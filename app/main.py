@@ -1,7 +1,10 @@
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 import uuid
 import os
 import json
@@ -14,6 +17,15 @@ import math
 from sqlalchemy import create_engine, Column, String, DateTime, Float, Integer, Text, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import redis
+
+try:
+    from pydantic import model_validator
+
+    PYDANTIC_V2 = True
+except ImportError:
+    from pydantic import root_validator
+
+    PYDANTIC_V2 = False
 
 app = FastAPI()
 
@@ -31,6 +43,92 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+
+class ErrorCode:
+    VALIDATION_ERROR = "validation_error"
+    SESSION_NOT_FOUND = "session_not_found"
+    MISSING_SESSION_TOKEN = "missing_session_token"
+    SESSION_TOKEN_UNAVAILABLE = "session_token_unavailable"
+    INVALID_SESSION_TOKEN = "invalid_session_token"
+    SESSION_ALREADY_ENDED = "session_already_ended"
+    POSITION_COORDINATE_OUT_OF_RANGE = "position_coordinate_out_of_range"
+    POSITION_ALT_OUT_OF_RANGE = "position_alt_out_of_range"
+    POSITION_SPEED_OUT_OF_RANGE = "position_speed_out_of_range"
+    POSITION_HEADING_OUT_OF_RANGE = "position_heading_out_of_range"
+    POSITION_TIMESTAMP_IN_FUTURE = "position_timestamp_in_future"
+    POSITION_OUT_OF_ORDER = "position_out_of_order"
+    POSITION_CONFLICTING_DUPLICATE_TIMESTAMP = "position_conflicting_duplicate_timestamp"
+    POSITION_IMPOSSIBLE_JUMP = "position_impossible_jump"
+    INVALID_NUMERIC_VALUE = "invalid_numeric_value"
+    TASK_NAME_REQUIRED = "task_name_required"
+    TASK_TURNPOINTS_INVALID = "task_turnpoints_invalid"
+    TASK_TURNPOINT_INVALID = "task_turnpoint_invalid"
+    TASK_TURNPOINT_NAME_REQUIRED = "task_turnpoint_name_required"
+    TASK_TURNPOINT_TYPE_REQUIRED = "task_turnpoint_type_required"
+    TASK_TURNPOINT_COORDINATES_REQUIRED = "task_turnpoint_coordinates_required"
+    TASK_COORDINATE_OUT_OF_RANGE = "task_coordinate_out_of_range"
+    TASK_RADIUS_OUT_OF_RANGE = "task_radius_out_of_range"
+    TASK_BOUNDARY_INVALID = "task_boundary_invalid"
+    TASK_BOUNDARY_TYPE_INVALID = "task_boundary_type_invalid"
+    TASK_BOUNDARY_RADIUS_OUT_OF_RANGE = "task_boundary_radius_out_of_range"
+
+
+POSITION_MONOTONIC_FIELD_NAMES = frozenset({
+    "fix_mono_ms",
+    "fixMonoMs",
+    "monotonic_ms",
+    "monotonicMs",
+    "monotonic_time_ms",
+    "monotonicTimeMs",
+    "client_monotonic_ms",
+    "clientMonotonicMs"
+})
+
+
+class ApiHTTPException(HTTPException):
+    def __init__(self, status_code: int, code: str, detail: Any):
+        super().__init__(status_code=status_code, detail=detail)
+        self.code = code
+
+
+def utcnow() -> datetime:
+    return datetime.utcnow()
+
+
+def reject_monotonic_position_fields(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    monotonic_fields = sorted(POSITION_MONOTONIC_FIELD_NAMES.intersection(payload.keys()))
+    if monotonic_fields:
+        field_list = ", ".join(monotonic_fields)
+        raise ValueError(
+            f"client monotonic time is not accepted on the wire ({field_list})"
+        )
+    return payload
+
+
+@app.exception_handler(ApiHTTPException)
+def api_http_exception_handler(_request: Request, exc: ApiHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.code,
+            "detail": exc.detail
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+def request_validation_exception_handler(_request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "code": ErrorCode.VALIDATION_ERROR,
+            "detail": jsonable_encoder(exc.errors())
+        }
+    )
 
 
 def generate_share_code(length=8):
@@ -60,24 +158,24 @@ def to_iso_utc(dt: Optional[datetime]) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def parse_number(value, field_name: str) -> float:
+def parse_number(value, field_name: str, code: str) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"{field_name} must be numeric")
+        raise ApiHTTPException(status_code=400, code=code, detail=f"{field_name} must be numeric")
 
 
-def validate_lat_lon(lat: float, lon: float, field_prefix: str) -> None:
+def validate_lat_lon(lat: float, lon: float, field_prefix: str, code: str) -> None:
     if lat < -90 or lat > 90:
-        raise HTTPException(status_code=400, detail=f"{field_prefix}.lat out of range")
+        raise ApiHTTPException(status_code=400, code=code, detail=f"{field_prefix}.lat out of range")
     if lon < -180 or lon > 180:
-        raise HTTPException(status_code=400, detail=f"{field_prefix}.lon out of range")
+        raise ApiHTTPException(status_code=400, code=code, detail=f"{field_prefix}.lon out of range")
 
 
-def validate_radius(radius_value, field_name: str) -> None:
-    radius = parse_number(radius_value, field_name)
+def validate_radius(radius_value, field_name: str, code: str) -> None:
+    radius = parse_number(radius_value, field_name, code)
     if radius <= 0 or radius > MAX_TASK_RADIUS_M:
-        raise HTTPException(status_code=400, detail=f"{field_name} out of range")
+        raise ApiHTTPException(status_code=400, code=code, detail=f"{field_name} out of range")
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -102,7 +200,7 @@ class LiveSession(Base):
     String(20),
     nullable=False,
     default="active",
-    server_default=text("'active'::character varying"))
+    server_default=text("'active'"))
     last_position_at = Column(DateTime, nullable=True)
     ended_at = Column(DateTime, nullable=True)
     write_token_hash = Column(String(64), nullable=True)
@@ -142,13 +240,32 @@ class LiveTaskRevision(Base):
 
 
 class Position(BaseModel):
+    """Deployed telemetry ingest contract.
+
+    `speed` is XCPro groundSpeedMs in meters per second.
+    `timestamp` is client wall-clock time in a UTC/ISO-8601-compatible format.
+    Client monotonic timestamps stay transport-local and are not part of this wire DTO.
+    """
+
     session_id: str
     lat: float
     lon: float
     alt: float
-    speed: float
+    speed: float = Field(description="XCPro groundSpeedMs in meters per second.")
     heading: float
-    timestamp: datetime
+    timestamp: datetime = Field(
+        description="Client wall-clock time in UTC/ISO-8601-compatible format."
+    )
+
+    if PYDANTIC_V2:
+        @model_validator(mode="before")
+        @classmethod
+        def validate_wire_contract(cls, payload: Any):
+            return reject_monotonic_position_fields(payload)
+    else:
+        @root_validator(pre=True)
+        def validate_wire_contract(cls, payload):
+            return reject_monotonic_position_fields(payload)
 
 
 class TaskUpsertRequest(BaseModel):
@@ -164,19 +281,35 @@ class SessionEndRequest(BaseModel):
 def get_session_or_404(db, session_id: str) -> LiveSession:
     session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
     if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+        raise ApiHTTPException(
+            status_code=404,
+            code=ErrorCode.SESSION_NOT_FOUND,
+            detail="session not found"
+        )
     return session
 
 
 def require_write_access(session: LiveSession, x_session_token: Optional[str]) -> None:
     if not x_session_token:
-        raise HTTPException(status_code=401, detail="missing X-Session-Token header")
+        raise ApiHTTPException(
+            status_code=401,
+            code=ErrorCode.MISSING_SESSION_TOKEN,
+            detail="missing X-Session-Token header"
+        )
 
     if not session.write_token_hash:
-        raise HTTPException(status_code=403, detail="write token unavailable for this session")
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.SESSION_TOKEN_UNAVAILABLE,
+            detail="write token unavailable for this session"
+        )
 
     if not secrets.compare_digest(session.write_token_hash, hash_token(x_session_token)):
-        raise HTTPException(status_code=403, detail="invalid session token")
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.INVALID_SESSION_TOKEN,
+            detail="invalid session token"
+        )
 
 
 def compute_effective_status(session: LiveSession) -> str:
@@ -186,7 +319,7 @@ def compute_effective_status(session: LiveSession) -> str:
     if session.last_position_at is None:
         return "active"
 
-    age = datetime.utcnow() - session.last_position_at
+    age = utcnow() - session.last_position_at
     if age > timedelta(seconds=STALE_AFTER_SECONDS):
         return "stale"
 
@@ -194,52 +327,114 @@ def compute_effective_status(session: LiveSession) -> str:
 
 
 def validate_position_payload(p: Position, position_ts: datetime) -> None:
-    validate_lat_lon(p.lat, p.lon, "position")
+    validate_lat_lon(
+        p.lat,
+        p.lon,
+        "position",
+        ErrorCode.POSITION_COORDINATE_OUT_OF_RANGE
+    )
 
     if p.alt < MIN_REASONABLE_ALT_M or p.alt > MAX_REASONABLE_ALT_M:
-        raise HTTPException(status_code=400, detail="position.alt out of range")
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.POSITION_ALT_OUT_OF_RANGE,
+            detail="position.alt out of range"
+        )
 
     if p.speed < 0 or p.speed > MAX_REASONABLE_SPEED:
-        raise HTTPException(status_code=400, detail="position.speed out of range")
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.POSITION_SPEED_OUT_OF_RANGE,
+            detail="position.speed out of range"
+        )
 
     if p.heading < 0 or p.heading > 360:
-        raise HTTPException(status_code=400, detail="position.heading out of range")
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.POSITION_HEADING_OUT_OF_RANGE,
+            detail="position.heading out of range"
+        )
 
-    if position_ts > datetime.utcnow() + timedelta(seconds=MAX_POSITION_FUTURE_SKEW_SECONDS):
-        raise HTTPException(status_code=400, detail="position.timestamp too far in the future")
+    if position_ts > utcnow() + timedelta(seconds=MAX_POSITION_FUTURE_SKEW_SECONDS):
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.POSITION_TIMESTAMP_IN_FUTURE,
+            detail="position.timestamp too far in the future"
+        )
 
 
 def validate_task_payload(req: TaskUpsertRequest) -> str:
     task_name = (req.task_name or "").strip()
     if not task_name:
-        raise HTTPException(status_code=400, detail="task_name is required")
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.TASK_NAME_REQUIRED,
+            detail="task_name is required"
+        )
 
     task = req.task
     turnpoints = task.get("turnpoints")
 
     if not isinstance(turnpoints, list) or len(turnpoints) < 2:
-        raise HTTPException(status_code=400, detail="task.turnpoints must contain at least 2 items")
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.TASK_TURNPOINTS_INVALID,
+            detail="task.turnpoints must contain at least 2 items"
+        )
 
     for idx, tp in enumerate(turnpoints):
         if not isinstance(tp, dict):
-            raise HTTPException(status_code=400, detail=f"task.turnpoints[{idx}] must be an object")
+            raise ApiHTTPException(
+                status_code=400,
+                code=ErrorCode.TASK_TURNPOINT_INVALID,
+                detail=f"task.turnpoints[{idx}] must be an object"
+            )
 
         name = str(tp.get("name", "")).strip()
         tp_type = str(tp.get("type", "")).strip()
 
         if not name:
-            raise HTTPException(status_code=400, detail=f"task.turnpoints[{idx}].name is required")
+            raise ApiHTTPException(
+                status_code=400,
+                code=ErrorCode.TASK_TURNPOINT_NAME_REQUIRED,
+                detail=f"task.turnpoints[{idx}].name is required"
+            )
         if not tp_type:
-            raise HTTPException(status_code=400, detail=f"task.turnpoints[{idx}].type is required")
+            raise ApiHTTPException(
+                status_code=400,
+                code=ErrorCode.TASK_TURNPOINT_TYPE_REQUIRED,
+                detail=f"task.turnpoints[{idx}].type is required"
+            )
         if "lat" not in tp or "lon" not in tp:
-            raise HTTPException(status_code=400, detail=f"task.turnpoints[{idx}] requires lat/lon")
+            raise ApiHTTPException(
+                status_code=400,
+                code=ErrorCode.TASK_TURNPOINT_COORDINATES_REQUIRED,
+                detail=f"task.turnpoints[{idx}] requires lat/lon"
+            )
 
-        lat = parse_number(tp.get("lat"), f"task.turnpoints[{idx}].lat")
-        lon = parse_number(tp.get("lon"), f"task.turnpoints[{idx}].lon")
-        validate_lat_lon(lat, lon, f"task.turnpoints[{idx}]")
+        lat = parse_number(
+            tp.get("lat"),
+            f"task.turnpoints[{idx}].lat",
+            ErrorCode.INVALID_NUMERIC_VALUE
+        )
+        lon = parse_number(
+            tp.get("lon"),
+            f"task.turnpoints[{idx}].lon",
+            ErrorCode.INVALID_NUMERIC_VALUE
+        )
+        validate_lat_lon(
+            lat,
+            lon,
+            f"task.turnpoints[{idx}]",
+            ErrorCode.TASK_COORDINATE_OUT_OF_RANGE
+        )
 
         if "radius_m" in tp and tp.get("radius_m") is not None:
-            validate_radius(tp.get("radius_m"), f"task.turnpoints[{idx}].radius_m")
+            validate_radius(
+                tp.get("radius_m"),
+                f"task.turnpoints[{idx}].radius_m",
+                ErrorCode.TASK_RADIUS_OUT_OF_RANGE
+            )
 
     for boundary_name in ["start", "finish"]:
         boundary = task.get(boundary_name)
@@ -247,13 +442,25 @@ def validate_task_payload(req: TaskUpsertRequest) -> str:
             continue
 
         if not isinstance(boundary, dict):
-            raise HTTPException(status_code=400, detail=f"task.{boundary_name} must be an object")
+            raise ApiHTTPException(
+                status_code=400,
+                code=ErrorCode.TASK_BOUNDARY_INVALID,
+                detail=f"task.{boundary_name} must be an object"
+            )
 
         if "type" in boundary and not str(boundary.get("type", "")).strip():
-            raise HTTPException(status_code=400, detail=f"task.{boundary_name}.type is invalid")
+            raise ApiHTTPException(
+                status_code=400,
+                code=ErrorCode.TASK_BOUNDARY_TYPE_INVALID,
+                detail=f"task.{boundary_name}.type is invalid"
+            )
 
         if "radius_m" in boundary and boundary.get("radius_m") is not None:
-            validate_radius(boundary.get("radius_m"), f"task.{boundary_name}.radius_m")
+            validate_radius(
+                boundary.get("radius_m"),
+                f"task.{boundary_name}.radius_m",
+                ErrorCode.TASK_BOUNDARY_RADIUS_OUT_OF_RANGE
+            )
 
     return task_name
 
@@ -332,7 +539,7 @@ def start_session():
         row = LiveSession(
             id=session_id,
             share_code=share_code,
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
             status="active",
             last_position_at=None,
             ended_at=None,
@@ -362,7 +569,11 @@ def post_position(
         require_write_access(session, x_session_token)
 
         if session.status == "ended":
-            raise HTTPException(status_code=409, detail="session already ended")
+            raise ApiHTTPException(
+                status_code=409,
+                code=ErrorCode.SESSION_ALREADY_ENDED,
+                detail="session already ended"
+            )
 
         position_ts = to_utc_naive(p.timestamp)
         validate_position_payload(p, position_ts)
@@ -376,7 +587,11 @@ def post_position(
 
         if last_position:
             if position_ts < last_position.timestamp:
-                raise HTTPException(status_code=409, detail="out-of-order position timestamp")
+                raise ApiHTTPException(
+                    status_code=409,
+                    code=ErrorCode.POSITION_OUT_OF_ORDER,
+                    detail="out-of-order position timestamp"
+                )
 
             exact_duplicate = (
                 position_ts == last_position.timestamp and
@@ -391,15 +606,20 @@ def post_position(
                 return {"ok": True, "deduped": True}
 
             if position_ts == last_position.timestamp:
-                raise HTTPException(status_code=409, detail="conflicting duplicate timestamp")
+                raise ApiHTTPException(
+                    status_code=409,
+                    code=ErrorCode.POSITION_CONFLICTING_DUPLICATE_TIMESTAMP,
+                    detail="conflicting duplicate timestamp"
+                )
 
             delta_seconds = (position_ts - last_position.timestamp).total_seconds()
             if delta_seconds > 0:
                 jump_m = haversine_m(last_position.lat, last_position.lon, p.lat, p.lon)
                 implied_kmh = (jump_m / delta_seconds) * 3.6
                 if implied_kmh > MAX_IMPOSSIBLE_GROUND_SPEED_KMH:
-                    raise HTTPException(
+                    raise ApiHTTPException(
                         status_code=400,
+                        code=ErrorCode.POSITION_IMPOSSIBLE_JUMP,
                         detail=f"impossible jump detected ({implied_kmh:.1f} km/h)"
                     )
 
@@ -414,7 +634,7 @@ def post_position(
         )
         db.add(row)
 
-        session.last_position_at = datetime.utcnow()
+        session.last_position_at = utcnow()
         db.commit()
 
         latest = {
@@ -443,10 +663,14 @@ def task_upsert(
         require_write_access(session, x_session_token)
 
         if session.status == "ended":
-            raise HTTPException(status_code=409, detail="session already ended")
+            raise ApiHTTPException(
+                status_code=409,
+                code=ErrorCode.SESSION_ALREADY_ENDED,
+                detail="session already ended"
+            )
 
         task_name = validate_task_payload(req)
-        now = datetime.utcnow()
+        now = utcnow()
 
         payload = {
             "task_name": task_name,
@@ -541,7 +765,7 @@ def end_session(
             }
 
         session.status = "ended"
-        session.ended_at = datetime.utcnow()
+        session.ended_at = utcnow()
         db.commit()
 
         return {
@@ -560,7 +784,11 @@ def get_live(session_id: str):
     try:
         session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
         if not session:
-            raise HTTPException(status_code=404, detail="not found")
+            raise ApiHTTPException(
+                status_code=404,
+                code=ErrorCode.SESSION_NOT_FOUND,
+                detail="not found"
+            )
 
         return build_live_response(db, session)
     finally:
@@ -573,7 +801,11 @@ def get_live_by_share_code(share_code: str):
     try:
         session = db.query(LiveSession).filter(LiveSession.share_code == share_code).first()
         if not session:
-            raise HTTPException(status_code=404, detail="not found")
+            raise ApiHTTPException(
+                status_code=404,
+                code=ErrorCode.SESSION_NOT_FOUND,
+                detail="not found"
+            )
 
         return build_live_response(db, session)
     finally:
