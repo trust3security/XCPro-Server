@@ -292,6 +292,115 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(200, live_after_end.status_code)
         self.assertEqual("ended", live_after_end.json()["status"])
 
+    def test_active_pilots_list_returns_active_sessions_with_expected_fields(self):
+        session = self.start_session()
+
+        position_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, position_response.status_code)
+
+        response = self.client.get("/api/v1/live/active")
+        self.assertEqual(200, response.status_code)
+
+        body = response.json()
+        self.assertEqual(1, len(body))
+
+        item = body[0]
+        self.assertEqual(
+            {
+                "session_id",
+                "share_code",
+                "status",
+                "created_at",
+                "last_position_at",
+                "latest",
+                "display_label"
+            },
+            set(item.keys())
+        )
+        self.assertEqual(session["session_id"], item["session_id"])
+        self.assertEqual(session["share_code"], item["share_code"])
+        self.assertEqual("active", item["status"])
+        self.assertEqual(f"Live {session['share_code']}", item["display_label"])
+        self.assertIsNotNone(item["created_at"])
+        self.assertIsNotNone(item["last_position_at"])
+        self.assertEqual(12.5, item["latest"]["speed"])
+        self.assertEqual("2026-03-20T12:00:00+00:00", item["latest"]["timestamp"])
+
+    def test_active_pilots_list_excludes_ended_and_never_started_sessions(self):
+        idle_session = self.start_session()
+        active_session = self.start_session()
+        ended_session = self.start_session()
+
+        active_position = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(active_session["session_id"]),
+            headers=self.write_headers(active_session)
+        )
+        ended_position = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(ended_session["session_id"]),
+            headers=self.write_headers(ended_session)
+        )
+        ended_response = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": ended_session["session_id"]},
+            headers=self.write_headers(ended_session)
+        )
+
+        self.assertEqual(200, active_position.status_code)
+        self.assertEqual(200, ended_position.status_code)
+        self.assertEqual(200, ended_response.status_code)
+
+        response = self.client.get("/api/v1/live/active")
+        self.assertEqual(200, response.status_code)
+
+        session_ids = [item["session_id"] for item in response.json()]
+        self.assertIn(active_session["session_id"], session_ids)
+        self.assertNotIn(idle_session["session_id"], session_ids)
+        self.assertNotIn(ended_session["session_id"], session_ids)
+
+    def test_active_pilots_list_preserves_stale_status(self):
+        session = self.start_session()
+
+        position_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, position_response.status_code)
+
+        self.clock.advance(seconds=main_module.STALE_AFTER_SECONDS + 1)
+
+        response = self.client.get("/api/v1/live/active")
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.json()))
+        self.assertEqual("stale", response.json()[0]["status"])
+
+    def test_active_pilots_list_keeps_session_when_latest_cache_is_missing(self):
+        session = self.start_session()
+
+        position_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, position_response.status_code)
+
+        main_module.redis_client.values.pop(f"live:latest:{session['session_id']}", None)
+
+        response = self.client.get("/api/v1/live/active")
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(response.json()))
+
+        item = response.json()[0]
+        self.assertEqual(session["session_id"], item["session_id"])
+        self.assertIsNone(item["latest"])
+        self.assertIsNotNone(item["last_position_at"])
+
     def test_position_wire_contract_preserves_ground_speed_ms_and_wall_clock_timestamp(self):
         session = self.start_session()
         headers = self.write_headers(session)
@@ -338,6 +447,27 @@ class LiveFollowApiTest(unittest.TestCase):
                 for item in body["detail"]
             )
         )
+
+    def test_live_routes_still_resolve_after_active_endpoint_addition(self):
+        session = self.start_session()
+
+        position_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, position_response.status_code)
+
+        active_list = self.client.get("/api/v1/live/active")
+        by_session = self.client.get(f"/api/v1/live/{session['session_id']}")
+        by_share = self.client.get(f"/api/v1/live/share/{session['share_code']}")
+
+        self.assertEqual(200, active_list.status_code)
+        self.assertIsInstance(active_list.json(), list)
+        self.assertEqual(200, by_session.status_code)
+        self.assertEqual(session["session_id"], by_session.json()["session"])
+        self.assertEqual(200, by_share.status_code)
+        self.assertEqual(session["share_code"], by_share.json()["share_code"])
 
     def start_session(self):
         response = self.client.post("/api/v1/session/start")
