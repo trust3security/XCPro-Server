@@ -465,9 +465,30 @@ def validate_task_payload(req: TaskUpsertRequest) -> str:
     return task_name
 
 
+def get_cached_latest(session_id: str) -> Optional[dict]:
+    latest_raw = redis_client.get(f"live:latest:{session_id}")
+    return json.loads(latest_raw) if latest_raw else None
+
+
+def build_live_list_display_label(session: LiveSession) -> str:
+    # Public UI label only. Share code is server-owned; no stronger identity is implied.
+    return f"Live {session.share_code}"
+
+
+def build_live_active_item(session: LiveSession) -> dict:
+    return {
+        "session_id": session.id,
+        "share_code": session.share_code,
+        "status": compute_effective_status(session),
+        "created_at": to_iso_utc(session.created_at),
+        "last_position_at": to_iso_utc(session.last_position_at),
+        "latest": get_cached_latest(session.id),
+        "display_label": build_live_list_display_label(session)
+    }
+
+
 def build_live_response(db, session):
-    latest_raw = redis_client.get(f"live:latest:{session.id}")
-    latest = json.loads(latest_raw) if latest_raw else None
+    latest = get_cached_latest(session.id)
 
     positions = (
         db.query(LivePosition)
@@ -774,6 +795,30 @@ def end_session(
             "status": "ended",
             "ended_at": to_iso_utc(session.ended_at)
         }
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/live/active")
+def get_active_live_sessions():
+    db = SessionLocal()
+    try:
+        # Conservative inclusion: only sessions with at least one accepted position are listed.
+        sessions = (
+            db.query(LiveSession)
+            .filter(
+                LiveSession.status != "ended",
+                LiveSession.last_position_at.isnot(None)
+            )
+            .order_by(
+                LiveSession.last_position_at.desc(),
+                LiveSession.created_at.desc(),
+                LiveSession.id.asc()
+            )
+            .all()
+        )
+
+        return [build_live_active_item(session) for session in sessions]
     finally:
         db.close()
 
