@@ -2,6 +2,7 @@ version: "3.9"
 
 services:
   api:
+    restart: unless-stopped
     build: ./app
     container_name: xcpro-api
     ports:
