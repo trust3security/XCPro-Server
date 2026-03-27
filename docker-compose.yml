@@ -1,4 +1,3 @@
-
 services:
   api:
     restart: unless-stopped
@@ -10,15 +9,15 @@ services:
       - db
       - redis
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/xcpro
+      DATABASE_URL: ${DATABASE_URL}
 
   db:
     image: postgres:15
     container_name: xcpro-db
     restart: always
     environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: xcpro
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - pgdata:/var/lib/postgresql/data
 

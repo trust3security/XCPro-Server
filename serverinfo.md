@@ -114,4 +114,6 @@ These included:
 - no documented staging environment
 - no automated GitHub deploy pipeline
 - current deployment process is manual
-- credentials are still hardcoded in compose and should be cleaned up later
+- production secrets are not yet fully externalized; they should live in `/opt/xcpro/.env`
+- `.env.example` in this repo shows the required variables
+- the real `.env` file must never be committed
