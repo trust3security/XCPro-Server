@@ -58,25 +58,44 @@ Important:
 - Pushing to GitHub does **not** update production by itself
 - Production changes currently require an explicit deploy/apply step on the server
 
-The API service currently includes:
-
-```yaml
-restart: unless-stopped
-```
+Current API runtime notes:
+- API container restart policy is `unless-stopped`
+- public HTTPS and local loopback checks were verified after the recent fixes
+- Compose v2 is installed and available as `docker compose`
 
 ## Database
 
 Postgres runs in Docker as `xcpro-db`.
 
-Current compose uses:
-- database name: `xcpro`
-- password: `postgres`
+Current runtime model:
+- database name is provided through `/opt/xcpro/.env`
+- database password is provided through `/opt/xcpro/.env`
+- `DATABASE_URL` is provided through `/opt/xcpro/.env`
 
-This works, but should be improved later by moving secrets to environment files or a secret manager.
+Important:
+- the database password has been rotated away from the original default value
+- the real production password must never be committed to Git
+- the real production password should be stored in a password manager or other secure secret store
 
 ## Redis
 
 Redis runs in Docker as `xcpro-redis`.
+
+## Environment file
+
+Production runtime secrets/config now live in:
+
+```text
+/opt/xcpro/.env
+```
+
+This file is not committed to Git.
+
+The repo should contain only an example file such as:
+
+```text
+.env.example
+```
 
 ## Compose tooling
 
@@ -86,7 +105,7 @@ The host originally used old Compose v1:
 docker-compose 1.29.2
 ```
 
-Compose v2 was later installed manually so the host now also supports:
+Compose v2 was later installed manually and the host now supports:
 
 ```text
 docker compose
@@ -114,6 +133,6 @@ These included:
 - no documented staging environment
 - no automated GitHub deploy pipeline
 - current deployment process is manual
-- production secrets are not yet fully externalized; they should live in `/opt/xcpro/.env`
-- `.env.example` in this repo shows the required variables
+- production secrets live outside Git on the server in `/opt/xcpro/.env`
+- `.env.example` in this repo shows the required variable names only
 - the real `.env` file must never be committed
