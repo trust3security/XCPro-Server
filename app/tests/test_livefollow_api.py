@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 
 from alembic import command
@@ -52,6 +53,7 @@ class LiveFollowApiTest(unittest.TestCase):
         self.original_session_local = main_module.SessionLocal
         self.original_redis_client = main_module.redis_client
         self.original_utcnow = main_module.utcnow
+        self.original_private_follow_runtime_config = main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG
         self.original_static_bearer_tokens = main_module.STATIC_BEARER_TOKENS
         self.original_google_server_client_ids = main_module.GOOGLE_SERVER_CLIENT_IDS
         self.original_google_id_token_verifier = main_module.GOOGLE_ID_TOKEN_VERIFIER
@@ -97,6 +99,7 @@ class LiveFollowApiTest(unittest.TestCase):
         main_module.SessionLocal = self.original_session_local
         main_module.redis_client = self.original_redis_client
         main_module.utcnow = self.original_utcnow
+        main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG = self.original_private_follow_runtime_config
         main_module.STATIC_BEARER_TOKENS = self.original_static_bearer_tokens
         main_module.GOOGLE_SERVER_CLIENT_IDS = self.original_google_server_client_ids
         main_module.GOOGLE_ID_TOKEN_VERIFIER = self.original_google_id_token_verifier
@@ -737,6 +740,11 @@ class LiveFollowApiTest(unittest.TestCase):
         )
 
     def test_subscription_entitlement_read_rejects_invalid_package_in_production(self):
+        self.override_private_follow_runtime_config(
+            runtime_env=main_module.RUNTIME_ENV_PROD,
+            allow_debug_entitlement_package=False
+        )
+
         unknown = self.client.get(
             "/api/v1/subscriptions/entitlements",
             headers=self.entitlement_headers(package_name="com.example.other")
@@ -756,6 +764,20 @@ class LiveFollowApiTest(unittest.TestCase):
         )
         self.assertEqual(400, debug.status_code)
         self.assertEqual(main_module.ErrorCode.INVALID_PACKAGE, debug.json()["code"])
+
+    def test_subscription_entitlement_read_allows_debug_package_with_explicit_opt_in(self):
+        self.override_private_follow_runtime_config(
+            runtime_env=main_module.RUNTIME_ENV_PROD,
+            allow_debug_entitlement_package=True
+        )
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers(package_name=main_module.XCPRO_DEBUG_PACKAGE_NAME)
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("FREE", response.json()["entitlement"]["tier"])
 
     def test_google_auth_exchange_issues_server_bearer_that_works_on_me(self):
         exchange_response = self.client.post(
@@ -1414,6 +1436,12 @@ class LiveFollowApiTest(unittest.TestCase):
         package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME
     ):
         return {"X-XCPro-Package-Name": package_name}
+
+    def override_private_follow_runtime_config(self, **overrides):
+        main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG = replace(
+            main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG,
+            **overrides
+        )
 
     def complete_profile(
         self,

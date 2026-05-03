@@ -175,6 +175,7 @@ class ResolvedBearerIdentity:
 class PrivateFollowRuntimeConfig:
     runtime_env: str
     allow_static_dev_bearer_auth: bool
+    allow_debug_entitlement_package: bool
     has_static_bearer_tokens_env: bool
     static_bearer_tokens: dict[str, ResolvedBearerIdentity]
     google_server_client_ids: frozenset[str]
@@ -315,6 +316,11 @@ def build_private_follow_runtime_config(
     resolved_env = os.environ if env is None else env
     runtime_env = normalize_runtime_env(resolved_env.get("XCPRO_RUNTIME_ENV"))
     allow_static_dev_bearer_auth = is_static_dev_bearer_auth_enabled_for_env(resolved_env)
+    allow_debug_entitlement_package = parse_boolean_env(
+        "XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE",
+        resolved_env.get("XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE"),
+        default=False
+    )
     raw_static_bearer_tokens = resolved_env.get("XCPRO_STATIC_BEARER_TOKENS_JSON", "").strip()
     has_static_bearer_tokens_env = bool(raw_static_bearer_tokens)
     static_bearer_tokens = {}
@@ -323,6 +329,7 @@ def build_private_follow_runtime_config(
     return PrivateFollowRuntimeConfig(
         runtime_env=runtime_env,
         allow_static_dev_bearer_auth=allow_static_dev_bearer_auth,
+        allow_debug_entitlement_package=allow_debug_entitlement_package,
         has_static_bearer_tokens_env=has_static_bearer_tokens_env,
         static_bearer_tokens=static_bearer_tokens,
         google_server_client_ids=load_google_server_client_ids_from_env(resolved_env),
@@ -380,6 +387,10 @@ def collect_private_follow_preflight_warnings(
         warnings.append(
             "Issued XCPro bearer tokens remain unavailable until XCPRO_PRIVATE_FOLLOW_BEARER_SECRET is configured"
         )
+    if config.runtime_env == RUNTIME_ENV_PROD and config.allow_debug_entitlement_package:
+        warnings.append(
+            "Debug entitlement package com.trust3.xcpro.debug is accepted in prod; disable before public release"
+        )
     return warnings
 
 
@@ -393,6 +404,7 @@ def build_private_follow_preflight_report(
         "ok": not errors,
         "runtime_env": resolved_config.runtime_env,
         "allow_static_dev_bearer_auth": resolved_config.allow_static_dev_bearer_auth,
+        "allow_debug_entitlement_package": resolved_config.allow_debug_entitlement_package,
         "has_static_bearer_tokens_env": resolved_config.has_static_bearer_tokens_env,
         "active_static_bearer_tokens": len(resolved_config.static_bearer_tokens),
         "has_google_server_client_ids": bool(resolved_config.google_server_client_ids),
@@ -944,7 +956,10 @@ def resolve_bearer_identity(authorization: Optional[str]) -> ResolvedBearerIdent
 def validate_entitlement_package_name(package_name: Optional[str]) -> str:
     normalized = trim_to_none(package_name)
     allowed_packages = {XCPRO_RELEASE_PACKAGE_NAME}
-    if PRIVATE_FOLLOW_RUNTIME_CONFIG.runtime_env != RUNTIME_ENV_PROD:
+    if (
+        PRIVATE_FOLLOW_RUNTIME_CONFIG.runtime_env != RUNTIME_ENV_PROD or
+        PRIVATE_FOLLOW_RUNTIME_CONFIG.allow_debug_entitlement_package
+    ):
         allowed_packages.add(XCPRO_DEBUG_PACKAGE_NAME)
 
     if normalized not in allowed_packages:

@@ -11,6 +11,7 @@ services:
       - redis
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/xcpro
+      XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE: ${XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE:-false}
 
   db:
     image: postgres:15
