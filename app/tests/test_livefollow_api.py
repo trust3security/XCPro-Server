@@ -646,6 +646,117 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual("followers", body["privacy"]["default_live_visibility"])
         self.assertEqual("owner_only", body["privacy"]["connection_list_visibility"])
 
+    def test_subscription_entitlement_read_requires_bearer_auth(self):
+        missing = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers_without_bearer()
+        )
+        invalid = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers("wrong-token")
+        )
+
+        self.assertEqual(401, missing.status_code)
+        self.assertEqual(
+            {
+                "code": main_module.ErrorCode.UNAUTHENTICATED,
+                "detail": "missing Authorization header"
+            },
+            missing.json()
+        )
+        self.assertEqual(401, invalid.status_code)
+        self.assertEqual(
+            {
+                "code": main_module.ErrorCode.UNAUTHENTICATED,
+                "detail": "invalid bearer token"
+            },
+            invalid.json()
+        )
+
+    def test_subscription_entitlement_read_returns_canonical_free(self):
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        entitlement = body["entitlement"]
+
+        self.assertIsNone(body["auditId"])
+        self.assertIsNotNone(entitlement["accountSubject"])
+        self.assertEqual("FREE", entitlement["tier"])
+        self.assertEqual("NONE", entitlement["billingPeriod"])
+        self.assertEqual("FREE_ACTIVE", entitlement["status"])
+        self.assertEqual("NONE", entitlement["source"])
+        self.assertEqual("FREE_CANONICAL", entitlement["verificationState"])
+        self.assertEqual([], entitlement["grantedFeatures"])
+        self.assertIsNone(entitlement["productId"])
+        self.assertIsNone(entitlement["basePlanId"])
+        self.assertIsNone(entitlement["validUntilMs"])
+        self.assertEqual(main_module.FREE_ENTITLEMENT_STALE_AFTER_MS, entitlement["staleAfterMs"])
+        self.assertEqual(
+            main_module.FREE_ENTITLEMENT_HARD_REFRESH_AFTER_MS,
+            entitlement["hardRefreshAfterMs"]
+        )
+        self.assertEqual("NONE", entitlement["recoveryAction"])
+        self.assertEqual(
+            {
+                "accountState": "UNKNOWN",
+                "verifiedAtMs": None,
+                "validUntilMs": None,
+                "errorCode": None
+            },
+            entitlement["providerStates"]["skySight"]
+        )
+        self.assertEqual("UNKNOWN", entitlement["providerStates"]["pureTrack"]["userAccess"])
+
+    def test_subscription_entitlement_read_rejects_expired_bearer(self):
+        token = main_module.issue_private_follow_bearer(
+            main_module.ResolvedBearerIdentity(
+                provider="google",
+                provider_subject="expired-pilot",
+                email="expired@example.com",
+                display_name="Expired Pilot"
+            )
+        )
+        self.clock.advance(days=31)
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers(token)
+        )
+
+        self.assertEqual(401, response.status_code)
+        self.assertEqual(
+            {
+                "code": main_module.ErrorCode.UNAUTHENTICATED,
+                "detail": "invalid bearer token"
+            },
+            response.json()
+        )
+
+    def test_subscription_entitlement_read_rejects_invalid_package_in_production(self):
+        unknown = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers(package_name="com.example.other")
+        )
+        debug = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers(package_name=main_module.XCPRO_DEBUG_PACKAGE_NAME)
+        )
+
+        self.assertEqual(400, unknown.status_code)
+        self.assertEqual(
+            {
+                "code": main_module.ErrorCode.INVALID_PACKAGE,
+                "detail": "invalid package name"
+            },
+            unknown.json()
+        )
+        self.assertEqual(400, debug.status_code)
+        self.assertEqual(main_module.ErrorCode.INVALID_PACKAGE, debug.json()["code"])
+
     def test_google_auth_exchange_issues_server_bearer_that_works_on_me(self):
         exchange_response = self.client.post(
             "/api/v2/auth/google/exchange",
@@ -1288,6 +1399,21 @@ class LiveFollowApiTest(unittest.TestCase):
 
     def bearer_headers(self, token: str | None = None):
         return {"Authorization": f"Bearer {token or self.primary_bearer_token}"}
+
+    def entitlement_headers(
+        self,
+        token: str | None = None,
+        package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME
+    ):
+        headers = self.bearer_headers(token)
+        headers["X-XCPro-Package-Name"] = package_name
+        return headers
+
+    def entitlement_headers_without_bearer(
+        self,
+        package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME
+    ):
+        return {"X-XCPro-Package-Name": package_name}
 
     def complete_profile(
         self,

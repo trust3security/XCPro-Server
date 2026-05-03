@@ -66,6 +66,10 @@ MIN_SEARCH_QUERY_LENGTH = 2
 SEARCH_RESULT_LIMIT = 25
 PRIVATE_FOLLOW_BEARER_VERSION = 1
 DEFAULT_PRIVATE_FOLLOW_BEARER_TTL_SECONDS = 60 * 60 * 24 * 30
+XCPRO_RELEASE_PACKAGE_NAME = "com.trust3.xcpro"
+XCPRO_DEBUG_PACKAGE_NAME = "com.trust3.xcpro.debug"
+FREE_ENTITLEMENT_STALE_AFTER_MS = 86_400_000
+FREE_ENTITLEMENT_HARD_REFRESH_AFTER_MS = 604_800_000
 DISCOVERABILITY_VALUES = frozenset({"searchable", "hidden"})
 FOLLOW_POLICY_VALUES = frozenset({"approval_required", "auto_approve", "closed"})
 DEFAULT_LIVE_VISIBILITY_VALUES = frozenset({
@@ -95,6 +99,7 @@ class ErrorCode:
     VALIDATION_ERROR = "validation_error"
     UNAUTHENTICATED = "unauthenticated"
     AUTH_UNAVAILABLE = "auth_unavailable"
+    INVALID_PACKAGE = "invalid_package"
     INVALID_GOOGLE_ID_TOKEN = "invalid_google_id_token"
     SESSION_NOT_FOUND = "session_not_found"
     MISSING_SESSION_TOKEN = "missing_session_token"
@@ -605,6 +610,14 @@ def to_iso_utc(dt: Optional[datetime]) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def to_epoch_ms(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
 def parse_number(value, field_name: str, code: str) -> float:
     try:
         return float(value)
@@ -928,6 +941,21 @@ def resolve_bearer_identity(authorization: Optional[str]) -> ResolvedBearerIdent
     return identity
 
 
+def validate_entitlement_package_name(package_name: Optional[str]) -> str:
+    normalized = trim_to_none(package_name)
+    allowed_packages = {XCPRO_RELEASE_PACKAGE_NAME}
+    if PRIVATE_FOLLOW_RUNTIME_CONFIG.runtime_env != RUNTIME_ENV_PROD:
+        allowed_packages.add(XCPRO_DEBUG_PACKAGE_NAME)
+
+    if normalized not in allowed_packages:
+        raise ApiHTTPException(
+            status_code=400,
+            code=ErrorCode.INVALID_PACKAGE,
+            detail="invalid package name"
+        )
+    return normalized
+
+
 def trim_to_none(raw_value: Optional[str]) -> Optional[str]:
     if raw_value is None:
         return None
@@ -1142,6 +1170,51 @@ def build_google_auth_exchange_response(
         "auth_method": "google",
         "user_id": current_user.user.id,
         "expires_at": to_iso_utc(expires_at)
+    }
+
+
+def build_canonical_free_entitlement_response(current_user: CurrentUserRecord) -> dict[str, Any]:
+    fetched_at_ms = to_epoch_ms(utcnow())
+    return {
+        "entitlement": {
+            "accountSubject": current_user.user.id,
+            "tier": "FREE",
+            "billingPeriod": "NONE",
+            "status": "FREE_ACTIVE",
+            "source": "NONE",
+            "verificationState": "FREE_CANONICAL",
+            "grantedFeatures": [],
+            "productId": None,
+            "basePlanId": None,
+            "expiryTimeMs": None,
+            "autoRenewing": None,
+            "willLoseAccessAtMs": None,
+            "verifiedAtMs": fetched_at_ms,
+            "fetchedAtMs": fetched_at_ms,
+            "validUntilMs": None,
+            "staleAfterMs": FREE_ENTITLEMENT_STALE_AFTER_MS,
+            "hardRefreshAfterMs": FREE_ENTITLEMENT_HARD_REFRESH_AFTER_MS,
+            "recoveryAction": "NONE",
+            "manageSubscriptionUrl": None,
+            "providerStates": {
+                "skySight": {
+                    "accountState": "UNKNOWN",
+                    "verifiedAtMs": None,
+                    "validUntilMs": None,
+                    "errorCode": None
+                },
+                "pureTrack": {
+                    "appKeyConfigured": False,
+                    "trafficApiAllowed": False,
+                    "insertApiConfigured": False,
+                    "userAccess": "UNKNOWN",
+                    "verifiedAtMs": None,
+                    "validUntilMs": None,
+                    "errorCode": None
+                }
+            }
+        },
+        "auditId": None
     }
 
 
@@ -2237,6 +2310,20 @@ def get_current_user_me(
     try:
         current_user = ensure_current_user_record(db, authorization)
         return build_me_response(current_user)
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/subscriptions/entitlements")
+def get_subscription_entitlements(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        validate_entitlement_package_name(package_name)
+        return build_canonical_free_entitlement_response(current_user)
     finally:
         db.close()
 
