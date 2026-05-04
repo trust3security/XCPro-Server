@@ -779,6 +779,183 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("FREE", response.json()["entitlement"]["tier"])
 
+    def test_subscription_entitlement_dto_vocabulary_is_frozen(self):
+        self.assertEqual(
+            {"FREE", "BASIC", "SOARING", "XC", "PRO"},
+            main_module.PLAN_TIER_VALUES
+        )
+        self.assertEqual({"NONE", "MONTHLY", "ANNUAL"}, main_module.BILLING_PERIOD_VALUES)
+        self.assertEqual({"NONE", "GOOGLE_PLAY"}, main_module.ENTITLEMENT_SOURCE_VALUES)
+        self.assertEqual(
+            {
+                "FREE_ACTIVE",
+                "PENDING",
+                "ACTIVE",
+                "GRACE_PERIOD",
+                "CANCELED_BUT_ACTIVE",
+                "ON_HOLD",
+                "PAUSED",
+                "SUSPENDED",
+                "EXPIRED",
+                "REVOKED",
+                "RECOVERY_REQUIRED",
+                "ERROR",
+            },
+            main_module.SUBSCRIPTION_STATUS_VALUES
+        )
+        self.assertEqual(
+            {
+                "VERIFIED",
+                "FREE_CANONICAL",
+                "STALE_CACHE",
+                "UNVERIFIED",
+                "ACCOUNT_MISMATCH",
+                "RECOVERY_REQUIRED",
+                "ERROR",
+            },
+            main_module.VERIFICATION_STATE_VALUES
+        )
+        self.assertEqual(
+            {
+                "NONE",
+                "SIGN_IN_REQUIRED",
+                "CONTACT_SUPPORT",
+                "CHOOSE_CORRECT_ACCOUNT",
+                "OPEN_PLAY_SUBSCRIPTIONS",
+                "RETRY_LATER",
+            },
+            main_module.RECOVERY_ACTION_VALUES
+        )
+
+    def test_subscription_entitlement_read_returns_paid_continuity_states(self):
+        for status in ("ACTIVE", "GRACE_PERIOD", "CANCELED_BUT_ACTIVE"):
+            with self.subTest(status=status):
+                valid_until_ms = 1777777777000
+                self.upsert_entitlement_snapshot(
+                    tier="SOARING",
+                    billing_period="MONTHLY",
+                    status=status,
+                    verification_state="VERIFIED",
+                    product_id="xcpro_soaring",
+                    base_plan_id="monthly",
+                    valid_until_ms=valid_until_ms,
+                    expiry_time_ms=valid_until_ms,
+                    auto_renewing=status != "CANCELED_BUT_ACTIVE"
+                )
+
+                response = self.client.get(
+                    "/api/v1/subscriptions/entitlements",
+                    headers=self.entitlement_headers()
+                )
+
+                self.assertEqual(200, response.status_code)
+                entitlement = response.json()["entitlement"]
+                self.assertEqual("SOARING", entitlement["tier"])
+                self.assertEqual("MONTHLY", entitlement["billingPeriod"])
+                self.assertEqual(status, entitlement["status"])
+                self.assertEqual("GOOGLE_PLAY", entitlement["source"])
+                self.assertEqual("VERIFIED", entitlement["verificationState"])
+                self.assertEqual("xcpro_soaring", entitlement["productId"])
+                self.assertEqual("monthly", entitlement["basePlanId"])
+                self.assertEqual(valid_until_ms, entitlement["validUntilMs"])
+                self.assertEqual(
+                    main_module.PAID_CONTINUITY_STALE_AFTER_MS,
+                    entitlement["staleAfterMs"]
+                )
+                self.assertEqual(
+                    main_module.PAID_CONTINUITY_HARD_REFRESH_AFTER_MS,
+                    entitlement["hardRefreshAfterMs"]
+                )
+
+    def test_subscription_entitlement_read_denied_lifecycle_states_do_not_return_valid_until(self):
+        for status in ("PENDING", "ON_HOLD", "PAUSED", "SUSPENDED", "EXPIRED", "REVOKED"):
+            with self.subTest(status=status):
+                self.upsert_entitlement_snapshot(
+                    tier="PRO",
+                    billing_period="ANNUAL",
+                    status=status,
+                    verification_state="UNVERIFIED" if status == "PENDING" else "VERIFIED",
+                    product_id="xcpro_pro",
+                    base_plan_id="annual",
+                    valid_until_ms=1777777777000,
+                    expiry_time_ms=1777777777000,
+                )
+
+                response = self.client.get(
+                    "/api/v1/subscriptions/entitlements",
+                    headers=self.entitlement_headers()
+                )
+
+                self.assertEqual(200, response.status_code)
+                entitlement = response.json()["entitlement"]
+                self.assertEqual(status, entitlement["status"])
+                self.assertIsNone(entitlement["validUntilMs"])
+                self.assertEqual(
+                    main_module.DENIED_ENTITLEMENT_STALE_AFTER_MS,
+                    entitlement["staleAfterMs"]
+                )
+                self.assertEqual(
+                    main_module.DENIED_ENTITLEMENT_HARD_REFRESH_AFTER_MS,
+                    entitlement["hardRefreshAfterMs"]
+                )
+
+    def test_subscription_entitlement_read_recovery_required_never_grants_access(self):
+        self.upsert_entitlement_snapshot(
+            tier="PRO",
+            billing_period="MONTHLY",
+            status="RECOVERY_REQUIRED",
+            verification_state="ACCOUNT_MISMATCH",
+            product_id="xcpro_pro",
+            base_plan_id="monthly",
+            valid_until_ms=1777777777000,
+            recovery_action="CHOOSE_CORRECT_ACCOUNT",
+        )
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        entitlement = response.json()["entitlement"]
+        self.assertEqual("RECOVERY_REQUIRED", entitlement["status"])
+        self.assertEqual("ACCOUNT_MISMATCH", entitlement["verificationState"])
+        self.assertEqual("CHOOSE_CORRECT_ACCOUNT", entitlement["recoveryAction"])
+        self.assertIsNone(entitlement["validUntilMs"])
+
+    def test_subscription_entitlement_read_unknown_stored_enum_fails_closed(self):
+        self.upsert_entitlement_snapshot(status="ALIEN_ACTIVE")
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers()
+        )
+
+        self.assertEqual(500, response.status_code)
+        self.assertEqual(
+            {
+                "code": main_module.ErrorCode.ENTITLEMENT_STATE_INVALID,
+                "detail": "stored entitlement status is invalid"
+            },
+            response.json()
+        )
+
+    def test_subscription_entitlement_read_product_base_plan_mismatch_fails_closed(self):
+        self.upsert_entitlement_snapshot(
+            tier="PRO",
+            billing_period="MONTHLY",
+            product_id="xcpro_basic",
+            base_plan_id="monthly"
+        )
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers()
+        )
+
+        self.assertEqual(500, response.status_code)
+        self.assertEqual(main_module.ErrorCode.ENTITLEMENT_STATE_INVALID, response.json()["code"])
+
     def test_google_auth_exchange_issues_server_bearer_that_works_on_me(self):
         exchange_response = self.client.post(
             "/api/v2/auth/google/exchange",
@@ -1442,6 +1619,76 @@ class LiveFollowApiTest(unittest.TestCase):
             main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG,
             **overrides
         )
+
+    def user_id_for_token(self, token: str | None = None) -> str:
+        bearer_token = token or self.primary_bearer_token
+        self.client.get("/api/v2/me", headers=self.bearer_headers(bearer_token))
+        identity = main_module.STATIC_BEARER_TOKENS[bearer_token]
+        db = self.session_local()
+        try:
+            auth_identity = (
+                db.query(main_module.AuthIdentity)
+                .filter(
+                    main_module.AuthIdentity.provider == identity.provider,
+                    main_module.AuthIdentity.provider_subject == identity.provider_subject
+                )
+                .first()
+            )
+            self.assertIsNotNone(auth_identity)
+            return auth_identity.user_id
+        finally:
+            db.close()
+
+    def upsert_entitlement_snapshot(
+        self,
+        token: str | None = None,
+        tier: str = "PRO",
+        billing_period: str = "MONTHLY",
+        status: str = "ACTIVE",
+        source: str = "GOOGLE_PLAY",
+        verification_state: str = "VERIFIED",
+        product_id: str | None = "xcpro_pro",
+        base_plan_id: str | None = "monthly",
+        expiry_time_ms: int | None = 1777777777000,
+        auto_renewing: bool | None = True,
+        will_lose_access_at_ms: int | None = None,
+        verified_at_ms: int | None = 1777000000000,
+        fetched_at_ms: int = 1777000000000,
+        valid_until_ms: int | None = 1777777777000,
+        stale_after_ms: int | None = None,
+        hard_refresh_after_ms: int | None = None,
+        recovery_action: str = "NONE"
+    ):
+        user_id = self.user_id_for_token(token)
+        now = self.clock.utcnow()
+        db = self.session_local()
+        try:
+            db.merge(
+                main_module.AccountEntitlementSnapshot(
+                    user_id=user_id,
+                    tier=tier,
+                    billing_period=billing_period,
+                    status=status,
+                    source=source,
+                    verification_state=verification_state,
+                    product_id=product_id,
+                    base_plan_id=base_plan_id,
+                    expiry_time_ms=expiry_time_ms,
+                    auto_renewing=auto_renewing,
+                    will_lose_access_at_ms=will_lose_access_at_ms,
+                    verified_at_ms=verified_at_ms,
+                    fetched_at_ms=fetched_at_ms,
+                    valid_until_ms=valid_until_ms,
+                    stale_after_ms=stale_after_ms,
+                    hard_refresh_after_ms=hard_refresh_after_ms,
+                    recovery_action=recovery_action,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
 
     def complete_profile(
         self,

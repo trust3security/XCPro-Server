@@ -18,7 +18,7 @@ import math
 import re
 import base64
 
-from sqlalchemy import CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 import redis
@@ -70,6 +70,65 @@ XCPRO_RELEASE_PACKAGE_NAME = "com.trust3.xcpro"
 XCPRO_DEBUG_PACKAGE_NAME = "com.trust3.xcpro.debug"
 FREE_ENTITLEMENT_STALE_AFTER_MS = 86_400_000
 FREE_ENTITLEMENT_HARD_REFRESH_AFTER_MS = 604_800_000
+DENIED_ENTITLEMENT_STALE_AFTER_MS = 900_000
+DENIED_ENTITLEMENT_HARD_REFRESH_AFTER_MS = 3_600_000
+PAID_CONTINUITY_STALE_AFTER_MS = 21_600_000
+PAID_CONTINUITY_HARD_REFRESH_AFTER_MS = 259_200_000
+PLAN_TIER_VALUES = frozenset({"FREE", "BASIC", "SOARING", "XC", "PRO"})
+BILLING_PERIOD_VALUES = frozenset({"NONE", "MONTHLY", "ANNUAL"})
+ENTITLEMENT_SOURCE_VALUES = frozenset({"NONE", "GOOGLE_PLAY"})
+SUBSCRIPTION_STATUS_VALUES = frozenset({
+    "FREE_ACTIVE",
+    "PENDING",
+    "ACTIVE",
+    "GRACE_PERIOD",
+    "CANCELED_BUT_ACTIVE",
+    "ON_HOLD",
+    "PAUSED",
+    "SUSPENDED",
+    "EXPIRED",
+    "REVOKED",
+    "RECOVERY_REQUIRED",
+    "ERROR",
+})
+VERIFICATION_STATE_VALUES = frozenset({
+    "VERIFIED",
+    "FREE_CANONICAL",
+    "STALE_CACHE",
+    "UNVERIFIED",
+    "ACCOUNT_MISMATCH",
+    "RECOVERY_REQUIRED",
+    "ERROR",
+})
+RECOVERY_ACTION_VALUES = frozenset({
+    "NONE",
+    "SIGN_IN_REQUIRED",
+    "CONTACT_SUPPORT",
+    "CHOOSE_CORRECT_ACCOUNT",
+    "OPEN_PLAY_SUBSCRIPTIONS",
+    "RETRY_LATER",
+})
+PRODUCT_ID_BY_TIER = {
+    "BASIC": "xcpro_basic",
+    "SOARING": "xcpro_soaring",
+    "XC": "xcpro_xc",
+    "PRO": "xcpro_pro",
+}
+BASE_PLAN_BY_PERIOD = {
+    "MONTHLY": "monthly",
+    "ANNUAL": "annual",
+}
+PAID_CONTINUITY_STATUSES = frozenset({"ACTIVE", "GRACE_PERIOD", "CANCELED_BUT_ACTIVE"})
+DENIED_SUBSCRIPTION_STATUSES = frozenset({
+    "PENDING",
+    "ON_HOLD",
+    "PAUSED",
+    "SUSPENDED",
+    "EXPIRED",
+    "REVOKED",
+    "RECOVERY_REQUIRED",
+    "ERROR",
+})
 DISCOVERABILITY_VALUES = frozenset({"searchable", "hidden"})
 FOLLOW_POLICY_VALUES = frozenset({"approval_required", "auto_approve", "closed"})
 DEFAULT_LIVE_VISIBILITY_VALUES = frozenset({
@@ -100,6 +159,7 @@ class ErrorCode:
     UNAUTHENTICATED = "unauthenticated"
     AUTH_UNAVAILABLE = "auth_unavailable"
     INVALID_PACKAGE = "invalid_package"
+    ENTITLEMENT_STATE_INVALID = "entitlement_state_invalid"
     INVALID_GOOGLE_ID_TOKEN = "invalid_google_id_token"
     SESSION_NOT_FOUND = "session_not_found"
     MISSING_SESSION_TOKEN = "missing_session_token"
@@ -794,6 +854,30 @@ class PrivacySetting(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
+class AccountEntitlementSnapshot(Base):
+    __tablename__ = "account_entitlement_snapshots"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    tier = Column(String(24), nullable=False)
+    billing_period = Column(String(24), nullable=False)
+    status = Column(String(40), nullable=False)
+    source = Column(String(40), nullable=False)
+    verification_state = Column(String(40), nullable=False)
+    product_id = Column(String(80), nullable=True)
+    base_plan_id = Column(String(80), nullable=True)
+    expiry_time_ms = Column(BigInteger, nullable=True)
+    auto_renewing = Column(Boolean, nullable=True)
+    will_lose_access_at_ms = Column(BigInteger, nullable=True)
+    verified_at_ms = Column(BigInteger, nullable=True)
+    fetched_at_ms = Column(BigInteger, nullable=False)
+    valid_until_ms = Column(BigInteger, nullable=True)
+    stale_after_ms = Column(BigInteger, nullable=True)
+    hard_refresh_after_ms = Column(BigInteger, nullable=True)
+    recovery_action = Column(String(40), nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
 class FollowRequest(Base):
     __tablename__ = "follow_requests"
     __table_args__ = (
@@ -1231,6 +1315,166 @@ def build_canonical_free_entitlement_response(current_user: CurrentUserRecord) -
         },
         "auditId": None
     }
+
+
+def require_entitlement_value(raw_value: Optional[str], allowed_values: frozenset[str], field_name: str) -> str:
+    value = trim_to_none(raw_value)
+    if value not in allowed_values:
+        raise ApiHTTPException(
+            status_code=500,
+            code=ErrorCode.ENTITLEMENT_STATE_INVALID,
+            detail=f"stored entitlement {field_name} is invalid"
+        )
+    return value
+
+
+def require_stored_entitlement_contract(snapshot: AccountEntitlementSnapshot) -> dict[str, str]:
+    tier = require_entitlement_value(snapshot.tier, PLAN_TIER_VALUES, "tier")
+    billing_period = require_entitlement_value(
+        snapshot.billing_period,
+        BILLING_PERIOD_VALUES,
+        "billingPeriod"
+    )
+    status = require_entitlement_value(snapshot.status, SUBSCRIPTION_STATUS_VALUES, "status")
+    source = require_entitlement_value(snapshot.source, ENTITLEMENT_SOURCE_VALUES, "source")
+    verification_state = require_entitlement_value(
+        snapshot.verification_state,
+        VERIFICATION_STATE_VALUES,
+        "verificationState"
+    )
+    recovery_action = require_entitlement_value(
+        snapshot.recovery_action,
+        RECOVERY_ACTION_VALUES,
+        "recoveryAction"
+    )
+
+    if tier == "FREE":
+        if (
+            billing_period != "NONE"
+            or status != "FREE_ACTIVE"
+            or source != "NONE"
+            or verification_state != "FREE_CANONICAL"
+            or snapshot.product_id is not None
+            or snapshot.base_plan_id is not None
+        ):
+            raise ApiHTTPException(
+                status_code=500,
+                code=ErrorCode.ENTITLEMENT_STATE_INVALID,
+                detail="stored Free entitlement is invalid"
+            )
+        return {
+            "tier": tier,
+            "billingPeriod": billing_period,
+            "status": status,
+            "source": source,
+            "verificationState": verification_state,
+            "recoveryAction": recovery_action,
+        }
+
+    expected_product_id = PRODUCT_ID_BY_TIER.get(tier)
+    expected_base_plan_id = BASE_PLAN_BY_PERIOD.get(billing_period)
+    if source != "GOOGLE_PLAY" or expected_product_id is None or expected_base_plan_id is None:
+        raise ApiHTTPException(
+            status_code=500,
+            code=ErrorCode.ENTITLEMENT_STATE_INVALID,
+            detail="stored paid entitlement product context is invalid"
+        )
+    if snapshot.product_id != expected_product_id or snapshot.base_plan_id != expected_base_plan_id:
+        raise ApiHTTPException(
+            status_code=500,
+            code=ErrorCode.ENTITLEMENT_STATE_INVALID,
+            detail="stored paid entitlement product/base plan mismatch"
+        )
+    if status in PAID_CONTINUITY_STATUSES and snapshot.valid_until_ms is None:
+        raise ApiHTTPException(
+            status_code=500,
+            code=ErrorCode.ENTITLEMENT_STATE_INVALID,
+            detail="stored paid entitlement is missing validUntilMs"
+        )
+    if status not in PAID_CONTINUITY_STATUSES and status not in DENIED_SUBSCRIPTION_STATUSES:
+        raise ApiHTTPException(
+            status_code=500,
+            code=ErrorCode.ENTITLEMENT_STATE_INVALID,
+            detail="stored paid entitlement status is invalid"
+        )
+    return {
+        "tier": tier,
+        "billingPeriod": billing_period,
+        "status": status,
+        "source": source,
+        "verificationState": verification_state,
+        "recoveryAction": recovery_action,
+    }
+
+
+def build_stored_entitlement_response(
+    current_user: CurrentUserRecord,
+    snapshot: AccountEntitlementSnapshot
+) -> dict[str, Any]:
+    values = require_stored_entitlement_contract(snapshot)
+    is_paid_continuity = values["status"] in PAID_CONTINUITY_STATUSES
+    return {
+        "entitlement": {
+            "accountSubject": current_user.user.id,
+            "tier": values["tier"],
+            "billingPeriod": values["billingPeriod"],
+            "status": values["status"],
+            "source": values["source"],
+            "verificationState": values["verificationState"],
+            "grantedFeatures": [],
+            "productId": snapshot.product_id,
+            "basePlanId": snapshot.base_plan_id,
+            "expiryTimeMs": snapshot.expiry_time_ms,
+            "autoRenewing": snapshot.auto_renewing,
+            "willLoseAccessAtMs": snapshot.will_lose_access_at_ms,
+            "verifiedAtMs": snapshot.verified_at_ms,
+            "fetchedAtMs": snapshot.fetched_at_ms,
+            "validUntilMs": snapshot.valid_until_ms if is_paid_continuity else None,
+            "staleAfterMs": snapshot.stale_after_ms
+            or (
+                PAID_CONTINUITY_STALE_AFTER_MS
+                if is_paid_continuity
+                else DENIED_ENTITLEMENT_STALE_AFTER_MS
+            ),
+            "hardRefreshAfterMs": snapshot.hard_refresh_after_ms
+            or (
+                PAID_CONTINUITY_HARD_REFRESH_AFTER_MS
+                if is_paid_continuity
+                else DENIED_ENTITLEMENT_HARD_REFRESH_AFTER_MS
+            ),
+            "recoveryAction": values["recoveryAction"],
+            "manageSubscriptionUrl": None,
+            "providerStates": {
+                "skySight": {
+                    "accountState": "UNKNOWN",
+                    "verifiedAtMs": None,
+                    "validUntilMs": None,
+                    "errorCode": None
+                },
+                "pureTrack": {
+                    "appKeyConfigured": False,
+                    "trafficApiAllowed": False,
+                    "insertApiConfigured": False,
+                    "userAccess": "UNKNOWN",
+                    "verifiedAtMs": None,
+                    "validUntilMs": None,
+                    "errorCode": None
+                }
+            }
+        },
+        "auditId": None
+    }
+
+
+def build_entitlement_response(db, current_user: CurrentUserRecord) -> dict[str, Any]:
+    snapshot = (
+        db.query(AccountEntitlementSnapshot)
+        .filter(AccountEntitlementSnapshot.user_id == current_user.user.id)
+        .first()
+    )
+    if snapshot is None:
+        return build_canonical_free_entitlement_response(current_user)
+    return build_stored_entitlement_response(current_user, snapshot)
 
 
 def ensure_profile_complete(
@@ -2338,7 +2582,7 @@ def get_subscription_entitlements(
     try:
         current_user = ensure_current_user_record(db, authorization)
         validate_entitlement_package_name(package_name)
-        return build_canonical_free_entitlement_response(current_user)
+        return build_entitlement_response(db, current_user)
     finally:
         db.close()
 
