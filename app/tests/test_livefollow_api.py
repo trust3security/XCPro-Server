@@ -1890,6 +1890,9 @@ class PrivateFollowReleaseHardeningTest(unittest.TestCase):
                         "privacy_settings",
                         "follow_requests",
                         "follow_edges",
+                        "billing_google_purchases",
+                        "billing_google_events",
+                        "billing_audit_records",
                     }.issubset(table_names)
                 )
                 self.assertIn(
