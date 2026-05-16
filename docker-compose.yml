@@ -10,7 +10,7 @@ services:
       - db
       - redis
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/xcpro
+      DATABASE_URL: ${DATABASE_URL}
       XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE: ${XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE:-false}
 
   db:
