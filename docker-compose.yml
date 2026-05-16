@@ -10,7 +10,20 @@ services:
       - redis
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      XCPRO_RUNTIME_ENV: ${XCPRO_RUNTIME_ENV:-prod}
       XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE: ${XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE:-false}
+      XCPRO_GOOGLE_PLAY_PACKAGE_NAME: ${XCPRO_GOOGLE_PLAY_PACKAGE_NAME:-com.trust3.xcpro}
+      XCPRO_GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH: ${XCPRO_GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/google-play-service-account.json}
+      XCPRO_GOOGLE_PLAY_RTDN_OIDC_AUDIENCE: ${XCPRO_GOOGLE_PLAY_RTDN_OIDC_AUDIENCE:-https://api.xcpro.com.au/api/v1/subscriptions/googleplay/rtdn}
+      XCPRO_GOOGLE_PLAY_RTDN_EXPECTED_SERVICE_ACCOUNT_EMAIL: ${XCPRO_GOOGLE_PLAY_RTDN_EXPECTED_SERVICE_ACCOUNT_EMAIL:-xcpro-rtdn-push@xcpro-868cd.iam.gserviceaccount.com}
+      XCPRO_ALLOW_TEST_RTDN_HEADER_AUTH: ${XCPRO_ALLOW_TEST_RTDN_HEADER_AUTH:-false}
+    volumes:
+      - type: bind
+        source: /opt/xcpro/secrets/google-play-service-account.json
+        target: /run/secrets/google-play-service-account.json
+        read_only: true
+        bind:
+          create_host_path: false
 
   db:
     image: postgres:15

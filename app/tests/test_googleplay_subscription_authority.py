@@ -754,6 +754,199 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual("ACK_RETRYABLE", purchase.acknowledgement_state)
         self.assertEqual("ACTIVE", self.single_row(main_module.AccountEntitlementSnapshot).status)
 
+    def test_rtdn_test_notification_records_evidence_without_purchase_mutation(self):
+        purchase_token = "rtdn-test-notification-existing-token"
+        self.verifier.set_result(purchase_token, self.verification_result(status="ACTIVE"))
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        purchase_before = self.single_row(main_module.BillingGooglePurchase)
+        snapshot_before = self.single_row(main_module.AccountEntitlementSnapshot)
+        audit_count_before = self.count_rows(main_module.BillingAuditRecord)
+        self.clock.advance(minutes=5)
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_test_notification_envelope(
+                message_id="rtdn-test-notification-message-1"
+            ),
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("TEST_NOTIFICATION", response.json()["result"])
+        self.assertFalse(response.json()["deduped"])
+        self.assertEqual(1, self.count_rows(main_module.BillingGooglePurchase))
+        self.assertEqual(1, self.count_rows(main_module.AccountEntitlementSnapshot))
+        self.assertEqual(audit_count_before, self.count_rows(main_module.BillingAuditRecord))
+        self.assertEqual(1, len(self.verifier.calls))
+        purchase_after = self.single_row(main_module.BillingGooglePurchase)
+        snapshot_after = self.single_row(main_module.AccountEntitlementSnapshot)
+        self.assertEqual(purchase_before.updated_at, purchase_after.updated_at)
+        self.assertEqual(purchase_before.last_verified_at_ms, purchase_after.last_verified_at_ms)
+        self.assertEqual(snapshot_before.status, snapshot_after.status)
+        self.assertEqual(snapshot_before.updated_at, snapshot_after.updated_at)
+        event = self.single_row(main_module.BillingGoogleEvent)
+        self.assertEqual("TEST_NOTIFICATION", event.event_type)
+        self.assertEqual("TEST_NOTIFICATION", event.processing_result)
+        self.assertIsNone(event.product_id)
+        self.assertIsNone(event.purchase_token_hash)
+        self.assertIsNone(event.audit_id)
+        self.assertIsNotNone(event.processed_at)
+
+    def test_duplicate_rtdn_test_notification_is_idempotent(self):
+        envelope = self.rtdn_test_notification_envelope(
+            message_id="rtdn-test-notification-duplicate"
+        )
+
+        first = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=envelope,
+            headers=self.rtdn_headers(),
+        )
+        duplicate = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=envelope,
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, first.status_code)
+        self.assertEqual("TEST_NOTIFICATION", first.json()["result"])
+        self.assertFalse(first.json()["deduped"])
+        self.assertEqual(200, duplicate.status_code)
+        self.assertEqual("TEST_NOTIFICATION", duplicate.json()["result"])
+        self.assertTrue(duplicate.json()["deduped"])
+        self.assertEqual(1, self.count_rows(main_module.BillingGoogleEvent))
+        self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+        self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+        self.assertEqual(0, self.count_rows(main_module.BillingAuditRecord))
+        self.assertEqual([], self.verifier.calls)
+
+    def test_rtdn_without_subscription_id_uses_stored_owned_purchase_metadata(self):
+        purchase_token = "rtdn-owned-token-without-subscription-id"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_xc",
+                base_plan_id="annual",
+            ),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_xc",
+                base_plan_id="annual",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="EXPIRED",
+                product_id="xcpro_xc",
+                base_plan_id="annual",
+                expiry_time_ms=1777000000000,
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_envelope(
+                message_id="rtdn-no-subscription-id-owned",
+                purchase_token=purchase_token,
+                product_id=None,
+            ),
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("REVOKED_OR_EXPIRED", response.json()["result"])
+        self.assertEqual(
+            ["xcpro_xc", "xcpro_xc"],
+            [call["productId"] for call in self.verifier.calls],
+        )
+        purchase = self.single_row(main_module.BillingGooglePurchase)
+        self.assertEqual("xcpro_xc", purchase.product_id)
+        self.assertEqual("annual", purchase.base_plan_id)
+        self.assertEqual("EXPIRED", self.single_row(main_module.AccountEntitlementSnapshot).status)
+
+    def test_unknown_rtdn_without_subscription_id_records_token_not_owned(self):
+        purchase_token = "rtdn-unknown-no-subscription-id-token"
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_envelope(
+                message_id="rtdn-no-subscription-id-unknown",
+                purchase_token=purchase_token,
+                product_id=None,
+            ),
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("TOKEN_NOT_OWNED", response.json()["result"])
+        self.assertEqual([], self.verifier.calls)
+        self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+        self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+        event = self.single_row(main_module.BillingGoogleEvent)
+        self.assertEqual(
+            main_module.hash_purchase_token(purchase_token),
+            event.purchase_token_hash,
+        )
+        self.assertIsNone(event.product_id)
+        audit = self.single_row(main_module.BillingAuditRecord)
+        self.assertEqual("TOKEN_NOT_OWNED", audit.result)
+        self.assertEqual(
+            main_module.hash_purchase_token(purchase_token),
+            audit.purchase_token_hash,
+        )
+
+    def test_rtdn_missing_message_id_and_invalid_base64_still_return_422(self):
+        valid_payload = {
+            "version": "1.0",
+            "packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+            "eventTimeMillis": "1777000000000",
+            "testNotification": {"version": "1.0"},
+        }
+        missing_message_id = {
+            "message": {
+                "publishTime": "2026-05-15T10:00:00Z",
+                "data": base64.b64encode(json.dumps(valid_payload).encode("utf-8")).decode("ascii"),
+            },
+            "subscription": "projects/test/subscriptions/google-play-rtdn",
+        }
+        invalid_base64 = {
+            "message": {
+                "messageId": "rtdn-invalid-base64",
+                "publishTime": "2026-05-15T10:00:00Z",
+                "data": "not valid base64",
+            },
+            "subscription": "projects/test/subscriptions/google-play-rtdn",
+        }
+
+        missing = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=missing_message_id,
+            headers=self.rtdn_headers(),
+        )
+        invalid = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=invalid_base64,
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(422, missing.status_code)
+        self.assertEqual(main_module.ErrorCode.INVALID_RTDN_ENVELOPE, missing.json()["code"])
+        self.assertEqual(422, invalid.status_code)
+        self.assertEqual(main_module.ErrorCode.INVALID_RTDN_ENVELOPE, invalid.json()["code"])
+        self.assertEqual(0, self.count_rows(main_module.BillingGoogleEvent))
+
     def test_duplicate_rtdn_message_id_is_idempotent(self):
         purchase_token = "rtdn-owned-token"
         self.verifier.set_result(purchase_token, self.verification_result(status="ACTIVE"))
@@ -1106,28 +1299,54 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
 
     def rtdn_envelope(
         self,
-        message_id: str,
+        message_id: str | None,
         purchase_token: str,
         package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME,
-        product_id: str = "xcpro_pro",
+        product_id: str | None = "xcpro_pro",
+    ):
+        subscription_notification = {
+            "version": "1.0",
+            "notificationType": 13,
+            "purchaseToken": purchase_token,
+        }
+        if product_id is not None:
+            subscription_notification["subscriptionId"] = product_id
+        payload = {
+            "version": "1.0",
+            "packageName": package_name,
+            "eventTimeMillis": "1777000000000",
+            "subscriptionNotification": subscription_notification,
+        }
+        message = {
+            "publishTime": "2026-05-15T10:00:00Z",
+            "data": base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii"),
+        }
+        if message_id is not None:
+            message["messageId"] = message_id
+        return {
+            "message": message,
+            "subscription": "projects/test/subscriptions/google-play-rtdn",
+        }
+
+    def rtdn_test_notification_envelope(
+        self,
+        message_id: str | None,
+        package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME,
     ):
         payload = {
             "version": "1.0",
             "packageName": package_name,
             "eventTimeMillis": "1777000000000",
-            "subscriptionNotification": {
-                "version": "1.0",
-                "notificationType": 13,
-                "purchaseToken": purchase_token,
-                "subscriptionId": product_id,
-            },
+            "testNotification": {"version": "1.0"},
         }
+        message = {
+            "publishTime": "2026-05-15T10:00:00Z",
+            "data": base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii"),
+        }
+        if message_id is not None:
+            message["messageId"] = message_id
         return {
-            "message": {
-                "messageId": message_id,
-                "publishTime": "2026-05-15T10:00:00Z",
-                "data": base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii"),
-            },
+            "message": message,
             "subscription": "projects/test/subscriptions/google-play-rtdn",
         }
 

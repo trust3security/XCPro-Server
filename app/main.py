@@ -170,6 +170,7 @@ GOOGLE_PLAY_ANDROID_PUBLISHER_BASE_URL = (
 GOOGLE_PLAY_RTDN_PROCESSING_RESULTS = frozenset({
     "RECORDED",
     "DUPLICATE",
+    "TEST_NOTIFICATION",
     "ACCEPTED_VERIFIED",
     "ACCEPTED_PENDING",
     "REVOKED_OR_EXPIRED",
@@ -2757,24 +2758,42 @@ def decode_pubsub_rtdn_payload(envelope: PubSubPushEnvelope) -> dict[str, Any]:
             code=ErrorCode.INVALID_RTDN_ENVELOPE,
             detail="Pub/Sub message data is invalid"
         )
+    package_name = trim_to_none(decoded_json.get("packageName"))
+    test_notification = decoded_json.get("testNotification")
+    if isinstance(test_notification, dict):
+        if package_name is None:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.INVALID_RTDN_ENVELOPE,
+                detail="RTDN packageName is required"
+            )
+        return {
+            "messageId": message_id,
+            "publishedAt": envelope.message.publishTime or envelope.message.publish_time,
+            "packageName": package_name,
+            "productId": None,
+            "purchaseToken": None,
+            "purchaseTokenHash": None,
+            "eventType": "TEST_NOTIFICATION",
+        }
+
     subscription_notification = decoded_json.get("subscriptionNotification")
     if not isinstance(subscription_notification, dict):
         raise ApiHTTPException(
             status_code=422,
             code=ErrorCode.INVALID_RTDN_ENVELOPE,
-            detail="subscription notification is required"
+            detail="subscription or test notification is required"
         )
-    package_name = trim_to_none(decoded_json.get("packageName"))
     product_id = trim_to_none(subscription_notification.get("subscriptionId"))
     purchase_token = trim_to_none(subscription_notification.get("purchaseToken"))
     notification_type = str(
         subscription_notification.get("notificationType", "UNKNOWN")
     ).strip() or "UNKNOWN"
-    if package_name is None or product_id is None or purchase_token is None:
+    if package_name is None or purchase_token is None:
         raise ApiHTTPException(
             status_code=422,
             code=ErrorCode.INVALID_RTDN_ENVELOPE,
-            detail="RTDN packageName, subscriptionId, and purchaseToken are required"
+            detail="RTDN packageName and purchaseToken are required"
         )
     return {
         "messageId": message_id,
@@ -2849,13 +2868,13 @@ def process_google_play_rtdn_event(
             auditId=None,
         )
 
-    if validate_google_play_product_id(decoded["productId"]) is None:
-        event.processing_result = "INVALID_PRODUCT"
+    if decoded["eventType"] == "TEST_NOTIFICATION":
+        event.processing_result = "TEST_NOTIFICATION"
         event.processed_at = utcnow()
         event.updated_at = utcnow()
         db.commit()
         return GooglePlayRtdnIngestionResponse(
-            result="INVALID_PRODUCT",
+            result="TEST_NOTIFICATION",
             deduped=False,
             auditId=None,
         )
@@ -2889,11 +2908,23 @@ def process_google_play_rtdn_event(
             auditId=audit_id,
         )
 
+    product_id = purchase.product_id
+    if validate_google_play_product_id(product_id) is None:
+        event.processing_result = "INVALID_PRODUCT"
+        event.processed_at = utcnow()
+        event.updated_at = utcnow()
+        db.commit()
+        return GooglePlayRtdnIngestionResponse(
+            result="INVALID_PRODUCT",
+            deduped=False,
+            auditId=None,
+        )
+
     outcome = process_google_play_purchase_for_user(
         db=db,
         user_id=purchase.user_id,
         package_name=decoded["packageName"],
-        product_id=decoded["productId"],
+        product_id=product_id,
         base_plan_id=purchase.base_plan_id,
         purchase_token_hash=decoded["purchaseTokenHash"],
         purchase_token=decoded["purchaseToken"],
