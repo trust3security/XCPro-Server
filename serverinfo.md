@@ -49,6 +49,25 @@ Current services:
 - `xcpro-db`
 - `xcpro-redis`
 
+Private-follow notification delivery runs as a host-owned systemd timer that
+invokes the server-owned command inside the API container:
+
+```bash
+docker compose exec -T api python /app/scripts/deliver_notifications.py --confirm-send --limit 50
+```
+
+Installed units:
+
+```text
+/etc/systemd/system/xcpro-notification-delivery.service
+/etc/systemd/system/xcpro-notification-delivery.timer
+```
+
+The timer runs once per minute with `OnCalendar=*:0/1`. The service uses
+`flock` on `/run/xcpro-notification-delivery.lock` so delivery runs do not
+overlap. The FCM service account JSON stays outside Git under
+`/opt/xcpro/secrets/` and is mounted read-only into the container.
+
 ## API service
 
 The API is built from the local server files under `/opt/xcpro/app`.
@@ -133,6 +152,8 @@ These included:
 - no documented staging environment
 - no automated GitHub deploy pipeline
 - current deployment process is manual
+- private-follow notification delivery is scheduled by a host systemd timer,
+  not a dedicated Compose worker service
 - production secrets live outside Git on the server in `/opt/xcpro/.env`
 - `.env.example` in this repo shows the required variable names only
 - the real `.env` file must never be committed

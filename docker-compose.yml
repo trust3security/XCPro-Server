@@ -15,15 +15,24 @@ services:
       XCPRO_GOOGLE_SERVER_CLIENT_IDS: ${XCPRO_GOOGLE_SERVER_CLIENT_IDS}
       XCPRO_GOOGLE_SERVER_CLIENT_ID: ${XCPRO_GOOGLE_SERVER_CLIENT_ID:-}
       XCPRO_PRIVATE_FOLLOW_BEARER_SECRET: ${XCPRO_PRIVATE_FOLLOW_BEARER_SECRET}
+      XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET: ${XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET}
       XCPRO_GOOGLE_PLAY_PACKAGE_NAME: ${XCPRO_GOOGLE_PLAY_PACKAGE_NAME:-com.trust3.xcpro}
       XCPRO_GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH: ${XCPRO_GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/google-play-service-account.json}
       XCPRO_GOOGLE_PLAY_RTDN_OIDC_AUDIENCE: ${XCPRO_GOOGLE_PLAY_RTDN_OIDC_AUDIENCE:-https://api.xcpro.com.au/api/v1/subscriptions/googleplay/rtdn}
       XCPRO_GOOGLE_PLAY_RTDN_EXPECTED_SERVICE_ACCOUNT_EMAIL: ${XCPRO_GOOGLE_PLAY_RTDN_EXPECTED_SERVICE_ACCOUNT_EMAIL:-xcpro-rtdn-push@xcpro-868cd.iam.gserviceaccount.com}
       XCPRO_ALLOW_TEST_RTDN_HEADER_AUTH: ${XCPRO_ALLOW_TEST_RTDN_HEADER_AUTH:-false}
+      XCPRO_FCM_PROJECT_ID: ${XCPRO_FCM_PROJECT_ID:-}
+      XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH: ${XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/fcm-service-account.json}
     volumes:
       - type: bind
         source: /opt/xcpro/secrets/google-play-service-account.json
         target: /run/secrets/google-play-service-account.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/xcpro/secrets/fcm-service-account.json
+        target: /run/secrets/fcm-service-account.json
         read_only: true
         bind:
           create_host_path: false

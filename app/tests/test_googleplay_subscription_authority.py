@@ -199,6 +199,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             static_bearer_tokens={},
             google_server_client_ids=frozenset(),
             private_follow_bearer_secret=None,
+            push_token_encryption_secret=None,
             private_follow_bearer_ttl_seconds=main_module.DEFAULT_PRIVATE_FOLLOW_BEARER_TTL_SECONDS,
         )
         self.primary_bearer_token = "test-bearer-token-1"
@@ -1103,6 +1104,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             static_bearer_tokens={},
             google_server_client_ids=frozenset(),
             private_follow_bearer_secret=None,
+            push_token_encryption_secret=None,
             private_follow_bearer_ttl_seconds=main_module.DEFAULT_PRIVATE_FOLLOW_BEARER_TTL_SECONDS,
         )
         main_module.GOOGLE_PLAY_RTDN_ALLOW_TEST_HEADER_AUTH = True

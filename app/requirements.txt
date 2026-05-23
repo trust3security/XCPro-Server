@@ -6,3 +6,4 @@ alembic
 httpx
 google-auth
 requests
+cryptography

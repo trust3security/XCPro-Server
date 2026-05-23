@@ -20,10 +20,11 @@ import re
 import base64
 
 import httpx
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, and_, create_engine, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 import redis
+from cryptography.fernet import Fernet, InvalidToken
 
 try:
     from google.auth.exceptions import GoogleAuthError
@@ -59,6 +60,19 @@ HANDLE_PATTERN = re.compile(r"^[a-z0-9._]{3,24}$")
 FOLLOW_REQUEST_STATUS_PENDING = "pending"
 FOLLOW_REQUEST_STATUS_ACCEPTED = "accepted"
 FOLLOW_REQUEST_STATUS_DECLINED = "declined"
+NOTIFICATION_EVENT_FOLLOW_REQUEST_RECEIVED = "follow_request_received"
+NOTIFICATION_EVENT_FOLLOW_REQUEST_ACCEPTED = "follow_request_accepted"
+NOTIFICATION_EVENT_FOLLOW_NEW_FOLLOWER = "follow_new_follower"
+NOTIFICATION_EVENT_FOLLOW_MUTUAL = "follow_mutual"
+NOTIFICATION_OUTBOX_STATUS_PENDING = "pending"
+NOTIFICATION_OUTBOX_STATUS_SENT = "sent"
+NOTIFICATION_OUTBOX_STATUS_RETRYABLE_FAILED = "retryable_failed"
+NOTIFICATION_OUTBOX_STATUS_FAILED = "failed"
+NOTIFICATION_OUTBOX_DELIVERABLE_STATUSES = frozenset({
+    NOTIFICATION_OUTBOX_STATUS_PENDING,
+    NOTIFICATION_OUTBOX_STATUS_RETRYABLE_FAILED,
+})
+NOTIFICATION_OUTBOX_ERROR_MAX_LENGTH = 320
 LIVE_VISIBILITY_OFF = "off"
 LIVE_VISIBILITY_FOLLOWERS = "followers"
 LIVE_VISIBILITY_PUBLIC = "public"
@@ -70,6 +84,8 @@ SEARCH_RELATIONSHIP_FOLLOWED_BY = "followed_by"
 SEARCH_RELATIONSHIP_MUTUAL = "mutual"
 MIN_SEARCH_QUERY_LENGTH = 2
 SEARCH_RESULT_LIMIT = 25
+RELATIONSHIP_LIST_DEFAULT_LIMIT = 50
+RELATIONSHIP_LIST_MAX_LIMIT = 200
 PRIVATE_FOLLOW_BEARER_VERSION = 1
 DEFAULT_PRIVATE_FOLLOW_BEARER_TTL_SECONDS = 60 * 60 * 24 * 30
 XCPRO_RELEASE_PACKAGE_NAME = "com.trust3.xcpro"
@@ -137,6 +153,24 @@ DENIED_SUBSCRIPTION_STATUSES = frozenset({
     "RECOVERY_REQUIRED",
     "ERROR",
 })
+LIVEFOLLOW_FOLLOWING_CAP_BY_TIER = {
+    "FREE": 1,
+    "BASIC": 4,
+    "SOARING": 15,
+    "XC": 50,
+    "PRO": 100,
+}
+RELATIONSHIP_LIMIT_UNDER = "under_limit"
+RELATIONSHIP_LIMIT_AT = "at_limit"
+RELATIONSHIP_LIMIT_OVER = "over_limit"
+PUSH_PLATFORM_ANDROID = "android"
+PUSH_PROVIDER_FCM = "fcm"
+PUSH_TOKEN_MAX_LENGTH = 4096
+PUSH_DEVICE_ID_MAX_LENGTH = 160
+PUSH_APP_VERSION_MAX_LENGTH = 80
+PUSH_TOKEN_FERNET_KEY_CONTEXT = b"xcpro-push-token-fernet-v1"
+FCM_MESSAGING_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
+FCM_SEND_URL_TEMPLATE = "https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
 GOOGLE_PLAY_SYNC_RESULT_VALUES = frozenset({
     "ACCEPTED_VERIFIED",
     "ACCEPTED_PENDING",
@@ -261,6 +295,13 @@ class ErrorCode:
     ALREADY_FOLLOWING = "already_following"
     FOLLOW_REQUEST_NOT_FOUND = "follow_request_not_found"
     FOLLOW_REQUEST_NOT_PENDING = "follow_request_not_pending"
+    LIVEFOLLOW_FOLLOWING_LIMIT_EXCEEDED = "livefollow_following_limit_exceeded"
+    NOT_AUTHORIZED_TO_VIEW_FOLLOWERS = "not_authorized_to_view_followers"
+    NOT_AUTHORIZED_TO_VIEW_FOLLOWING = "not_authorized_to_view_following"
+    BLOCK_SELF = "block_self"
+    BLOCKED_RELATIONSHIP = "blocked_relationship"
+    INVALID_PUSH_TOKEN = "invalid_push_token"
+    PUSH_TOKEN_ENCRYPTION_UNAVAILABLE = "push_token_encryption_unavailable"
 
 
 POSITION_MONOTONIC_FIELD_NAMES = frozenset({
@@ -302,6 +343,7 @@ class PrivateFollowRuntimeConfig:
     static_bearer_tokens: dict[str, ResolvedBearerIdentity]
     google_server_client_ids: frozenset[str]
     private_follow_bearer_secret: Optional[bytes]
+    push_token_encryption_secret: Optional[bytes]
     private_follow_bearer_ttl_seconds: int
 
 
@@ -313,6 +355,12 @@ class GooglePlayRuntimeConfig:
     rtdn_expected_service_account_email: Optional[str]
     rtdn_test_ingest_token: Optional[str]
     allow_test_rtdn_header_auth: bool
+
+
+@dataclass(frozen=True)
+class FcmRuntimeConfig:
+    project_id: Optional[str]
+    service_account_json_path: Optional[str]
 
 
 def parse_boolean_env(name: str, raw_value: Optional[str], default: bool = False) -> bool:
@@ -427,6 +475,16 @@ def load_private_follow_bearer_secret_from_env(
     return raw_value.encode("utf-8")
 
 
+def load_push_token_encryption_secret_from_env(
+    env: Optional[dict[str, str]] = None
+) -> Optional[bytes]:
+    resolved_env = os.environ if env is None else env
+    raw_value = resolved_env.get("XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET", "").strip()
+    if not raw_value:
+        return None
+    return raw_value.encode("utf-8")
+
+
 def load_private_follow_bearer_ttl_seconds_from_env(
     env: Optional[dict[str, str]] = None
 ) -> int:
@@ -466,6 +524,7 @@ def build_private_follow_runtime_config(
         static_bearer_tokens=static_bearer_tokens,
         google_server_client_ids=load_google_server_client_ids_from_env(resolved_env),
         private_follow_bearer_secret=load_private_follow_bearer_secret_from_env(resolved_env),
+        push_token_encryption_secret=load_push_token_encryption_secret_from_env(resolved_env),
         private_follow_bearer_ttl_seconds=load_private_follow_bearer_ttl_seconds_from_env(resolved_env)
     )
 
@@ -516,6 +575,24 @@ def load_google_play_runtime_config(
     )
 
 
+def load_fcm_runtime_config(
+    env: Optional[dict[str, str]] = None
+) -> FcmRuntimeConfig:
+    resolved_env = os.environ if env is None else env
+    return FcmRuntimeConfig(
+        project_id=env_value_or_none(
+            resolved_env,
+            "XCPRO_FCM_PROJECT_ID",
+            "FIREBASE_PROJECT_ID",
+        ),
+        service_account_json_path=env_value_or_none(
+            resolved_env,
+            "XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ),
+    )
+
+
 def collect_private_follow_runtime_safety_errors(
     config: PrivateFollowRuntimeConfig
 ) -> list[str]:
@@ -542,6 +619,8 @@ def collect_private_follow_preflight_errors(
             )
         if config.private_follow_bearer_secret is None:
             errors.append("Missing XCPRO_PRIVATE_FOLLOW_BEARER_SECRET")
+        if config.push_token_encryption_secret is None:
+            errors.append("Missing XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET")
     return errors
 
 
@@ -565,6 +644,10 @@ def collect_private_follow_preflight_warnings(
         warnings.append(
             "Issued XCPro bearer tokens remain unavailable until XCPRO_PRIVATE_FOLLOW_BEARER_SECRET is configured"
         )
+    if config.runtime_env == RUNTIME_ENV_DEV and config.push_token_encryption_secret is None:
+        warnings.append(
+            "Push token registration remains unavailable until XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET is configured"
+        )
     if config.runtime_env == RUNTIME_ENV_PROD and config.allow_debug_entitlement_package:
         warnings.append(
             "Debug entitlement package com.trust3.xcpro.debug is accepted in prod; disable before public release"
@@ -587,6 +670,7 @@ def build_private_follow_preflight_report(
         "active_static_bearer_tokens": len(resolved_config.static_bearer_tokens),
         "has_google_server_client_ids": bool(resolved_config.google_server_client_ids),
         "has_private_follow_bearer_secret": resolved_config.private_follow_bearer_secret is not None,
+        "has_push_token_encryption_secret": resolved_config.push_token_encryption_secret is not None,
         "private_follow_bearer_ttl_seconds": resolved_config.private_follow_bearer_ttl_seconds,
         "errors": errors,
         "warnings": warnings,
@@ -606,8 +690,10 @@ assert_private_follow_runtime_safety(PRIVATE_FOLLOW_RUNTIME_CONFIG)
 STATIC_BEARER_TOKENS = PRIVATE_FOLLOW_RUNTIME_CONFIG.static_bearer_tokens
 GOOGLE_SERVER_CLIENT_IDS = PRIVATE_FOLLOW_RUNTIME_CONFIG.google_server_client_ids
 PRIVATE_FOLLOW_BEARER_SECRET = PRIVATE_FOLLOW_RUNTIME_CONFIG.private_follow_bearer_secret
+PUSH_TOKEN_ENCRYPTION_SECRET = PRIVATE_FOLLOW_RUNTIME_CONFIG.push_token_encryption_secret
 PRIVATE_FOLLOW_BEARER_TTL_SECONDS = PRIVATE_FOLLOW_RUNTIME_CONFIG.private_follow_bearer_ttl_seconds
 GOOGLE_PLAY_RUNTIME_CONFIG = load_google_play_runtime_config()
+FCM_RUNTIME_CONFIG = load_fcm_runtime_config()
 GOOGLE_PLAY_RTDN_INGEST_TOKEN = GOOGLE_PLAY_RUNTIME_CONFIG.rtdn_test_ingest_token
 GOOGLE_PLAY_RTDN_ALLOW_TEST_HEADER_AUTH = (
     GOOGLE_PLAY_RUNTIME_CONFIG.allow_test_rtdn_header_auth
@@ -793,6 +879,43 @@ def hash_token(token: str) -> str:
 
 def hash_purchase_token(purchase_token: str) -> str:
     return hashlib.sha256(purchase_token.encode("utf-8")).hexdigest()
+
+
+def hash_push_token(push_token: str) -> str:
+    return hashlib.sha256(push_token.encode("utf-8")).hexdigest()
+
+
+def derive_push_token_fernet_key(secret: bytes) -> bytes:
+    return base64.urlsafe_b64encode(
+        hmac.new(
+            secret,
+            PUSH_TOKEN_FERNET_KEY_CONTEXT,
+            hashlib.sha256
+        ).digest()
+    )
+
+
+def build_push_token_fernet() -> Fernet:
+    if PUSH_TOKEN_ENCRYPTION_SECRET is None:
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PUSH_TOKEN_ENCRYPTION_UNAVAILABLE,
+            detail="push token encryption secret is not configured"
+        )
+    return Fernet(derive_push_token_fernet_key(PUSH_TOKEN_ENCRYPTION_SECRET))
+
+
+def encrypt_push_token(push_token: str) -> str:
+    return build_push_token_fernet().encrypt(push_token.encode("utf-8")).decode("ascii")
+
+
+def decrypt_push_token(push_token_ciphertext: str) -> str:
+    try:
+        return build_push_token_fernet().decrypt(
+            push_token_ciphertext.encode("ascii")
+        ).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError):
+        raise ValueError("push token ciphertext is invalid")
 
 
 def to_utc_naive(dt: datetime) -> datetime:
@@ -1099,6 +1222,99 @@ class FollowEdge(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
+class UserBlock(Base):
+    __tablename__ = "blocks"
+    __table_args__ = (
+        UniqueConstraint(
+            "blocker_user_id",
+            "blocked_user_id",
+            name="uq_blocks_blocker_blocked"
+        ),
+        CheckConstraint(
+            "blocker_user_id <> blocked_user_id",
+            name="ck_blocks_no_self_block"
+        ),
+    )
+
+    blocker_user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    blocked_user_id = Column(String, ForeignKey("users.id"), primary_key=True, index=True)
+    created_at = Column(DateTime, nullable=False)
+
+
+class DevicePushToken(Base):
+    __tablename__ = "device_push_tokens"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "platform",
+            "provider",
+            "device_id",
+            name="uq_device_push_tokens_user_platform_provider_device"
+        ),
+        CheckConstraint(
+            "platform IN ('android')",
+            name="ck_device_push_tokens_platform"
+        ),
+        CheckConstraint(
+            "provider IN ('fcm')",
+            name="ck_device_push_tokens_provider"
+        ),
+    )
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    platform = Column(String(24), nullable=False)
+    provider = Column(String(24), nullable=False)
+    token_hash = Column(String(64), nullable=False, index=True)
+    token_ciphertext = Column(Text, nullable=False)
+    device_id = Column(String(160), nullable=False)
+    app_version = Column(String(80), nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+
+
+class NotificationOutboxEvent(Base):
+    __tablename__ = "notification_outbox_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "dedupe_key",
+            name="uq_notification_outbox_events_dedupe_key"
+        ),
+        CheckConstraint(
+            (
+                "event_type IN ("
+                "'follow_request_received', "
+                "'follow_request_accepted', "
+                "'follow_new_follower', "
+                "'follow_mutual'"
+                ")"
+            ),
+            name="ck_notification_outbox_events_event_type"
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'sent', 'retryable_failed', 'failed')",
+            name="ck_notification_outbox_events_status"
+        ),
+    )
+
+    id = Column(String, primary_key=True, index=True)
+    event_type = Column(String(80), nullable=False, index=True)
+    recipient_user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    actor_user_id = Column(String, ForeignKey("users.id"), index=True, nullable=False)
+    follow_request_id = Column(String, ForeignKey("follow_requests.id"), index=True, nullable=True)
+    dedupe_key = Column(String(255), nullable=False)
+    status = Column(String(24), nullable=False)
+    attempt_count = Column(Integer, nullable=False)
+    last_attempt_at = Column(DateTime, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    last_error = Column(String(NOTIFICATION_OUTBOX_ERROR_MAX_LENGTH), nullable=True)
+    last_error_retryable = Column(Boolean, nullable=True)
+    payload_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
 class Position(BaseModel):
     """Deployed telemetry ingest contract.
 
@@ -1172,6 +1388,18 @@ class FollowRequestCreateRequest(BaseModel):
     target_user_id: str
 
 
+class BlockCreateRequest(BaseModel):
+    target_user_id: str
+
+
+class PushTokenRegistrationRequest(BaseModel):
+    token: str
+    device_id: str
+    platform: str = PUSH_PLATFORM_ANDROID
+    provider: str = PUSH_PROVIDER_FCM
+    app_version: Optional[str] = None
+
+
 class GooglePlaySyncRequest(BaseModel):
     packageName: str
     productId: str
@@ -1236,6 +1464,12 @@ class RelationshipLookup:
 
 
 @dataclass(frozen=True)
+class LiveFollowFollowingLimit:
+    effective_tier: str
+    max_following: int
+
+
+@dataclass(frozen=True)
 class GooglePlayVerificationResult:
     package_name: str
     product_id: str
@@ -1262,6 +1496,14 @@ class GooglePlayVerificationTemporarilyUnavailable(Exception):
 
 
 class GooglePlayVerificationRejected(Exception):
+    pass
+
+
+class FcmDeliveryTemporarilyUnavailable(Exception):
+    pass
+
+
+class FcmDeliveryRejected(Exception):
     pass
 
 
@@ -1393,6 +1635,102 @@ class AndroidPublisherApiClient:
             )
         self._handle_response(response)
         return True
+
+
+class FcmHttpV1Sender:
+    def __init__(
+        self,
+        config: Optional[FcmRuntimeConfig] = None,
+        timeout_seconds: float = 10.0,
+    ):
+        self.config = config
+        self.timeout_seconds = timeout_seconds
+
+    def resolved_config(self) -> FcmRuntimeConfig:
+        return self.config or FCM_RUNTIME_CONFIG
+
+    def _require_config(self) -> FcmRuntimeConfig:
+        config = self.resolved_config()
+        errors: list[str] = []
+        if google_service_account is None or google_requests is None:
+            errors.append("google-auth service account support is unavailable")
+        if not config.project_id:
+            errors.append("missing XCPRO_FCM_PROJECT_ID")
+        if not config.service_account_json_path:
+            errors.append("missing XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH")
+        elif not os.path.isfile(config.service_account_json_path):
+            errors.append("FCM service account JSON path is not readable")
+        if errors:
+            raise FcmDeliveryTemporarilyUnavailable("; ".join(errors))
+        return config
+
+    def _access_token(self) -> str:
+        config = self._require_config()
+        try:
+            credentials = google_service_account.Credentials.from_service_account_file(
+                config.service_account_json_path,
+                scopes=[FCM_MESSAGING_SCOPE],
+            )
+            credentials.refresh(google_requests.Request())
+        except Exception as exc:
+            if GoogleAuthError is not None and isinstance(exc, GoogleAuthError):
+                raise FcmDeliveryTemporarilyUnavailable(
+                    "FCM service account authentication failed"
+                )
+            raise FcmDeliveryTemporarilyUnavailable(
+                "FCM service account credentials are unavailable"
+            )
+        token = getattr(credentials, "token", None)
+        if not token:
+            raise FcmDeliveryTemporarilyUnavailable(
+                "FCM service account did not return an access token"
+            )
+        return token
+
+    def _authorized_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._access_token()}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def _handle_response(self, response: httpx.Response) -> None:
+        if 200 <= response.status_code < 300:
+            return
+        if response.status_code in {408, 429} or response.status_code >= 500:
+            raise FcmDeliveryTemporarilyUnavailable(
+                "FCM request temporarily unavailable"
+            )
+        if response.status_code in {401, 403}:
+            raise FcmDeliveryTemporarilyUnavailable(
+                "FCM authentication failed"
+            )
+        raise FcmDeliveryRejected(
+            f"FCM rejected message with status {response.status_code}"
+        )
+
+    def send_message(self, token: str, data: dict[str, str]) -> None:
+        config = self._require_config()
+        url = FCM_SEND_URL_TEMPLATE.format(project_id=quote(config.project_id, safe=""))
+        body = {
+            "message": {
+                "token": token,
+                "data": data,
+                "android": {
+                    "priority": "HIGH",
+                },
+            }
+        }
+        try:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(
+                    url,
+                    headers=self._authorized_headers(),
+                    json=body,
+                )
+        except httpx.HTTPError:
+            raise FcmDeliveryTemporarilyUnavailable("FCM request failed")
+        self._handle_response(response)
 
 
 def parse_google_play_timestamp_ms(raw_value: Optional[str]) -> Optional[int]:
@@ -1658,6 +1996,7 @@ class GooglePlayRtdnOidcAuthenticator:
 GOOGLE_PLAY_PURCHASE_VERIFIER = GooglePlayPurchaseVerifier()
 GOOGLE_PLAY_PURCHASE_ACKNOWLEDGER = GooglePlayPurchaseAcknowledger()
 GOOGLE_PLAY_RTDN_OIDC_AUTHENTICATOR = GooglePlayRtdnOidcAuthenticator()
+FCM_NOTIFICATION_SENDER = FcmHttpV1Sender()
 
 
 def requested_fields(model: BaseModel) -> set[str]:
@@ -1857,6 +2196,155 @@ def validate_privacy_value(field_name: str, value: str) -> str:
     return value
 
 
+def normalize_push_token_value(raw_token: str) -> str:
+    token = trim_to_none(raw_token)
+    if token is None or len(token) > PUSH_TOKEN_MAX_LENGTH:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.INVALID_PUSH_TOKEN,
+            detail="token is required"
+        )
+    return token
+
+
+def normalize_push_device_id(raw_device_id: str) -> str:
+    device_id = trim_to_none(raw_device_id)
+    if device_id is None or len(device_id) > PUSH_DEVICE_ID_MAX_LENGTH:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.INVALID_PUSH_TOKEN,
+            detail="device_id is required"
+        )
+    return device_id
+
+
+def normalize_push_platform(raw_platform: str) -> str:
+    platform = (trim_to_none(raw_platform) or "").lower()
+    if platform != PUSH_PLATFORM_ANDROID:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.INVALID_PUSH_TOKEN,
+            detail="platform must be android"
+        )
+    return platform
+
+
+def normalize_push_provider(raw_provider: str) -> str:
+    provider = (trim_to_none(raw_provider) or "").lower()
+    if provider != PUSH_PROVIDER_FCM:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.INVALID_PUSH_TOKEN,
+            detail="provider must be fcm"
+        )
+    return provider
+
+
+def normalize_push_app_version(raw_app_version: Optional[str]) -> Optional[str]:
+    app_version = trim_to_none(raw_app_version)
+    if app_version is not None and len(app_version) > PUSH_APP_VERSION_MAX_LENGTH:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.INVALID_PUSH_TOKEN,
+            detail="app_version is too long"
+        )
+    return app_version
+
+
+def build_push_token_registration_response(push_token: DevicePushToken) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "device_id": push_token.device_id,
+        "platform": push_token.platform,
+        "provider": push_token.provider,
+        "app_version": push_token.app_version,
+        "registered": True,
+        "updated_at": to_iso_utc(push_token.updated_at),
+    }
+
+
+def upsert_device_push_token(
+    db,
+    user_id: str,
+    request: PushTokenRegistrationRequest
+) -> DevicePushToken:
+    token = normalize_push_token_value(request.token)
+    device_id = normalize_push_device_id(request.device_id)
+    platform = normalize_push_platform(request.platform)
+    provider = normalize_push_provider(request.provider)
+    app_version = normalize_push_app_version(request.app_version)
+    token_hash = hash_push_token(token)
+    token_ciphertext = encrypt_push_token(token)
+    now = utcnow()
+
+    push_token = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == user_id,
+            DevicePushToken.platform == platform,
+            DevicePushToken.provider == provider,
+            DevicePushToken.device_id == device_id
+        )
+        .first()
+    )
+    if push_token is None:
+        push_token = DevicePushToken(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            platform=platform,
+            provider=provider,
+            device_id=device_id,
+            created_at=now
+        )
+        db.add(push_token)
+
+    push_token.token_hash = token_hash
+    push_token.token_ciphertext = token_ciphertext
+    push_token.app_version = app_version
+    push_token.updated_at = now
+    push_token.revoked_at = None
+
+    duplicate_active_rows = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.token_hash == token_hash,
+            DevicePushToken.revoked_at.is_(None),
+            DevicePushToken.id != push_token.id
+        )
+        .all()
+    )
+    for duplicate in duplicate_active_rows:
+        duplicate.revoked_at = now
+        duplicate.updated_at = now
+
+    return push_token
+
+
+def revoke_device_push_token(
+    db,
+    user_id: str,
+    device_id: str
+) -> bool:
+    normalized_device_id = normalize_push_device_id(device_id)
+    push_token = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == user_id,
+            DevicePushToken.platform == PUSH_PLATFORM_ANDROID,
+            DevicePushToken.provider == PUSH_PROVIDER_FCM,
+            DevicePushToken.device_id == normalized_device_id,
+            DevicePushToken.revoked_at.is_(None)
+        )
+        .first()
+    )
+    if push_token is None:
+        return False
+    now = utcnow()
+    push_token.revoked_at = now
+    push_token.updated_at = now
+    return True
+
+
 def ensure_current_user_record(
     db,
     authorization: Optional[str]
@@ -1998,9 +2486,13 @@ def build_privacy_response(privacy: PrivacySetting) -> dict[str, str]:
     }
 
 
-def build_me_response(current_user: CurrentUserRecord) -> dict[str, Any]:
+def build_me_response(db, current_user: CurrentUserRecord) -> dict[str, Any]:
     response = build_profile_response(current_user.profile)
     response["privacy"] = build_privacy_response(current_user.privacy)
+    response["relationship_limits"] = build_relationship_limits_response(
+        db,
+        current_user.user.id
+    )
     return response
 
 
@@ -2221,6 +2713,107 @@ def build_entitlement_response(db, current_user: CurrentUserRecord) -> dict[str,
     if snapshot is None:
         return build_canonical_free_entitlement_response(current_user)
     return build_stored_entitlement_response(current_user, snapshot)
+
+
+def build_free_livefollow_following_limit() -> LiveFollowFollowingLimit:
+    return LiveFollowFollowingLimit(
+        effective_tier="FREE",
+        max_following=LIVEFOLLOW_FOLLOWING_CAP_BY_TIER["FREE"]
+    )
+
+
+def resolve_effective_livefollow_following_limit(
+    db,
+    user_id: str
+) -> LiveFollowFollowingLimit:
+    snapshot = (
+        db.query(AccountEntitlementSnapshot)
+        .filter(AccountEntitlementSnapshot.user_id == user_id)
+        .first()
+    )
+    if snapshot is None:
+        return build_free_livefollow_following_limit()
+
+    try:
+        values = require_stored_entitlement_contract(snapshot)
+    except ApiHTTPException as exc:
+        if exc.code == ErrorCode.ENTITLEMENT_STATE_INVALID:
+            return build_free_livefollow_following_limit()
+        raise
+
+    tier = values["tier"]
+    if (
+        tier != "FREE"
+        and values["status"] in PAID_CONTINUITY_STATUSES
+        and values["verificationState"] == "VERIFIED"
+    ):
+        return LiveFollowFollowingLimit(
+            effective_tier=tier,
+            max_following=LIVEFOLLOW_FOLLOWING_CAP_BY_TIER[tier]
+        )
+    return build_free_livefollow_following_limit()
+
+
+def count_livefollow_following(db, user_id: str) -> int:
+    return (
+        db.query(FollowEdge)
+        .filter(FollowEdge.follower_user_id == user_id)
+        .count()
+    )
+
+
+def count_livefollow_followers(db, user_id: str) -> int:
+    return (
+        db.query(FollowEdge)
+        .filter(FollowEdge.followed_user_id == user_id)
+        .count()
+    )
+
+
+def relationship_limit_status(following_count: int, max_following: int) -> str:
+    if following_count < max_following:
+        return RELATIONSHIP_LIMIT_UNDER
+    if following_count == max_following:
+        return RELATIONSHIP_LIMIT_AT
+    return RELATIONSHIP_LIMIT_OVER
+
+
+def build_relationship_limits_response(db, user_id: str) -> dict[str, Any]:
+    following_count = count_livefollow_following(db, user_id)
+    limit = resolve_effective_livefollow_following_limit(db, user_id)
+    return {
+        "following_count": following_count,
+        "max_following": limit.max_following,
+        "status": relationship_limit_status(following_count, limit.max_following)
+    }
+
+
+def lock_user_for_following_capacity(db, user_id: str) -> User:
+    user = (
+        db.query(User)
+        .filter(User.id == user_id)
+        .with_for_update()
+        .first()
+    )
+    if user is None:
+        raise ApiHTTPException(
+            status_code=404,
+            code=ErrorCode.USER_NOT_FOUND,
+            detail="user not found"
+        )
+    return user
+
+
+def ensure_livefollow_following_capacity_available(db, follower_user_id: str) -> None:
+    lock_user_for_following_capacity(db, follower_user_id)
+    following_count = count_livefollow_following(db, follower_user_id)
+    limit = resolve_effective_livefollow_following_limit(db, follower_user_id)
+    if following_count >= limit.max_following:
+        raise ApiHTTPException(
+            status_code=409,
+            code=ErrorCode.LIVEFOLLOW_FOLLOWING_LIMIT_EXCEEDED,
+            detail="LiveFollow following limit exceeded"
+        )
 
 
 def sanitize_billing_audit_detail(value: Any) -> Any:
@@ -3054,6 +3647,411 @@ def load_relationship_lookup(
     )
 
 
+def parse_relationship_list_page_params(
+    limit: int,
+    cursor: Optional[str]
+) -> tuple[int, int]:
+    if limit < 1 or limit > RELATIONSHIP_LIST_MAX_LIMIT:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"limit must be between 1 and {RELATIONSHIP_LIST_MAX_LIMIT}"
+        )
+    if cursor is None:
+        return limit, 0
+
+    trimmed_cursor = cursor.strip()
+    if not trimmed_cursor or not trimmed_cursor.isdigit():
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail="cursor must be a non-negative offset"
+        )
+    return limit, int(trimmed_cursor)
+
+
+def approved_follow_edge_exists(
+    db,
+    follower_user_id: str,
+    followed_user_id: str
+) -> bool:
+    return (
+        db.query(FollowEdge)
+        .filter(
+            FollowEdge.follower_user_id == follower_user_id,
+            FollowEdge.followed_user_id == followed_user_id
+        )
+        .first()
+        is not None
+    )
+
+
+def load_blocked_counterpart_user_ids(db, user_id: str) -> set[str]:
+    block_rows = (
+        db.query(UserBlock.blocker_user_id, UserBlock.blocked_user_id)
+        .filter(
+            or_(
+                UserBlock.blocker_user_id == user_id,
+                UserBlock.blocked_user_id == user_id
+            )
+        )
+        .all()
+    )
+    blocked_user_ids: set[str] = set()
+    for blocker_user_id, blocked_user_id in block_rows:
+        if blocker_user_id == user_id:
+            blocked_user_ids.add(blocked_user_id)
+        else:
+            blocked_user_ids.add(blocker_user_id)
+    return blocked_user_ids
+
+
+def filter_blocked_counterparts(query, counterpart_column, blocked_user_ids: set[str]):
+    if not blocked_user_ids:
+        return query
+    return query.filter(~counterpart_column.in_(blocked_user_ids))
+
+
+def blocked_relationship_exists(db, first_user_id: str, second_user_id: str) -> bool:
+    return (
+        db.query(UserBlock)
+        .filter(
+            or_(
+                and_(
+                    UserBlock.blocker_user_id == first_user_id,
+                    UserBlock.blocked_user_id == second_user_id
+                ),
+                and_(
+                    UserBlock.blocker_user_id == second_user_id,
+                    UserBlock.blocked_user_id == first_user_id
+                )
+            )
+        )
+        .first()
+        is not None
+    )
+
+
+def ensure_relationship_not_blocked(db, first_user_id: str, second_user_id: str) -> None:
+    if blocked_relationship_exists(db, first_user_id, second_user_id):
+        raise ApiHTTPException(
+            status_code=409,
+            code=ErrorCode.BLOCKED_RELATIONSHIP,
+            detail="blocked relationship"
+        )
+
+
+def enqueue_follow_notification_event(
+    db,
+    event_type: str,
+    recipient_user_id: str,
+    actor_user_id: str,
+    follow_request_id: str,
+    occurred_at: datetime
+) -> Optional[NotificationOutboxEvent]:
+    if recipient_user_id == actor_user_id:
+        return None
+    if blocked_relationship_exists(db, recipient_user_id, actor_user_id):
+        return None
+
+    dedupe_key = ":".join(
+        [
+            event_type,
+            follow_request_id,
+            recipient_user_id,
+            to_iso_utc(occurred_at),
+        ]
+    )
+    existing_event = (
+        db.query(NotificationOutboxEvent)
+        .filter(NotificationOutboxEvent.dedupe_key == dedupe_key)
+        .first()
+    )
+    if existing_event is not None:
+        return existing_event
+
+    payload = {
+        "event_type": event_type,
+        "recipient_user_id": recipient_user_id,
+        "actor_user_id": actor_user_id,
+        "follow_request_id": follow_request_id,
+    }
+    notification_event = NotificationOutboxEvent(
+        id=str(uuid.uuid4()),
+        event_type=event_type,
+        recipient_user_id=recipient_user_id,
+        actor_user_id=actor_user_id,
+        follow_request_id=follow_request_id,
+        dedupe_key=dedupe_key,
+        status=NOTIFICATION_OUTBOX_STATUS_PENDING,
+        attempt_count=0,
+        last_attempt_at=None,
+        sent_at=None,
+        last_error=None,
+        last_error_retryable=None,
+        payload_json=json.dumps(payload, sort_keys=True),
+        created_at=occurred_at,
+        updated_at=occurred_at,
+    )
+    db.add(notification_event)
+    return notification_event
+
+
+def truncate_notification_error(message: str) -> str:
+    return message[:NOTIFICATION_OUTBOX_ERROR_MAX_LENGTH]
+
+
+def build_fcm_data_payload(event: NotificationOutboxEvent) -> dict[str, str]:
+    payload = json.loads(event.payload_json)
+    return {
+        "event_type": str(payload.get("event_type", event.event_type)),
+        "recipient_user_id": str(payload.get("recipient_user_id", event.recipient_user_id)),
+        "actor_user_id": str(payload.get("actor_user_id", event.actor_user_id)),
+        "follow_request_id": str(payload.get("follow_request_id", event.follow_request_id or "")),
+    }
+
+
+def mark_notification_delivery_result(
+    event: NotificationOutboxEvent,
+    now: datetime,
+    status: str,
+    error: Optional[str],
+    retryable: Optional[bool],
+) -> None:
+    event.status = status
+    event.updated_at = now
+    event.last_error = truncate_notification_error(error) if error else None
+    event.last_error_retryable = retryable
+    if status == NOTIFICATION_OUTBOX_STATUS_SENT:
+        event.sent_at = now
+
+
+def deliver_notification_event(
+    db,
+    event: NotificationOutboxEvent,
+    sender: Any,
+    now: datetime,
+) -> dict[str, int]:
+    event.attempt_count += 1
+    event.last_attempt_at = now
+    event.updated_at = now
+
+    active_tokens = (
+        db.query(DevicePushToken)
+        .filter(
+            DevicePushToken.user_id == event.recipient_user_id,
+            DevicePushToken.platform == PUSH_PLATFORM_ANDROID,
+            DevicePushToken.provider == PUSH_PROVIDER_FCM,
+            DevicePushToken.revoked_at.is_(None),
+        )
+        .order_by(DevicePushToken.created_at)
+        .all()
+    )
+    if not active_tokens:
+        mark_notification_delivery_result(
+            event,
+            now,
+            NOTIFICATION_OUTBOX_STATUS_FAILED,
+            "no active push tokens",
+            False,
+        )
+        return {"token_attempts": 0, "tokens_sent": 0}
+
+    payload = build_fcm_data_payload(event)
+    token_attempts = 0
+    tokens_sent = 0
+    retryable_errors = 0
+    terminal_errors = 0
+    last_error: Optional[str] = None
+    last_retryable: Optional[bool] = None
+    for push_token in active_tokens:
+        token_attempts += 1
+        try:
+            sender.send_message(decrypt_push_token(push_token.token_ciphertext), payload)
+            tokens_sent += 1
+        except FcmDeliveryTemporarilyUnavailable as exc:
+            retryable_errors += 1
+            last_error = str(exc) or "FCM temporarily unavailable"
+            last_retryable = True
+        except (FcmDeliveryRejected, ValueError) as exc:
+            terminal_errors += 1
+            last_error = str(exc) or "FCM message rejected"
+            last_retryable = False
+        except ApiHTTPException as exc:
+            retryable_errors += 1
+            last_error = str(exc.detail)
+            last_retryable = True
+
+    if tokens_sent > 0:
+        mark_notification_delivery_result(
+            event,
+            now,
+            NOTIFICATION_OUTBOX_STATUS_SENT,
+            None,
+            None,
+        )
+    elif retryable_errors > 0:
+        mark_notification_delivery_result(
+            event,
+            now,
+            NOTIFICATION_OUTBOX_STATUS_RETRYABLE_FAILED,
+            last_error or "FCM temporarily unavailable",
+            True,
+        )
+    else:
+        mark_notification_delivery_result(
+            event,
+            now,
+            NOTIFICATION_OUTBOX_STATUS_FAILED,
+            last_error or "FCM message rejected",
+            last_retryable if last_retryable is not None else False,
+        )
+
+    return {"token_attempts": token_attempts, "tokens_sent": tokens_sent}
+
+
+def deliver_pending_notification_events(
+    limit: int = 50,
+    sender: Optional[Any] = None,
+) -> dict[str, int]:
+    db = SessionLocal()
+    try:
+        resolved_limit = max(1, min(limit, 200))
+        events = (
+            db.query(NotificationOutboxEvent)
+            .filter(NotificationOutboxEvent.status.in_(NOTIFICATION_OUTBOX_DELIVERABLE_STATUSES))
+            .order_by(NotificationOutboxEvent.created_at)
+            .limit(resolved_limit)
+            .all()
+        )
+        delivery_sender = sender or FCM_NOTIFICATION_SENDER
+        summary = {
+            "events_attempted": 0,
+            "events_sent": 0,
+            "events_retryable_failed": 0,
+            "events_failed": 0,
+            "token_attempts": 0,
+            "tokens_sent": 0,
+        }
+        for event in events:
+            now = utcnow()
+            token_summary = deliver_notification_event(
+                db=db,
+                event=event,
+                sender=delivery_sender,
+                now=now,
+            )
+            summary["events_attempted"] += 1
+            summary["token_attempts"] += token_summary["token_attempts"]
+            summary["tokens_sent"] += token_summary["tokens_sent"]
+            if event.status == NOTIFICATION_OUTBOX_STATUS_SENT:
+                summary["events_sent"] += 1
+            elif event.status == NOTIFICATION_OUTBOX_STATUS_RETRYABLE_FAILED:
+                summary["events_retryable_failed"] += 1
+            elif event.status == NOTIFICATION_OUTBOX_STATUS_FAILED:
+                summary["events_failed"] += 1
+        db.commit()
+        return summary
+    finally:
+        db.close()
+
+
+def ensure_can_read_relationship_list(
+    db,
+    current_user_id: str,
+    target_user_id: str,
+    target_privacy: PrivacySetting,
+    error_code: str
+) -> None:
+    if current_user_id == target_user_id:
+        return
+    if target_privacy.connection_list_visibility == "public":
+        return
+    if target_privacy.connection_list_visibility == "mutuals_only":
+        if (
+            approved_follow_edge_exists(db, current_user_id, target_user_id)
+            and approved_follow_edge_exists(db, target_user_id, current_user_id)
+        ):
+            return
+    raise ApiHTTPException(
+        status_code=403,
+        code=error_code,
+        detail="not authorized to view relationship list"
+    )
+
+
+def load_livefollow_follow_count_maps(
+    db,
+    user_ids: list[str]
+) -> tuple[dict[str, int], dict[str, int]]:
+    if not user_ids:
+        return {}, {}
+
+    unique_user_ids = sorted(set(user_ids))
+    followers_count_by_user_id = {
+        user_id: count
+        for user_id, count in (
+            db.query(FollowEdge.followed_user_id, func.count(FollowEdge.follower_user_id))
+            .filter(FollowEdge.followed_user_id.in_(unique_user_ids))
+            .group_by(FollowEdge.followed_user_id)
+            .all()
+        )
+    }
+    following_count_by_user_id = {
+        user_id: count
+        for user_id, count in (
+            db.query(FollowEdge.follower_user_id, func.count(FollowEdge.followed_user_id))
+            .filter(FollowEdge.follower_user_id.in_(unique_user_ids))
+            .group_by(FollowEdge.follower_user_id)
+            .all()
+        )
+    }
+    return followers_count_by_user_id, following_count_by_user_id
+
+
+def build_relationship_list_item_response(
+    profile: PilotProfile,
+    lookup: RelationshipLookup,
+    followers_count_by_user_id: dict[str, int],
+    following_count_by_user_id: dict[str, int]
+) -> dict[str, Any]:
+    response = build_user_summary(profile)
+    response["followers_count"] = followers_count_by_user_id.get(profile.user_id, 0)
+    response["following_count"] = following_count_by_user_id.get(profile.user_id, 0)
+    response["relationship_state"] = build_relationship_state(lookup, profile.user_id)
+    return response
+
+
+def build_relationship_list_page_response(
+    db,
+    current_user_id: str,
+    profiles: list[PilotProfile],
+    total: int,
+    limit: int,
+    offset: int
+) -> dict[str, Any]:
+    user_ids = [profile.user_id for profile in profiles]
+    lookup = load_relationship_lookup(db, current_user_id, user_ids)
+    followers_count_by_user_id, following_count_by_user_id = (
+        load_livefollow_follow_count_maps(db, user_ids)
+    )
+    next_offset = offset + len(profiles)
+    next_cursor = str(next_offset) if next_offset < total else None
+    return {
+        "total": total,
+        "items": [
+            build_relationship_list_item_response(
+                profile,
+                lookup,
+                followers_count_by_user_id,
+                following_count_by_user_id
+            )
+            for profile in profiles
+        ],
+        "next_cursor": next_cursor
+    }
+
+
 def get_searchable_target_or_404(db, user_id: str) -> tuple[PilotProfile, PrivacySetting]:
     profile = db.query(PilotProfile).filter(PilotProfile.user_id == user_id).first()
     if profile is None:
@@ -3080,12 +4078,81 @@ def get_searchable_target_or_404(db, user_id: str) -> tuple[PilotProfile, Privac
     return profile, privacy
 
 
+def get_user_record_or_404(db, user_id: str) -> User:
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise ApiHTTPException(
+            status_code=404,
+            code=ErrorCode.USER_NOT_FOUND,
+            detail="user not found"
+        )
+    return user
+
+
+def remove_relationship_rows_between_users(
+    db,
+    first_user_id: str,
+    second_user_id: str
+) -> None:
+    follow_edges = (
+        db.query(FollowEdge)
+        .filter(
+            or_(
+                and_(
+                    FollowEdge.follower_user_id == first_user_id,
+                    FollowEdge.followed_user_id == second_user_id
+                ),
+                and_(
+                    FollowEdge.follower_user_id == second_user_id,
+                    FollowEdge.followed_user_id == first_user_id
+                )
+            )
+        )
+        .all()
+    )
+    for edge in follow_edges:
+        db.delete(edge)
+
+    pending_requests = (
+        db.query(FollowRequest)
+        .filter(
+            FollowRequest.status == FOLLOW_REQUEST_STATUS_PENDING,
+            or_(
+                and_(
+                    FollowRequest.requester_user_id == first_user_id,
+                    FollowRequest.target_user_id == second_user_id
+                ),
+                and_(
+                    FollowRequest.requester_user_id == second_user_id,
+                    FollowRequest.target_user_id == first_user_id
+                )
+            )
+        )
+        .all()
+    )
+    for request in pending_requests:
+        db.delete(request)
+
+
+def follow_edge_exists(db, follower_user_id: str, followed_user_id: str) -> bool:
+    return (
+        db.query(FollowEdge)
+        .filter(
+            FollowEdge.follower_user_id == follower_user_id,
+            FollowEdge.followed_user_id == followed_user_id
+        )
+        .first()
+        is not None
+    )
+
+
 def ensure_follow_edge(
     db,
     follower_user_id: str,
     followed_user_id: str,
     now: datetime
 ) -> None:
+    lock_user_for_following_capacity(db, follower_user_id)
     edge = (
         db.query(FollowEdge)
         .filter(
@@ -3095,6 +4162,14 @@ def ensure_follow_edge(
         .first()
     )
     if edge is None:
+        following_count = count_livefollow_following(db, follower_user_id)
+        limit = resolve_effective_livefollow_following_limit(db, follower_user_id)
+        if following_count >= limit.max_following:
+            raise ApiHTTPException(
+                status_code=409,
+                code=ErrorCode.LIVEFOLLOW_FOLLOWING_LIMIT_EXCEEDED,
+                detail="LiveFollow following limit exceeded"
+            )
         db.add(
             FollowEdge(
                 follower_user_id=follower_user_id,
@@ -3305,6 +4380,8 @@ def can_user_view_live_session(
     if owner_user_id is None:
         return False
     if visibility != LIVE_VISIBILITY_FOLLOWERS:
+        return False
+    if blocked_relationship_exists(db, viewer_user_id, owner_user_id):
         return False
 
     existing_edge = (
@@ -4045,7 +5122,44 @@ def get_current_user_me(
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
-        return build_me_response(current_user)
+        return build_me_response(db, current_user)
+    finally:
+        db.close()
+
+
+@app.post("/api/v2/me/push-tokens")
+def register_current_user_push_token(
+    request: PushTokenRegistrationRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        push_token = upsert_device_push_token(db, current_user.user.id, request)
+        db.commit()
+        db.refresh(push_token)
+        return build_push_token_registration_response(push_token)
+    finally:
+        db.close()
+
+
+@app.delete("/api/v2/me/push-tokens/{device_id}")
+def revoke_current_user_push_token(
+    device_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        revoked = revoke_device_push_token(db, current_user.user.id, device_id)
+        db.commit()
+        return {
+            "ok": True,
+            "device_id": normalize_push_device_id(device_id),
+            "platform": PUSH_PLATFORM_ANDROID,
+            "provider": PUSH_PROVIDER_FCM,
+            "revoked": revoked,
+        }
     finally:
         db.close()
 
@@ -4207,7 +5321,8 @@ def search_private_follow_users(
     try:
         current_user = ensure_current_user_record(db, authorization)
         normalized_query = normalize_search_query(q)
-        matching_profiles = (
+        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
+        search_query = (
             db.query(PilotProfile)
             .join(PrivacySetting, PrivacySetting.user_id == PilotProfile.user_id)
             .filter(
@@ -4217,8 +5332,13 @@ def search_private_follow_users(
                 PrivacySetting.discoverability == DEFAULT_DISCOVERABILITY,
                 PilotProfile.handle_normalized.like(f"%{normalized_query}%")
             )
-            .all()
         )
+        search_query = filter_blocked_counterparts(
+            search_query,
+            PilotProfile.user_id,
+            blocked_user_ids
+        )
+        matching_profiles = search_query.all()
         ordered_profiles = sorted(
             matching_profiles,
             key=lambda profile: (
@@ -4238,6 +5358,297 @@ def search_private_follow_users(
                 build_search_result_response(profile, lookup)
                 for profile in ordered_profiles
             ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/v2/users/{user_id}/followers")
+def list_user_followers(
+    user_id: str,
+    limit: int = RELATIONSHIP_LIST_DEFAULT_LIMIT,
+    cursor: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        _target_profile, target_privacy = get_searchable_target_or_404(db, user_id)
+        ensure_can_read_relationship_list(
+            db,
+            current_user.user.id,
+            user_id,
+            target_privacy,
+            ErrorCode.NOT_AUTHORIZED_TO_VIEW_FOLLOWERS
+        )
+        page_limit, offset = parse_relationship_list_page_params(limit, cursor)
+        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
+        followers_query = (
+            db.query(PilotProfile)
+            .join(FollowEdge, FollowEdge.follower_user_id == PilotProfile.user_id)
+            .filter(FollowEdge.followed_user_id == user_id)
+        )
+        followers_query = filter_blocked_counterparts(
+            followers_query,
+            FollowEdge.follower_user_id,
+            blocked_user_ids
+        )
+        total = followers_query.count()
+        profiles = (
+            followers_query
+            .order_by(FollowEdge.created_at.desc(), FollowEdge.follower_user_id.asc())
+            .offset(offset)
+            .limit(page_limit)
+            .all()
+        )
+        return build_relationship_list_page_response(
+            db,
+            current_user.user.id,
+            profiles,
+            total,
+            page_limit,
+            offset
+        )
+    finally:
+        db.close()
+
+
+@app.get("/api/v2/users/{user_id}/following")
+def list_user_following(
+    user_id: str,
+    limit: int = RELATIONSHIP_LIST_DEFAULT_LIMIT,
+    cursor: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        _target_profile, target_privacy = get_searchable_target_or_404(db, user_id)
+        ensure_can_read_relationship_list(
+            db,
+            current_user.user.id,
+            user_id,
+            target_privacy,
+            ErrorCode.NOT_AUTHORIZED_TO_VIEW_FOLLOWING
+        )
+        page_limit, offset = parse_relationship_list_page_params(limit, cursor)
+        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
+        following_query = (
+            db.query(PilotProfile)
+            .join(FollowEdge, FollowEdge.followed_user_id == PilotProfile.user_id)
+            .filter(FollowEdge.follower_user_id == user_id)
+        )
+        following_query = filter_blocked_counterparts(
+            following_query,
+            FollowEdge.followed_user_id,
+            blocked_user_ids
+        )
+        total = following_query.count()
+        profiles = (
+            following_query
+            .order_by(FollowEdge.created_at.desc(), FollowEdge.followed_user_id.asc())
+            .offset(offset)
+            .limit(page_limit)
+            .all()
+        )
+        return build_relationship_list_page_response(
+            db,
+            current_user.user.id,
+            profiles,
+            total,
+            page_limit,
+            offset
+        )
+    finally:
+        db.close()
+
+
+@app.delete("/api/v2/users/{user_id}/follow")
+def unfollow_user(
+    user_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        target_user_id = user_id.strip()
+        if not target_user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="user_id is required"
+            )
+        get_user_record_or_404(db, target_user_id)
+
+        edge = (
+            db.query(FollowEdge)
+            .filter(
+                FollowEdge.follower_user_id == current_user.user.id,
+                FollowEdge.followed_user_id == target_user_id
+            )
+            .first()
+        )
+        removed = edge is not None
+        if edge is not None:
+            db.delete(edge)
+            db.commit()
+
+        lookup = load_relationship_lookup(db, current_user.user.id, [target_user_id])
+        return {
+            "ok": True,
+            "removed": removed,
+            "relationship_state": build_relationship_state(lookup, target_user_id)
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/api/v2/me/followers/{user_id}")
+def remove_follower(
+    user_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        follower_user_id = user_id.strip()
+        if not follower_user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="user_id is required"
+            )
+        get_user_record_or_404(db, follower_user_id)
+
+        edge = (
+            db.query(FollowEdge)
+            .filter(
+                FollowEdge.follower_user_id == follower_user_id,
+                FollowEdge.followed_user_id == current_user.user.id
+            )
+            .first()
+        )
+        removed = edge is not None
+        if edge is not None:
+            db.delete(edge)
+            db.commit()
+
+        lookup = load_relationship_lookup(db, current_user.user.id, [follower_user_id])
+        return {
+            "ok": True,
+            "removed": removed,
+            "relationship_state": build_relationship_state(lookup, follower_user_id)
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/v2/blocks")
+def block_user(
+    request: BlockCreateRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        target_user_id = request.target_user_id.strip()
+        if not target_user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="target_user_id is required"
+            )
+        if target_user_id == current_user.user.id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.BLOCK_SELF,
+                detail="cannot block yourself"
+            )
+        get_user_record_or_404(db, target_user_id)
+
+        block = (
+            db.query(UserBlock)
+            .filter(
+                UserBlock.blocker_user_id == current_user.user.id,
+                UserBlock.blocked_user_id == target_user_id
+            )
+            .first()
+        )
+        if block is None:
+            db.add(
+                UserBlock(
+                    blocker_user_id=current_user.user.id,
+                    blocked_user_id=target_user_id,
+                    created_at=utcnow()
+                )
+            )
+        remove_relationship_rows_between_users(
+            db,
+            current_user.user.id,
+            target_user_id
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing_block = (
+                db.query(UserBlock)
+                .filter(
+                    UserBlock.blocker_user_id == current_user.user.id,
+                    UserBlock.blocked_user_id == target_user_id
+                )
+                .first()
+            )
+            if existing_block is None:
+                raise
+            remove_relationship_rows_between_users(
+                db,
+                current_user.user.id,
+                target_user_id
+            )
+            db.commit()
+        return {
+            "ok": True,
+            "blocked": True,
+            "target_user_id": target_user_id
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/api/v2/blocks/{user_id}")
+def unblock_user(
+    user_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        target_user_id = user_id.strip()
+        if not target_user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="user_id is required"
+            )
+        get_user_record_or_404(db, target_user_id)
+
+        block = (
+            db.query(UserBlock)
+            .filter(
+                UserBlock.blocker_user_id == current_user.user.id,
+                UserBlock.blocked_user_id == target_user_id
+            )
+            .first()
+        )
+        removed = block is not None
+        if block is not None:
+            db.delete(block)
+            db.commit()
+        return {
+            "ok": True,
+            "removed": removed,
+            "target_user_id": target_user_id
         }
     finally:
         db.close()
@@ -4270,6 +5681,7 @@ def create_follow_request(
             )
 
         target_profile, target_privacy = get_searchable_target_or_404(db, target_user_id)
+        ensure_relationship_not_blocked(db, current_user.user.id, target_user_id)
         existing_edge = (
             db.query(FollowEdge)
             .filter(
@@ -4312,6 +5724,7 @@ def create_follow_request(
             if target_privacy.follow_policy == "auto_approve"
             else FOLLOW_REQUEST_STATUS_PENDING
         )
+        ensure_livefollow_following_capacity_available(db, current_user.user.id)
         responded_at = now if final_status == FOLLOW_REQUEST_STATUS_ACCEPTED else None
         if follow_request is None:
             follow_request = FollowRequest(
@@ -4331,7 +5744,33 @@ def create_follow_request(
             follow_request.updated_at = now
 
         if final_status == FOLLOW_REQUEST_STATUS_ACCEPTED:
+            target_already_follows_requester = approved_follow_edge_exists(
+                db,
+                target_user_id,
+                current_user.user.id
+            )
             ensure_follow_edge(db, current_user.user.id, target_user_id, now)
+            enqueue_follow_notification_event(
+                db=db,
+                event_type=(
+                    NOTIFICATION_EVENT_FOLLOW_MUTUAL
+                    if target_already_follows_requester
+                    else NOTIFICATION_EVENT_FOLLOW_NEW_FOLLOWER
+                ),
+                recipient_user_id=target_user_id,
+                actor_user_id=current_user.user.id,
+                follow_request_id=follow_request.id,
+                occurred_at=now
+            )
+        else:
+            enqueue_follow_notification_event(
+                db=db,
+                event_type=NOTIFICATION_EVENT_FOLLOW_REQUEST_RECEIVED,
+                recipient_user_id=target_user_id,
+                actor_user_id=current_user.user.id,
+                follow_request_id=follow_request.id,
+                occurred_at=now
+            )
 
         db.commit()
         lookup = load_relationship_lookup(db, current_user.user.id, [target_user_id])
@@ -4352,13 +5791,22 @@ def list_incoming_follow_requests(
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
-        request_rows = (
+        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
+        incoming_query = (
             db.query(FollowRequest, PilotProfile)
             .join(PilotProfile, PilotProfile.user_id == FollowRequest.requester_user_id)
             .filter(
                 FollowRequest.target_user_id == current_user.user.id,
                 FollowRequest.status == FOLLOW_REQUEST_STATUS_PENDING
             )
+        )
+        incoming_query = filter_blocked_counterparts(
+            incoming_query,
+            FollowRequest.requester_user_id,
+            blocked_user_ids
+        )
+        request_rows = (
+            incoming_query
             .order_by(FollowRequest.updated_at.desc(), FollowRequest.id.desc())
             .all()
         )
@@ -4386,13 +5834,22 @@ def list_outgoing_follow_requests(
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
-        request_rows = (
+        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
+        outgoing_query = (
             db.query(FollowRequest, PilotProfile)
             .join(PilotProfile, PilotProfile.user_id == FollowRequest.target_user_id)
             .filter(
                 FollowRequest.requester_user_id == current_user.user.id,
                 FollowRequest.status == FOLLOW_REQUEST_STATUS_PENDING
             )
+        )
+        outgoing_query = filter_blocked_counterparts(
+            outgoing_query,
+            FollowRequest.target_user_id,
+            blocked_user_ids
+        )
+        request_rows = (
+            outgoing_query
             .order_by(FollowRequest.updated_at.desc(), FollowRequest.id.desc())
             .all()
         )
@@ -4435,6 +5892,58 @@ def get_follow_request_for_target_or_404(
     return follow_request
 
 
+def get_follow_request_for_requester_or_404(
+    db,
+    request_id: str,
+    requester_user_id: str
+) -> FollowRequest:
+    follow_request = (
+        db.query(FollowRequest)
+        .filter(
+            FollowRequest.id == request_id,
+            FollowRequest.requester_user_id == requester_user_id
+        )
+        .first()
+    )
+    if follow_request is None:
+        raise ApiHTTPException(
+            status_code=404,
+            code=ErrorCode.FOLLOW_REQUEST_NOT_FOUND,
+            detail="follow request not found"
+        )
+    return follow_request
+
+
+@app.delete("/api/v2/follow-requests/{request_id}")
+def cancel_outgoing_follow_request(
+    request_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        follow_request = get_follow_request_for_requester_or_404(
+            db,
+            request_id,
+            current_user.user.id
+        )
+        if follow_request.status != FOLLOW_REQUEST_STATUS_PENDING:
+            raise ApiHTTPException(
+                status_code=409,
+                code=ErrorCode.FOLLOW_REQUEST_NOT_PENDING,
+                detail="follow request is not pending"
+            )
+
+        db.delete(follow_request)
+        db.commit()
+        return {
+            "ok": True,
+            "request_id": request_id
+        }
+    finally:
+        db.close()
+
+
 @app.post("/api/v2/follow-requests/{request_id}/accept")
 def accept_follow_request(
     request_id: str,
@@ -4454,16 +5963,38 @@ def accept_follow_request(
                 code=ErrorCode.FOLLOW_REQUEST_NOT_PENDING,
                 detail="follow request is not pending"
             )
+        ensure_relationship_not_blocked(
+            db,
+            follow_request.requester_user_id,
+            follow_request.target_user_id
+        )
 
         now = utcnow()
-        follow_request.status = FOLLOW_REQUEST_STATUS_ACCEPTED
-        follow_request.responded_at = now
-        follow_request.updated_at = now
+        target_already_follows_requester = approved_follow_edge_exists(
+            db,
+            follow_request.target_user_id,
+            follow_request.requester_user_id
+        )
         ensure_follow_edge(
             db,
             follow_request.requester_user_id,
             follow_request.target_user_id,
             now
+        )
+        follow_request.status = FOLLOW_REQUEST_STATUS_ACCEPTED
+        follow_request.responded_at = now
+        follow_request.updated_at = now
+        enqueue_follow_notification_event(
+            db=db,
+            event_type=(
+                NOTIFICATION_EVENT_FOLLOW_MUTUAL
+                if target_already_follows_requester
+                else NOTIFICATION_EVENT_FOLLOW_REQUEST_ACCEPTED
+            ),
+            recipient_user_id=follow_request.requester_user_id,
+            actor_user_id=follow_request.target_user_id,
+            follow_request_id=follow_request.id,
+            occurred_at=now
         )
         db.commit()
 
@@ -4538,7 +6069,8 @@ def get_following_active_live_sessions(
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
-        rows = (
+        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
+        following_active_query = (
             db.query(LiveSession, PilotProfile)
             .join(
                 FollowEdge,
@@ -4555,6 +6087,14 @@ def get_following_active_live_sessions(
                     [LIVE_VISIBILITY_FOLLOWERS, LIVE_VISIBILITY_PUBLIC]
                 )
             )
+        )
+        following_active_query = filter_blocked_counterparts(
+            following_active_query,
+            LiveSession.owner_user_id,
+            blocked_user_ids
+        )
+        rows = (
+            following_active_query
             .order_by(
                 LiveSession.last_position_at.desc(),
                 LiveSession.created_at.desc(),

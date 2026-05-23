@@ -64,9 +64,104 @@ Example format only:
 POSTGRES_DB=xcpro
 POSTGRES_PASSWORD=change-me
 DATABASE_URL=postgresql://postgres:change-me@db:5432/xcpro
+XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET=generated-secret
+XCPRO_FCM_PROJECT_ID=your-firebase-project-id
+XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH=/run/secrets/fcm-service-account.json
 ```
 
 Do not commit the real production values.
+
+## Private-follow notification delivery
+
+Private-follow push notifications are delivered by `XCPro_Server` through
+Firebase Cloud Messaging. Firebase is only the push transport:
+- do not add Firebase-hosted backend logic
+- do not use paid Firebase services for this path
+- do not log raw FCM device tokens
+- do not send live-now notifications from this private-follow worker
+
+The server-owned notification outbox currently emits only these private-follow
+event types:
+- `follow_request_received`
+- `follow_request_accepted`
+- `follow_new_follower`
+- `follow_mutual`
+
+### Required production secrets
+
+The FCM service account JSON must live outside Git on the production host:
+
+```text
+/opt/xcpro/secrets/fcm-service-account.json
+```
+
+The API container receives it read-only at:
+
+```text
+/run/secrets/fcm-service-account.json
+```
+
+Production `.env` must provide:
+
+```dotenv
+XCPRO_FCM_PROJECT_ID=your-firebase-project-id
+XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH=/run/secrets/fcm-service-account.json
+XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET=generated-secret
+```
+
+Do not commit the service account JSON or paste its contents into docs, logs,
+test fixtures, or shell history.
+
+### Manual delivery command
+
+After the API container is running, deliver queued private-follow notification
+outbox events with:
+
+```bash
+cd /opt/xcpro
+docker compose exec -T api python /app/scripts/deliver_notifications.py --confirm-send --limit 50
+```
+
+The `--confirm-send` flag is intentionally required so accidental command
+execution does not call FCM. The command prints aggregate counts only; it must
+not print raw FCM tokens.
+
+### Production scheduling
+
+Production scheduling is host-owned through systemd:
+
+```text
+/etc/systemd/system/xcpro-notification-delivery.service
+/etc/systemd/system/xcpro-notification-delivery.timer
+```
+
+The timer runs once per minute:
+
+```ini
+OnCalendar=*:0/1
+```
+
+The service uses `flock` to prevent overlapping delivery runs:
+
+```bash
+cd /opt/xcpro
+/usr/bin/flock -n /run/xcpro-notification-delivery.lock \
+  /usr/bin/docker compose exec -T api \
+  python /app/scripts/deliver_notifications.py --confirm-send --limit 50
+```
+
+Inspect scheduler status and recent aggregate delivery output with:
+
+```bash
+systemctl status xcpro-notification-delivery.timer --no-pager -l
+systemctl status xcpro-notification-delivery.service --no-pager -l
+journalctl -u xcpro-notification-delivery.service -n 50 --no-pager
+```
+
+This scheduler calls the server-owned outbox delivery command. It does not move
+delivery into Android, request handlers, Firebase Functions, or any
+Firebase-hosted backend logic. Journal output must remain aggregate-only and
+must not include raw FCM device tokens, access tokens, or service account JSON.
 
 ## Before changing production
 
