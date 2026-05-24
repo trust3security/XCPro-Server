@@ -18,9 +18,11 @@ import hmac
 import math
 import re
 import base64
+import threading
+import time
 
 import httpx
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, and_, create_engine, func, or_, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, case, create_engine, func, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 import redis
@@ -56,6 +58,9 @@ MIN_REASONABLE_ALT_M = -1000
 MAX_REASONABLE_SPEED = 1000
 MAX_IMPOSSIBLE_GROUND_SPEED_KMH = 500
 MAX_TASK_RADIUS_M = 500000
+SPECTATOR_STATS_CURRENT_CLIMB_MAX_DELTA_SECONDS = 120.0
+SPECTATOR_STATS_BEST_CLIMB_MIN_WINDOW_SECONDS = 20.0
+SPECTATOR_STATS_BEST_CLIMB_MAX_WINDOW_SECONDS = 45.0
 HANDLE_PATTERN = re.compile(r"^[a-z0-9._]{3,24}$")
 FOLLOW_REQUEST_STATUS_PENDING = "pending"
 FOLLOW_REQUEST_STATUS_ACCEPTED = "accepted"
@@ -72,7 +77,15 @@ NOTIFICATION_OUTBOX_DELIVERABLE_STATUSES = frozenset({
     NOTIFICATION_OUTBOX_STATUS_PENDING,
     NOTIFICATION_OUTBOX_STATUS_RETRYABLE_FAILED,
 })
+SOCIAL_NOTIFICATION_EVENT_TYPES = frozenset({
+    NOTIFICATION_EVENT_FOLLOW_REQUEST_RECEIVED,
+    NOTIFICATION_EVENT_FOLLOW_REQUEST_ACCEPTED,
+    NOTIFICATION_EVENT_FOLLOW_NEW_FOLLOWER,
+    NOTIFICATION_EVENT_FOLLOW_MUTUAL,
+})
 NOTIFICATION_OUTBOX_ERROR_MAX_LENGTH = 320
+NOTIFICATION_DELIVERY_DEFAULT_LIMIT = 50
+NOTIFICATION_DELIVERY_MAX_LIMIT = 200
 LIVE_VISIBILITY_OFF = "off"
 LIVE_VISIBILITY_FOLLOWERS = "followers"
 LIVE_VISIBILITY_PUBLIC = "public"
@@ -86,6 +99,7 @@ MIN_SEARCH_QUERY_LENGTH = 2
 SEARCH_RESULT_LIMIT = 25
 RELATIONSHIP_LIST_DEFAULT_LIMIT = 50
 RELATIONSHIP_LIST_MAX_LIMIT = 200
+BULK_RELATIONSHIP_STATUS_MAX_IDS = 100
 PRIVATE_FOLLOW_BEARER_VERSION = 1
 DEFAULT_PRIVATE_FOLLOW_BEARER_TTL_SECONDS = 60 * 60 * 24 * 30
 XCPRO_RELEASE_PACKAGE_NAME = "com.trust3.xcpro"
@@ -231,6 +245,8 @@ DEFAULT_DISCOVERABILITY = "searchable"
 DEFAULT_FOLLOW_POLICY = "approval_required"
 DEFAULT_LIVE_VISIBILITY = LIVE_VISIBILITY_FOLLOWERS
 DEFAULT_CONNECTION_LIST_VISIBILITY = "owner_only"
+DEFAULT_SOCIAL_NOTIFICATIONS_ENABLED = True
+DEFAULT_LIVE_NOTIFICATIONS_ENABLED = False
 RUNTIME_ENV_DEV = "dev"
 RUNTIME_ENV_STAGING = "staging"
 RUNTIME_ENV_PROD = "prod"
@@ -295,7 +311,9 @@ class ErrorCode:
     ALREADY_FOLLOWING = "already_following"
     FOLLOW_REQUEST_NOT_FOUND = "follow_request_not_found"
     FOLLOW_REQUEST_NOT_PENDING = "follow_request_not_pending"
+    FAVORITE_REQUIRES_FOLLOWING = "favorite_requires_following"
     LIVEFOLLOW_FOLLOWING_LIMIT_EXCEEDED = "livefollow_following_limit_exceeded"
+    LIVEFOLLOW_RATE_LIMITED = "livefollow_rate_limited"
     NOT_AUTHORIZED_TO_VIEW_FOLLOWERS = "not_authorized_to_view_followers"
     NOT_AUTHORIZED_TO_VIEW_FOLLOWING = "not_authorized_to_view_following"
     BLOCK_SELF = "block_self"
@@ -317,8 +335,14 @@ POSITION_MONOTONIC_FIELD_NAMES = frozenset({
 
 
 class ApiHTTPException(HTTPException):
-    def __init__(self, status_code: int, code: str, detail: Any):
-        super().__init__(status_code=status_code, detail=detail)
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        detail: Any,
+        headers: Optional[dict[str, str]] = None
+    ):
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
         self.code = code
 
 
@@ -849,7 +873,8 @@ def api_http_exception_handler(_request: Request, exc: ApiHTTPException):
         content={
             "code": exc.code,
             "detail": exc.detail
-        }
+        },
+        headers=exc.headers
     )
 
 
@@ -960,6 +985,25 @@ def validate_radius(radius_value, field_name: str, code: str) -> None:
         raise ApiHTTPException(status_code=400, code=code, detail=f"{field_name} out of range")
 
 
+@dataclass(frozen=True)
+class LiveSpectatorStatsPoint:
+    lat: float
+    lon: float
+    altitude_msl_meters: float
+    timestamp: datetime
+
+
+@dataclass(frozen=True)
+class LiveSpectatorStatsSnapshot:
+    first_position_at: datetime
+    last_position_at: datetime
+    position_count: int
+    highest_altitude_msl_meters: float
+    distance_flown_meters: float
+    current_climb_sink_ms: Optional[float]
+    best_short_window_climb_ms: Optional[float]
+
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371000.0
     p1 = math.radians(lat1)
@@ -972,6 +1016,128 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return r * c
 
 
+def finite_float(value: float) -> bool:
+    return isinstance(value, (float, int)) and math.isfinite(float(value))
+
+
+def valid_spectator_stats_point(point: LiveSpectatorStatsPoint) -> bool:
+    if not finite_float(point.lat) or not finite_float(point.lon):
+        return False
+    if point.lat < -90.0 or point.lat > 90.0:
+        return False
+    if point.lon < -180.0 or point.lon > 180.0:
+        return False
+    if not finite_float(point.altitude_msl_meters):
+        return False
+    return isinstance(point.timestamp, datetime)
+
+
+def normalized_spectator_stats_points(
+    points: list[LiveSpectatorStatsPoint]
+) -> list[LiveSpectatorStatsPoint]:
+    valid_points = [
+        LiveSpectatorStatsPoint(
+            lat=float(point.lat),
+            lon=float(point.lon),
+            altitude_msl_meters=float(point.altitude_msl_meters),
+            timestamp=to_utc_naive(point.timestamp)
+        )
+        for point in points
+        if valid_spectator_stats_point(point)
+    ]
+    return sorted(valid_points, key=lambda point: point.timestamp)
+
+
+def spectator_stats_delta_seconds(
+    start_at: datetime,
+    end_at: datetime
+) -> float:
+    return (end_at - start_at).total_seconds()
+
+
+def spectator_stats_climb_rate_ms(
+    start: LiveSpectatorStatsPoint,
+    end: LiveSpectatorStatsPoint,
+    min_delta_seconds: float,
+    max_delta_seconds: float
+) -> Optional[float]:
+    delta_seconds = spectator_stats_delta_seconds(start.timestamp, end.timestamp)
+    if delta_seconds < min_delta_seconds or delta_seconds > max_delta_seconds:
+        return None
+    return (end.altitude_msl_meters - start.altitude_msl_meters) / delta_seconds
+
+
+def spectator_stats_distance_meters(
+    points: list[LiveSpectatorStatsPoint]
+) -> float:
+    distance_meters = 0.0
+    for previous, current in zip(points, points[1:]):
+        if spectator_stats_delta_seconds(previous.timestamp, current.timestamp) <= 0.0:
+            continue
+        distance_meters += haversine_m(
+            previous.lat,
+            previous.lon,
+            current.lat,
+            current.lon
+        )
+    return distance_meters
+
+
+def spectator_stats_current_climb_sink_ms(
+    points: list[LiveSpectatorStatsPoint]
+) -> Optional[float]:
+    if len(points) < 2:
+        return None
+    return spectator_stats_climb_rate_ms(
+        start=points[-2],
+        end=points[-1],
+        min_delta_seconds=0.000001,
+        max_delta_seconds=SPECTATOR_STATS_CURRENT_CLIMB_MAX_DELTA_SECONDS
+    )
+
+
+def spectator_stats_best_short_window_climb_ms(
+    points: list[LiveSpectatorStatsPoint]
+) -> Optional[float]:
+    best_climb_ms: Optional[float] = None
+    for end_index, end in enumerate(points):
+        for start in points[:end_index]:
+            climb_ms = spectator_stats_climb_rate_ms(
+                start=start,
+                end=end,
+                min_delta_seconds=SPECTATOR_STATS_BEST_CLIMB_MIN_WINDOW_SECONDS,
+                max_delta_seconds=SPECTATOR_STATS_BEST_CLIMB_MAX_WINDOW_SECONDS
+            )
+            if climb_ms is None or climb_ms <= 0.0:
+                continue
+            if best_climb_ms is None or climb_ms > best_climb_ms:
+                best_climb_ms = climb_ms
+    return best_climb_ms
+
+
+def build_live_spectator_stats_snapshot(
+    points: list[LiveSpectatorStatsPoint]
+) -> Optional[LiveSpectatorStatsSnapshot]:
+    normalized_points = normalized_spectator_stats_points(points)
+    if not normalized_points:
+        return None
+
+    return LiveSpectatorStatsSnapshot(
+        first_position_at=normalized_points[0].timestamp,
+        last_position_at=normalized_points[-1].timestamp,
+        position_count=len(normalized_points),
+        highest_altitude_msl_meters=max(
+            point.altitude_msl_meters
+            for point in normalized_points
+        ),
+        distance_flown_meters=spectator_stats_distance_meters(normalized_points),
+        current_climb_sink_ms=spectator_stats_current_climb_sink_ms(normalized_points),
+        best_short_window_climb_ms=spectator_stats_best_short_window_climb_ms(
+            normalized_points
+        )
+    )
+
+
 class LiveSession(Base):
     __tablename__ = "live_sessions"
     __table_args__ = (
@@ -979,6 +1145,7 @@ class LiveSession(Base):
             "visibility IN ('off', 'followers', 'public')",
             name="ck_live_sessions_visibility"
         ),
+        Index("ix_live_sessions_owner_status", "owner_user_id", "status"),
     )
 
     id = Column(String, primary_key=True, index=True)
@@ -1033,6 +1200,37 @@ class LiveTaskRevision(Base):
     revision = Column(Integer, nullable=False)
     created_at = Column(DateTime, nullable=False)
     payload_json = Column(Text, nullable=False)
+
+
+class LiveSessionViewer(Base):
+    __tablename__ = "live_session_viewers"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "viewer_user_id",
+            name="uq_live_session_viewers_session_viewer"
+        ),
+    )
+
+    id = Column(String, primary_key=True, index=True)
+    session_id = Column(String, ForeignKey("live_sessions.id"), index=True, nullable=False)
+    viewer_user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    first_seen_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, nullable=False)
+
+
+class LiveSessionSpectatorStats(Base):
+    __tablename__ = "live_session_spectator_stats"
+
+    session_id = Column(String, ForeignKey("live_sessions.id"), primary_key=True, index=True)
+    first_position_at = Column(DateTime, nullable=False)
+    last_position_at = Column(DateTime, nullable=False)
+    position_count = Column(Integer, nullable=False)
+    highest_altitude_msl_meters = Column(Float, nullable=False)
+    distance_flown_meters = Column(Float, nullable=False)
+    current_climb_sink_ms = Column(Float, nullable=True)
+    best_short_window_climb_ms = Column(Float, nullable=True)
+    updated_at = Column(DateTime, nullable=False)
 
 
 class User(Base):
@@ -1100,6 +1298,8 @@ class PrivacySetting(Base):
     follow_policy = Column(String(32), nullable=False)
     default_live_visibility = Column(String(24), nullable=False)
     connection_list_visibility = Column(String(24), nullable=False)
+    social_notifications_enabled = Column(Boolean, nullable=False, default=True)
+    live_notifications_enabled = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
 
@@ -1202,6 +1402,18 @@ class FollowRequest(Base):
             "status IN ('pending', 'accepted', 'declined')",
             name="ck_follow_requests_status"
         ),
+        Index(
+            "ix_follow_requests_requester_status_updated_at",
+            "requester_user_id",
+            "status",
+            "updated_at"
+        ),
+        Index(
+            "ix_follow_requests_target_status_updated_at",
+            "target_user_id",
+            "status",
+            "updated_at"
+        ),
     )
 
     id = Column(String, primary_key=True, index=True)
@@ -1215,10 +1427,38 @@ class FollowRequest(Base):
 
 class FollowEdge(Base):
     __tablename__ = "follow_edges"
+    __table_args__ = (
+        Index("ix_follow_edges_followed_user_id", "followed_user_id"),
+    )
 
     follower_user_id = Column(String, ForeignKey("users.id"), primary_key=True)
     followed_user_id = Column(String, ForeignKey("users.id"), primary_key=True)
     created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class FavoriteFollow(Base):
+    __tablename__ = "favorite_follows"
+    __table_args__ = (
+        Index("ix_favorite_follows_favorite_user_id", "favorite_user_id"),
+        CheckConstraint(
+            "user_id <> favorite_user_id",
+            name="ck_favorite_follows_no_self"
+        ),
+    )
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    favorite_user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class UserRelationshipCounter(Base):
+    __tablename__ = "user_relationship_counters"
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    followers_count = Column(Integer, nullable=False)
+    following_count = Column(Integer, nullable=False)
     updated_at = Column(DateTime, nullable=False)
 
 
@@ -1378,6 +1618,8 @@ class MePrivacyPatchRequest(BaseModel):
     follow_policy: Optional[str] = None
     default_live_visibility: Optional[str] = None
     connection_list_visibility: Optional[str] = None
+    social_notifications_enabled: Optional[bool] = None
+    live_notifications_enabled: Optional[bool] = None
 
 
 class GoogleAuthExchangeRequest(BaseModel):
@@ -1386,6 +1628,10 @@ class GoogleAuthExchangeRequest(BaseModel):
 
 class FollowRequestCreateRequest(BaseModel):
     target_user_id: str
+
+
+class BulkRelationshipStatusRequest(BaseModel):
+    user_ids: list[str]
 
 
 class BlockCreateRequest(BaseModel):
@@ -1461,6 +1707,23 @@ class RelationshipLookup:
     incoming_pending: frozenset[str]
     following: frozenset[str]
     followed_by: frozenset[str]
+
+
+@dataclass(frozen=True)
+class RelationshipPolicyContext:
+    current_user_id: str
+    target_user_id: str
+    is_blocked: bool
+    current_follows_target: bool
+    target_follows_current: bool
+
+    @property
+    def is_self(self) -> bool:
+        return self.current_user_id == self.target_user_id
+
+    @property
+    def is_mutual(self) -> bool:
+        return self.current_follows_target and self.target_follows_current
 
 
 @dataclass(frozen=True)
@@ -2404,6 +2667,8 @@ def ensure_current_user_record_for_identity(
             follow_policy=DEFAULT_FOLLOW_POLICY,
             default_live_visibility=DEFAULT_LIVE_VISIBILITY,
             connection_list_visibility=DEFAULT_CONNECTION_LIST_VISIBILITY,
+            social_notifications_enabled=DEFAULT_SOCIAL_NOTIFICATIONS_ENABLED,
+            live_notifications_enabled=DEFAULT_LIVE_NOTIFICATIONS_ENABLED,
             created_at=now,
             updated_at=now
         )
@@ -2446,6 +2711,8 @@ def ensure_current_user_record_for_identity(
             follow_policy=DEFAULT_FOLLOW_POLICY,
             default_live_visibility=DEFAULT_LIVE_VISIBILITY,
             connection_list_visibility=DEFAULT_CONNECTION_LIST_VISIBILITY,
+            social_notifications_enabled=DEFAULT_SOCIAL_NOTIFICATIONS_ENABLED,
+            live_notifications_enabled=DEFAULT_LIVE_NOTIFICATIONS_ENABLED,
             created_at=now,
             updated_at=now
         )
@@ -2477,12 +2744,14 @@ def build_user_summary(profile: PilotProfile) -> dict[str, Optional[str]]:
     return build_profile_response(profile)
 
 
-def build_privacy_response(privacy: PrivacySetting) -> dict[str, str]:
+def build_privacy_response(privacy: PrivacySetting) -> dict[str, Any]:
     return {
         "discoverability": privacy.discoverability,
         "follow_policy": privacy.follow_policy,
         "default_live_visibility": privacy.default_live_visibility,
         "connection_list_visibility": privacy.connection_list_visibility,
+        "social_notifications_enabled": privacy.social_notifications_enabled,
+        "live_notifications_enabled": privacy.live_notifications_enabled,
     }
 
 
@@ -2768,6 +3037,432 @@ def count_livefollow_followers(db, user_id: str) -> int:
         .filter(FollowEdge.followed_user_id == user_id)
         .count()
     )
+
+
+def get_cached_relationship_counts(db, user_id: str) -> tuple[int, int]:
+    counter = (
+        db.query(UserRelationshipCounter)
+        .filter(UserRelationshipCounter.user_id == user_id)
+        .first()
+    )
+    if counter is None:
+        return 0, 0
+    return counter.followers_count, counter.following_count
+
+
+def upsert_user_relationship_counter(
+    db,
+    user_id: str,
+    followers_count: int,
+    following_count: int,
+    updated_at: datetime
+) -> UserRelationshipCounter:
+    counter = (
+        db.query(UserRelationshipCounter)
+        .filter(UserRelationshipCounter.user_id == user_id)
+        .first()
+    )
+    if counter is None:
+        counter = UserRelationshipCounter(
+            user_id=user_id,
+            followers_count=followers_count,
+            following_count=following_count,
+            updated_at=updated_at
+        )
+        db.add(counter)
+        record_social_counter_counts(followers_count, following_count)
+        return counter
+    counter.followers_count = followers_count
+    counter.following_count = following_count
+    counter.updated_at = updated_at
+    record_social_counter_counts(followers_count, following_count)
+    return counter
+
+
+def get_or_create_user_relationship_counter(
+    db,
+    user_id: str,
+    updated_at: datetime
+) -> UserRelationshipCounter:
+    counter = (
+        db.query(UserRelationshipCounter)
+        .filter(UserRelationshipCounter.user_id == user_id)
+        .first()
+    )
+    if counter is not None:
+        return counter
+    counter = UserRelationshipCounter(
+        user_id=user_id,
+        followers_count=count_livefollow_followers(db, user_id),
+        following_count=count_livefollow_following(db, user_id),
+        updated_at=updated_at
+    )
+    db.add(counter)
+    return counter
+
+
+def adjust_user_relationship_counter(
+    db,
+    user_id: str,
+    followers_delta: int,
+    following_delta: int,
+    updated_at: datetime
+) -> UserRelationshipCounter:
+    counter = get_or_create_user_relationship_counter(db, user_id, updated_at)
+    counter.followers_count = max(0, counter.followers_count + followers_delta)
+    counter.following_count = max(0, counter.following_count + following_delta)
+    counter.updated_at = updated_at
+    record_social_counter_counts(counter.followers_count, counter.following_count)
+    return counter
+
+
+def increment_relationship_counters_for_follow_edge(
+    db,
+    follower_user_id: str,
+    followed_user_id: str,
+    updated_at: datetime
+) -> None:
+    adjust_user_relationship_counter(
+        db,
+        follower_user_id,
+        followers_delta=0,
+        following_delta=1,
+        updated_at=updated_at
+    )
+    adjust_user_relationship_counter(
+        db,
+        followed_user_id,
+        followers_delta=1,
+        following_delta=0,
+        updated_at=updated_at
+    )
+
+
+def decrement_relationship_counters_for_follow_edge(
+    db,
+    follower_user_id: str,
+    followed_user_id: str,
+    updated_at: datetime
+) -> None:
+    adjust_user_relationship_counter(
+        db,
+        follower_user_id,
+        followers_delta=0,
+        following_delta=-1,
+        updated_at=updated_at
+    )
+    adjust_user_relationship_counter(
+        db,
+        followed_user_id,
+        followers_delta=-1,
+        following_delta=0,
+        updated_at=updated_at
+    )
+
+
+def recount_user_relationship_counter(
+    db,
+    user_id: str,
+    updated_at: datetime
+) -> UserRelationshipCounter:
+    return upsert_user_relationship_counter(
+        db,
+        user_id=user_id,
+        followers_count=count_livefollow_followers(db, user_id),
+        following_count=count_livefollow_following(db, user_id),
+        updated_at=updated_at
+    )
+
+
+def recount_all_user_relationship_counters(
+    db,
+    updated_at: datetime
+) -> int:
+    user_ids = [user_id for user_id, in db.query(User.id).all()]
+    for user_id in user_ids:
+        recount_user_relationship_counter(db, user_id, updated_at)
+    return len(user_ids)
+
+
+def record_live_session_viewer(
+    db,
+    session_id: str,
+    viewer_user_id: str,
+    seen_at: datetime
+) -> LiveSessionViewer:
+    viewer = (
+        db.query(LiveSessionViewer)
+        .filter(
+            LiveSessionViewer.session_id == session_id,
+            LiveSessionViewer.viewer_user_id == viewer_user_id
+        )
+        .first()
+    )
+    if viewer is None:
+        viewer = LiveSessionViewer(
+            id=str(uuid.uuid4()),
+            session_id=session_id,
+            viewer_user_id=viewer_user_id,
+            first_seen_at=seen_at,
+            last_seen_at=seen_at
+        )
+        db.add(viewer)
+        return viewer
+    viewer.last_seen_at = seen_at
+    return viewer
+
+
+def count_live_session_unique_viewers(db, session_id: str) -> int:
+    return (
+        db.query(LiveSessionViewer)
+        .filter(LiveSessionViewer.session_id == session_id)
+        .count()
+    )
+
+
+def get_live_session_spectator_stats(
+    db,
+    session_id: str
+) -> Optional[LiveSessionSpectatorStats]:
+    return (
+        db.query(LiveSessionSpectatorStats)
+        .filter(LiveSessionSpectatorStats.session_id == session_id)
+        .first()
+    )
+
+
+def upsert_live_session_spectator_stats(
+    db,
+    session_id: str,
+    snapshot: LiveSpectatorStatsSnapshot,
+    updated_at: datetime
+) -> LiveSessionSpectatorStats:
+    stats = get_live_session_spectator_stats(db, session_id)
+    if stats is None:
+        stats = LiveSessionSpectatorStats(
+            session_id=session_id,
+            first_position_at=snapshot.first_position_at,
+            last_position_at=snapshot.last_position_at,
+            position_count=snapshot.position_count,
+            highest_altitude_msl_meters=snapshot.highest_altitude_msl_meters,
+            distance_flown_meters=snapshot.distance_flown_meters,
+            current_climb_sink_ms=snapshot.current_climb_sink_ms,
+            best_short_window_climb_ms=snapshot.best_short_window_climb_ms,
+            updated_at=updated_at
+        )
+        db.add(stats)
+        return stats
+
+    stats.first_position_at = snapshot.first_position_at
+    stats.last_position_at = snapshot.last_position_at
+    stats.position_count = snapshot.position_count
+    stats.highest_altitude_msl_meters = snapshot.highest_altitude_msl_meters
+    stats.distance_flown_meters = snapshot.distance_flown_meters
+    stats.current_climb_sink_ms = snapshot.current_climb_sink_ms
+    stats.best_short_window_climb_ms = snapshot.best_short_window_climb_ms
+    stats.updated_at = updated_at
+    return stats
+
+
+def live_position_to_spectator_stats_point(
+    position: LivePosition
+) -> LiveSpectatorStatsPoint:
+    return LiveSpectatorStatsPoint(
+        lat=position.lat,
+        lon=position.lon,
+        altitude_msl_meters=position.alt,
+        timestamp=position.timestamp
+    )
+
+
+def build_live_spectator_stats_snapshot_for_session(
+    db,
+    session_id: str
+) -> Optional[LiveSpectatorStatsSnapshot]:
+    positions = (
+        db.query(LivePosition)
+        .filter(LivePosition.session_id == session_id)
+        .order_by(LivePosition.timestamp.asc(), LivePosition.id.asc())
+        .all()
+    )
+    return build_live_spectator_stats_snapshot(
+        [
+            live_position_to_spectator_stats_point(position)
+            for position in positions
+        ]
+    )
+
+
+def latest_live_position_for_session(db, session_id: str) -> Optional[LivePosition]:
+    return (
+        db.query(LivePosition)
+        .filter(LivePosition.session_id == session_id)
+        .order_by(LivePosition.timestamp.desc(), LivePosition.id.desc())
+        .first()
+    )
+
+
+def previous_live_position_for_spectator_stats(
+    db,
+    session_id: str,
+    before_timestamp: datetime
+) -> Optional[LivePosition]:
+    return (
+        db.query(LivePosition)
+        .filter(
+            LivePosition.session_id == session_id,
+            LivePosition.timestamp < before_timestamp
+        )
+        .order_by(LivePosition.timestamp.desc(), LivePosition.id.desc())
+        .first()
+    )
+
+
+def best_short_window_climb_for_position(
+    db,
+    session_id: str,
+    current_position: LivePosition
+) -> Optional[float]:
+    current_point = live_position_to_spectator_stats_point(current_position)
+    window_start = current_position.timestamp - timedelta(
+        seconds=SPECTATOR_STATS_BEST_CLIMB_MAX_WINDOW_SECONDS
+    )
+    window_end = current_position.timestamp - timedelta(
+        seconds=SPECTATOR_STATS_BEST_CLIMB_MIN_WINDOW_SECONDS
+    )
+    candidates = (
+        db.query(LivePosition)
+        .filter(
+            LivePosition.session_id == session_id,
+            LivePosition.timestamp >= window_start,
+            LivePosition.timestamp <= window_end
+        )
+        .order_by(LivePosition.timestamp.asc(), LivePosition.id.asc())
+        .all()
+    )
+    best_climb_ms: Optional[float] = None
+    for candidate in candidates:
+        climb_ms = spectator_stats_climb_rate_ms(
+            start=live_position_to_spectator_stats_point(candidate),
+            end=current_point,
+            min_delta_seconds=SPECTATOR_STATS_BEST_CLIMB_MIN_WINDOW_SECONDS,
+            max_delta_seconds=SPECTATOR_STATS_BEST_CLIMB_MAX_WINDOW_SECONDS
+        )
+        if climb_ms is None or climb_ms <= 0.0:
+            continue
+        if best_climb_ms is None or climb_ms > best_climb_ms:
+            best_climb_ms = climb_ms
+    return best_climb_ms
+
+
+def build_incremental_live_spectator_stats_snapshot(
+    existing: LiveSessionSpectatorStats,
+    previous_position: LivePosition,
+    current_position: LivePosition,
+    best_short_window_climb_ms: Optional[float]
+) -> LiveSpectatorStatsSnapshot:
+    previous_point = live_position_to_spectator_stats_point(previous_position)
+    current_point = live_position_to_spectator_stats_point(current_position)
+    delta_seconds = spectator_stats_delta_seconds(
+        previous_point.timestamp,
+        current_point.timestamp
+    )
+    distance_delta_meters = 0.0
+    if delta_seconds > 0.0:
+        distance_delta_meters = haversine_m(
+            previous_point.lat,
+            previous_point.lon,
+            current_point.lat,
+            current_point.lon
+        )
+    current_climb_sink_ms = spectator_stats_climb_rate_ms(
+        start=previous_point,
+        end=current_point,
+        min_delta_seconds=0.000001,
+        max_delta_seconds=SPECTATOR_STATS_CURRENT_CLIMB_MAX_DELTA_SECONDS
+    )
+    prior_best_climb_ms = existing.best_short_window_climb_ms
+    best_candidates = [
+        value for value in (prior_best_climb_ms, best_short_window_climb_ms)
+        if value is not None
+    ]
+    return LiveSpectatorStatsSnapshot(
+        first_position_at=existing.first_position_at,
+        last_position_at=current_point.timestamp,
+        position_count=existing.position_count + 1,
+        highest_altitude_msl_meters=max(
+            existing.highest_altitude_msl_meters,
+            current_point.altitude_msl_meters
+        ),
+        distance_flown_meters=existing.distance_flown_meters + distance_delta_meters,
+        current_climb_sink_ms=current_climb_sink_ms,
+        best_short_window_climb_ms=max(best_candidates) if best_candidates else None
+    )
+
+
+def update_live_session_spectator_stats_for_accepted_position(
+    db,
+    session_id: str,
+    updated_at: datetime
+) -> Optional[LiveSessionSpectatorStats]:
+    current_position = latest_live_position_for_session(db, session_id)
+    if current_position is None:
+        return rebuild_live_session_spectator_stats(db, session_id, updated_at)
+    existing = get_live_session_spectator_stats(db, session_id)
+    if existing is None:
+        return rebuild_live_session_spectator_stats(db, session_id, updated_at)
+    previous_position = previous_live_position_for_spectator_stats(
+        db,
+        session_id,
+        before_timestamp=current_position.timestamp
+    )
+    if previous_position is None:
+        return rebuild_live_session_spectator_stats(db, session_id, updated_at)
+    snapshot = build_incremental_live_spectator_stats_snapshot(
+        existing=existing,
+        previous_position=previous_position,
+        current_position=current_position,
+        best_short_window_climb_ms=best_short_window_climb_for_position(
+            db,
+            session_id,
+            current_position
+        )
+    )
+    return upsert_live_session_spectator_stats(
+        db,
+        session_id=session_id,
+        snapshot=snapshot,
+        updated_at=updated_at
+    )
+
+
+def rebuild_live_session_spectator_stats(
+    db,
+    session_id: str,
+    updated_at: datetime
+) -> Optional[LiveSessionSpectatorStats]:
+    snapshot = build_live_spectator_stats_snapshot_for_session(db, session_id)
+    if snapshot is None:
+        existing = get_live_session_spectator_stats(db, session_id)
+        if existing is not None:
+            db.delete(existing)
+        return None
+    return upsert_live_session_spectator_stats(
+        db,
+        session_id=session_id,
+        snapshot=snapshot,
+        updated_at=updated_at
+    )
+
+
+def rebuild_all_live_session_spectator_stats(
+    db,
+    updated_at: datetime
+) -> int:
+    session_ids = [session_id for session_id, in db.query(LiveSession.id).all()]
+    for session_id in session_ids:
+        rebuild_live_session_spectator_stats(db, session_id, updated_at)
+    return len(session_ids)
 
 
 def relationship_limit_status(following_count: int, max_following: int) -> str:
@@ -3670,6 +4365,30 @@ def parse_relationship_list_page_params(
     return limit, int(trimmed_cursor)
 
 
+def normalize_bulk_relationship_status_user_ids(user_ids: list[str]) -> list[str]:
+    if len(user_ids) > BULK_RELATIONSHIP_STATUS_MAX_IDS:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"user_ids must contain at most {BULK_RELATIONSHIP_STATUS_MAX_IDS} ids"
+        )
+
+    normalized_user_ids: list[str] = []
+    seen_user_ids: set[str] = set()
+    for raw_user_id in user_ids:
+        user_id = raw_user_id.strip()
+        if not user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="user_ids must not contain blank ids"
+            )
+        if user_id not in seen_user_ids:
+            normalized_user_ids.append(user_id)
+            seen_user_ids.add(user_id)
+    return normalized_user_ids
+
+
 def approved_follow_edge_exists(
     db,
     follower_user_id: str,
@@ -3732,6 +4451,89 @@ def blocked_relationship_exists(db, first_user_id: str, second_user_id: str) -> 
     )
 
 
+def build_relationship_policy_context(
+    db,
+    current_user_id: str,
+    target_user_id: str
+) -> RelationshipPolicyContext:
+    if current_user_id == target_user_id:
+        return RelationshipPolicyContext(
+            current_user_id=current_user_id,
+            target_user_id=target_user_id,
+            is_blocked=False,
+            current_follows_target=False,
+            target_follows_current=False
+        )
+    return RelationshipPolicyContext(
+        current_user_id=current_user_id,
+        target_user_id=target_user_id,
+        is_blocked=blocked_relationship_exists(db, current_user_id, target_user_id),
+        current_follows_target=approved_follow_edge_exists(
+            db,
+            current_user_id,
+            target_user_id
+        ),
+        target_follows_current=approved_follow_edge_exists(
+            db,
+            target_user_id,
+            current_user_id
+        )
+    )
+
+
+def relationship_policy_allows_profile_discovery(
+    context: RelationshipPolicyContext,
+    target_privacy: PrivacySetting
+) -> bool:
+    if context.is_self:
+        return True
+    if context.is_blocked:
+        return False
+    return target_privacy.discoverability == DEFAULT_DISCOVERABILITY
+
+
+def relationship_policy_allows_connection_list(
+    context: RelationshipPolicyContext,
+    target_privacy: PrivacySetting
+) -> bool:
+    if context.is_self:
+        return True
+    if context.is_blocked:
+        return False
+    if target_privacy.connection_list_visibility == "public":
+        return True
+    if target_privacy.connection_list_visibility == "mutuals_only":
+        return context.is_mutual
+    return False
+
+
+def relationship_policy_allows_follower_live_access(
+    context: RelationshipPolicyContext
+) -> bool:
+    if context.is_self:
+        return True
+    if context.is_blocked:
+        return False
+    return context.current_follows_target
+
+
+def notification_event_enabled_for_recipient(
+    db,
+    recipient_user_id: str,
+    event_type: str
+) -> bool:
+    privacy = (
+        db.query(PrivacySetting)
+        .filter(PrivacySetting.user_id == recipient_user_id)
+        .first()
+    )
+    if privacy is None:
+        return DEFAULT_SOCIAL_NOTIFICATIONS_ENABLED
+    if event_type in SOCIAL_NOTIFICATION_EVENT_TYPES:
+        return privacy.social_notifications_enabled
+    return privacy.live_notifications_enabled
+
+
 def ensure_relationship_not_blocked(db, first_user_id: str, second_user_id: str) -> None:
     if blocked_relationship_exists(db, first_user_id, second_user_id):
         raise ApiHTTPException(
@@ -3752,6 +4554,8 @@ def enqueue_follow_notification_event(
     if recipient_user_id == actor_user_id:
         return None
     if blocked_relationship_exists(db, recipient_user_id, actor_user_id):
+        return None
+    if not notification_event_enabled_for_recipient(db, recipient_user_id, event_type):
         return None
 
     dedupe_key = ":".join(
@@ -3910,13 +4714,17 @@ def deliver_notification_event(
     return {"token_attempts": token_attempts, "tokens_sent": tokens_sent}
 
 
+def normalize_notification_delivery_limit(limit: int) -> int:
+    return max(1, min(limit, NOTIFICATION_DELIVERY_MAX_LIMIT))
+
+
 def deliver_pending_notification_events(
-    limit: int = 50,
+    limit: int = NOTIFICATION_DELIVERY_DEFAULT_LIMIT,
     sender: Optional[Any] = None,
 ) -> dict[str, int]:
     db = SessionLocal()
     try:
-        resolved_limit = max(1, min(limit, 200))
+        resolved_limit = normalize_notification_delivery_limit(limit)
         events = (
             db.query(NotificationOutboxEvent)
             .filter(NotificationOutboxEvent.status.in_(NOTIFICATION_OUTBOX_DELIVERABLE_STATUSES))
@@ -3924,6 +4732,7 @@ def deliver_pending_notification_events(
             .limit(resolved_limit)
             .all()
         )
+        record_notification_fanout_metric(len(events))
         delivery_sender = sender or FCM_NOTIFICATION_SENDER
         summary = {
             "events_attempted": 0,
@@ -3963,16 +4772,9 @@ def ensure_can_read_relationship_list(
     target_privacy: PrivacySetting,
     error_code: str
 ) -> None:
-    if current_user_id == target_user_id:
+    context = build_relationship_policy_context(db, current_user_id, target_user_id)
+    if relationship_policy_allows_connection_list(context, target_privacy):
         return
-    if target_privacy.connection_list_visibility == "public":
-        return
-    if target_privacy.connection_list_visibility == "mutuals_only":
-        if (
-            approved_follow_edge_exists(db, current_user_id, target_user_id)
-            and approved_follow_edge_exists(db, target_user_id, current_user_id)
-        ):
-            return
     raise ApiHTTPException(
         status_code=403,
         code=error_code,
@@ -3988,24 +4790,34 @@ def load_livefollow_follow_count_maps(
         return {}, {}
 
     unique_user_ids = sorted(set(user_ids))
-    followers_count_by_user_id = {
-        user_id: count
-        for user_id, count in (
-            db.query(FollowEdge.followed_user_id, func.count(FollowEdge.follower_user_id))
-            .filter(FollowEdge.followed_user_id.in_(unique_user_ids))
-            .group_by(FollowEdge.followed_user_id)
+    followers_count_by_user_id: dict[str, int] = {}
+    following_count_by_user_id: dict[str, int] = {}
+    missing_user_ids: list[str] = []
+    for user_id in unique_user_ids:
+        cached_counts = get_cached_social_counts(user_id)
+        if cached_counts is None:
+            missing_user_ids.append(user_id)
+            continue
+        followers_count_by_user_id[user_id] = cached_counts[0]
+        following_count_by_user_id[user_id] = cached_counts[1]
+
+    if missing_user_ids:
+        counters = (
+            db.query(UserRelationshipCounter)
+            .filter(UserRelationshipCounter.user_id.in_(missing_user_ids))
             .all()
         )
-    }
-    following_count_by_user_id = {
-        user_id: count
-        for user_id, count in (
-            db.query(FollowEdge.follower_user_id, func.count(FollowEdge.followed_user_id))
-            .filter(FollowEdge.follower_user_id.in_(unique_user_ids))
-            .group_by(FollowEdge.follower_user_id)
-            .all()
-        )
-    }
+        counters_by_user_id = {
+            counter.user_id: counter
+            for counter in counters
+        }
+        for user_id in missing_user_ids:
+            counter = counters_by_user_id.get(user_id)
+            followers_count = counter.followers_count if counter is not None else 0
+            following_count = counter.following_count if counter is not None else 0
+            followers_count_by_user_id[user_id] = followers_count
+            following_count_by_user_id[user_id] = following_count
+            set_cached_social_counts(user_id, followers_count, following_count)
     return followers_count_by_user_id, following_count_by_user_id
 
 
@@ -4013,12 +4825,14 @@ def build_relationship_list_item_response(
     profile: PilotProfile,
     lookup: RelationshipLookup,
     followers_count_by_user_id: dict[str, int],
-    following_count_by_user_id: dict[str, int]
+    following_count_by_user_id: dict[str, int],
+    favorite_user_ids: set[str]
 ) -> dict[str, Any]:
     response = build_user_summary(profile)
     response["followers_count"] = followers_count_by_user_id.get(profile.user_id, 0)
     response["following_count"] = following_count_by_user_id.get(profile.user_id, 0)
     response["relationship_state"] = build_relationship_state(lookup, profile.user_id)
+    response["is_favorite"] = profile.user_id in favorite_user_ids
     return response
 
 
@@ -4035,6 +4849,7 @@ def build_relationship_list_page_response(
     followers_count_by_user_id, following_count_by_user_id = (
         load_livefollow_follow_count_maps(db, user_ids)
     )
+    favorite_user_ids = load_favorite_follow_user_ids(db, current_user_id, user_ids)
     next_offset = offset + len(profiles)
     next_cursor = str(next_offset) if next_offset < total else None
     return {
@@ -4044,7 +4859,8 @@ def build_relationship_list_page_response(
                 profile,
                 lookup,
                 followers_count_by_user_id,
-                following_count_by_user_id
+                following_count_by_user_id,
+                favorite_user_ids
             )
             for profile in profiles
         ],
@@ -4070,6 +4886,8 @@ def get_searchable_target_or_404(db, user_id: str) -> tuple[PilotProfile, Privac
             follow_policy=DEFAULT_FOLLOW_POLICY,
             default_live_visibility=DEFAULT_LIVE_VISIBILITY,
             connection_list_visibility=DEFAULT_CONNECTION_LIST_VISIBILITY,
+            social_notifications_enabled=DEFAULT_SOCIAL_NOTIFICATIONS_ENABLED,
+            live_notifications_enabled=DEFAULT_LIVE_NOTIFICATIONS_ENABLED,
             created_at=now,
             updated_at=now
         )
@@ -4092,7 +4910,8 @@ def get_user_record_or_404(db, user_id: str) -> User:
 def remove_relationship_rows_between_users(
     db,
     first_user_id: str,
-    second_user_id: str
+    second_user_id: str,
+    updated_at: datetime
 ) -> None:
     follow_edges = (
         db.query(FollowEdge)
@@ -4111,6 +4930,12 @@ def remove_relationship_rows_between_users(
         .all()
     )
     for edge in follow_edges:
+        decrement_relationship_counters_for_follow_edge(
+            db,
+            edge.follower_user_id,
+            edge.followed_user_id,
+            updated_at
+        )
         db.delete(edge)
 
     pending_requests = (
@@ -4133,6 +4958,25 @@ def remove_relationship_rows_between_users(
     for request in pending_requests:
         db.delete(request)
 
+    favorite_rows = (
+        db.query(FavoriteFollow)
+        .filter(
+            or_(
+                and_(
+                    FavoriteFollow.user_id == first_user_id,
+                    FavoriteFollow.favorite_user_id == second_user_id
+                ),
+                and_(
+                    FavoriteFollow.user_id == second_user_id,
+                    FavoriteFollow.favorite_user_id == first_user_id
+                )
+            )
+        )
+        .all()
+    )
+    for favorite in favorite_rows:
+        db.delete(favorite)
+
 
 def follow_edge_exists(db, follower_user_id: str, followed_user_id: str) -> bool:
     return (
@@ -4144,6 +4988,39 @@ def follow_edge_exists(db, follower_user_id: str, followed_user_id: str) -> bool
         .first()
         is not None
     )
+
+
+def load_favorite_follow_user_ids(
+    db,
+    user_id: str,
+    candidate_user_ids: list[str]
+) -> set[str]:
+    if not candidate_user_ids:
+        return set()
+    rows = (
+        db.query(FavoriteFollow.favorite_user_id)
+        .filter(
+            FavoriteFollow.user_id == user_id,
+            FavoriteFollow.favorite_user_id.in_(sorted(set(candidate_user_ids)))
+        )
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
+def remove_favorite_follow(db, user_id: str, favorite_user_id: str) -> bool:
+    favorite = (
+        db.query(FavoriteFollow)
+        .filter(
+            FavoriteFollow.user_id == user_id,
+            FavoriteFollow.favorite_user_id == favorite_user_id
+        )
+        .first()
+    )
+    if favorite is None:
+        return False
+    db.delete(favorite)
+    return True
 
 
 def ensure_follow_edge(
@@ -4170,6 +5047,13 @@ def ensure_follow_edge(
                 code=ErrorCode.LIVEFOLLOW_FOLLOWING_LIMIT_EXCEEDED,
                 detail="LiveFollow following limit exceeded"
             )
+        increment_relationship_counters_for_follow_edge(
+            db,
+            follower_user_id,
+            followed_user_id,
+            now
+        )
+        invalidate_social_cache_for_users(follower_user_id, followed_user_id)
         db.add(
             FollowEdge(
                 follower_user_id=follower_user_id,
@@ -4289,6 +5173,22 @@ def apply_privacy_patch(
             "connection_list_visibility",
             request.connection_list_visibility.strip()
         )
+    if "social_notifications_enabled" in fields:
+        if request.social_notifications_enabled is None:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.INVALID_PRIVACY_SETTING,
+                detail="social_notifications_enabled is required"
+            )
+        privacy.social_notifications_enabled = request.social_notifications_enabled
+    if "live_notifications_enabled" in fields:
+        if request.live_notifications_enabled is None:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.INVALID_PRIVACY_SETTING,
+                detail="live_notifications_enabled is required"
+            )
+        privacy.live_notifications_enabled = request.live_notifications_enabled
     privacy.updated_at = utcnow()
 
 
@@ -4381,18 +5281,24 @@ def can_user_view_live_session(
         return False
     if visibility != LIVE_VISIBILITY_FOLLOWERS:
         return False
-    if blocked_relationship_exists(db, viewer_user_id, owner_user_id):
+
+    context = build_relationship_policy_context(db, viewer_user_id, owner_user_id)
+    return relationship_policy_allows_follower_live_access(context)
+
+
+def record_authorized_live_session_viewer_if_needed(
+    db,
+    session: LiveSession,
+    viewer_user_id: str,
+    seen_at: datetime
+) -> bool:
+    if session.status == "ended":
+        return False
+    if session.owner_user_id is None or session.owner_user_id == viewer_user_id:
         return False
 
-    existing_edge = (
-        db.query(FollowEdge)
-        .filter(
-            FollowEdge.follower_user_id == viewer_user_id,
-            FollowEdge.followed_user_id == owner_user_id
-        )
-        .first()
-    )
-    return existing_edge is not None
+    record_live_session_viewer(db, session.id, viewer_user_id, seen_at)
+    return True
 
 
 def get_owned_live_session_or_404(
@@ -4440,7 +5346,7 @@ def end_active_owned_live_sessions(
     db,
     owner_user_id: str,
     now: datetime
-) -> None:
+) -> list[str]:
     sessions = (
         db.query(LiveSession)
         .filter(
@@ -4449,9 +5355,12 @@ def end_active_owned_live_sessions(
         )
         .all()
     )
+    ended_session_ids = []
     for session in sessions:
         session.status = "ended"
         session.ended_at = now
+        ended_session_ids.append(session.id)
+    return ended_session_ids
 
 
 def build_live_session_command_response(
@@ -4636,6 +5545,521 @@ def get_cached_latest(session_id: str) -> Optional[dict]:
     return latest
 
 
+LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION = "v1_session"
+LIVE_RESPONSE_CACHE_VARIANT_V1_SHARE = "v1_share"
+LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION = "v2_session"
+LIVE_RESPONSE_CACHE_VARIANT_V2_USER = "v2_user"
+LIVE_RESPONSE_CACHE_VARIANTS = (
+    LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION,
+    LIVE_RESPONSE_CACHE_VARIANT_V1_SHARE,
+    LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION,
+    LIVE_RESPONSE_CACHE_VARIANT_V2_USER,
+)
+LIVE_RESPONSE_CACHE_SINGLE_FLIGHT_WAIT_SECONDS = 2.0
+_live_response_cache_locks: dict[str, threading.Lock] = {}
+_live_response_cache_locks_guard = threading.Lock()
+
+SOCIAL_CACHE_SCOPE_COUNTS = "counts"
+SOCIAL_CACHE_SCOPE_FOLLOWERS_PREVIEW = "followers_preview"
+SOCIAL_CACHE_SCOPE_FOLLOWING_PREVIEW = "following_preview"
+SOCIAL_CACHE_SCOPES = (
+    SOCIAL_CACHE_SCOPE_COUNTS,
+    SOCIAL_CACHE_SCOPE_FOLLOWERS_PREVIEW,
+    SOCIAL_CACHE_SCOPE_FOLLOWING_PREVIEW,
+)
+SOCIAL_CACHE_TTL_SECONDS = 60
+
+
+@dataclass
+class LiveReadMetric:
+    request_count: int = 0
+    cache_hit_count: int = 0
+    total_response_ms: float = 0.0
+
+
+@dataclass
+class SocialGraphMetrics:
+    largest_followers_count: int = 0
+    largest_following_count: int = 0
+    relationship_list_request_count: int = 0
+    slow_relationship_list_query_count: int = 0
+    total_relationship_list_response_ms: float = 0.0
+    max_offset_pagination_depth: int = 0
+    active_list_refresh_request_count: int = 0
+    bulk_relationship_status_request_count: int = 0
+    bulk_relationship_status_user_id_count: int = 0
+    notification_fanout_batch_count: int = 0
+    max_notification_fanout_size: int = 0
+
+
+_live_read_metrics: dict[str, LiveReadMetric] = {}
+_live_read_metrics_lock = threading.Lock()
+_live_read_rate_limited_count = 0
+LIVE_READ_RATE_LIMIT_WINDOW_SECONDS = 60.0
+LIVE_READ_RATE_LIMIT_GLOBAL = 0
+LIVE_READ_RATE_LIMIT_PER_USER = 0
+LIVE_READ_RATE_LIMIT_PER_IP = 0
+LIVE_READ_RATE_LIMIT_PER_SESSION = 0
+_live_read_rate_limit_events: dict[str, list[float]] = {}
+_live_read_rate_limit_lock = threading.Lock()
+SOCIAL_GRAPH_SLOW_QUERY_MS = 500.0
+_social_graph_metrics = SocialGraphMetrics()
+_social_graph_metrics_lock = threading.Lock()
+
+
+def live_response_cache_key(session_id: str, variant: str) -> str:
+    return f"live:response:{variant}:{session_id}"
+
+
+def live_response_cache_keys(session_id: str) -> list[str]:
+    return [
+        live_response_cache_key(session_id, variant)
+        for variant in LIVE_RESPONSE_CACHE_VARIANTS
+    ]
+
+
+def live_response_cache_rebuild_lock(cache_key: str) -> threading.Lock:
+    with _live_response_cache_locks_guard:
+        lock = _live_response_cache_locks.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _live_response_cache_locks[cache_key] = lock
+        return lock
+
+
+def serialize_live_response_cache_payload(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def deserialize_live_response_cache_payload(raw_value: Optional[str]) -> Optional[dict[str, Any]]:
+    if not raw_value:
+        return None
+    parsed = json.loads(raw_value)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def set_cached_live_response(cache_key: str, payload: dict[str, Any]) -> None:
+    redis_client.set(cache_key, serialize_live_response_cache_payload(payload))
+
+
+def get_cached_live_response(cache_key: str) -> Optional[dict[str, Any]]:
+    return deserialize_live_response_cache_payload(redis_client.get(cache_key))
+
+
+def social_cache_key(user_id: str, scope: str) -> str:
+    if scope not in SOCIAL_CACHE_SCOPES:
+        raise ValueError(f"unknown social cache scope: {scope}")
+    return f"social:{scope}:{user_id}"
+
+
+def social_cache_keys(user_id: str) -> list[str]:
+    return [
+        social_cache_key(user_id, scope)
+        for scope in SOCIAL_CACHE_SCOPES
+    ]
+
+
+def serialize_social_cache_payload(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def deserialize_social_cache_payload(raw_value: Optional[str]) -> Optional[dict[str, Any]]:
+    if not raw_value:
+        return None
+    parsed = json.loads(raw_value)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def set_cached_social_payload(
+    cache_key: str,
+    payload: dict[str, Any],
+    ttl_seconds: int = SOCIAL_CACHE_TTL_SECONDS
+) -> None:
+    serialized_payload = serialize_social_cache_payload(payload)
+    if ttl_seconds > 0:
+        redis_client.set(cache_key, serialized_payload, ex=ttl_seconds)
+    else:
+        redis_client.set(cache_key, serialized_payload)
+
+
+def get_cached_social_payload(cache_key: str) -> Optional[dict[str, Any]]:
+    return deserialize_social_cache_payload(redis_client.get(cache_key))
+
+
+def parse_cached_social_counts_payload(
+    user_id: str,
+    payload: Optional[dict[str, Any]]
+) -> Optional[tuple[int, int]]:
+    if payload is None or payload.get("user_id") != user_id:
+        return None
+    followers_count = payload.get("followers_count")
+    following_count = payload.get("following_count")
+    if (
+        isinstance(followers_count, bool)
+        or isinstance(following_count, bool)
+        or not isinstance(followers_count, int)
+        or not isinstance(following_count, int)
+        or followers_count < 0
+        or following_count < 0
+    ):
+        return None
+    return followers_count, following_count
+
+
+def get_cached_social_counts(user_id: str) -> Optional[tuple[int, int]]:
+    return parse_cached_social_counts_payload(
+        user_id,
+        get_cached_social_payload(
+            social_cache_key(user_id, SOCIAL_CACHE_SCOPE_COUNTS)
+        )
+    )
+
+
+def set_cached_social_counts(
+    user_id: str,
+    followers_count: int,
+    following_count: int
+) -> None:
+    set_cached_social_payload(
+        social_cache_key(user_id, SOCIAL_CACHE_SCOPE_COUNTS),
+        {
+            "user_id": user_id,
+            "followers_count": followers_count,
+            "following_count": following_count,
+        }
+    )
+
+
+def invalidate_social_cache_for_users(*user_ids: str) -> None:
+    cache_keys: list[str] = []
+    seen_user_ids: set[str] = set()
+    for user_id in user_ids:
+        normalized_user_id = (user_id or "").strip()
+        if not normalized_user_id or normalized_user_id in seen_user_ids:
+            continue
+        seen_user_ids.add(normalized_user_id)
+        cache_keys.extend(social_cache_keys(normalized_user_id))
+    if cache_keys:
+        redis_client.delete(*cache_keys)
+
+
+def live_response_with_dynamic_status(
+    session: LiveSession,
+    response: dict[str, Any]
+) -> dict[str, Any]:
+    adjusted_response = dict(response)
+    adjusted_response["status"] = compute_effective_status(session)
+    return adjusted_response
+
+
+def build_cached_live_response_with_metadata(
+    db,
+    session: LiveSession,
+    cache_key: str,
+    owner_profile: Optional[PilotProfile] = None
+) -> tuple[dict[str, Any], bool]:
+    cached_response = get_cached_live_response(cache_key)
+    if cached_response is not None:
+        return live_response_with_dynamic_status(session, cached_response), True
+
+    rebuild_lock = live_response_cache_rebuild_lock(cache_key)
+    lock_acquired = rebuild_lock.acquire(
+        timeout=LIVE_RESPONSE_CACHE_SINGLE_FLIGHT_WAIT_SECONDS
+    )
+    if not lock_acquired:
+        cached_response = get_cached_live_response(cache_key)
+        if cached_response is not None:
+            return live_response_with_dynamic_status(session, cached_response), True
+        response = build_live_response(db, session, owner_profile)
+        set_cached_live_response(cache_key, response)
+        return response, False
+    try:
+        cached_response = get_cached_live_response(cache_key)
+        if cached_response is not None:
+            return live_response_with_dynamic_status(session, cached_response), True
+        response = build_live_response(db, session, owner_profile)
+        set_cached_live_response(cache_key, response)
+        return response, False
+    finally:
+        rebuild_lock.release()
+
+
+def build_cached_live_response(
+    db,
+    session: LiveSession,
+    cache_key: str,
+    owner_profile: Optional[PilotProfile] = None
+) -> dict[str, Any]:
+    response, _cache_hit = build_cached_live_response_with_metadata(
+        db,
+        session,
+        cache_key,
+        owner_profile
+    )
+    return response
+
+
+def build_measured_live_response(
+    db,
+    session: LiveSession,
+    cache_key: str,
+    owner_profile: Optional[PilotProfile] = None
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    response, cache_hit = build_cached_live_response_with_metadata(
+        db,
+        session,
+        cache_key,
+        owner_profile
+    )
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    record_live_read_metric(
+        session_id=session.id,
+        cache_hit=cache_hit,
+        response_ms=elapsed_ms
+    )
+    return response
+
+
+def record_live_read_metric(
+    session_id: str,
+    cache_hit: bool,
+    response_ms: float
+) -> None:
+    with _live_read_metrics_lock:
+        metric = _live_read_metrics.get(session_id)
+        if metric is None:
+            metric = LiveReadMetric()
+            _live_read_metrics[session_id] = metric
+        metric.request_count += 1
+        if cache_hit:
+            metric.cache_hit_count += 1
+        metric.total_response_ms += max(response_ms, 0.0)
+
+
+def record_live_read_rate_limited() -> None:
+    global _live_read_rate_limited_count
+    with _live_read_metrics_lock:
+        _live_read_rate_limited_count += 1
+
+
+def reset_live_read_metrics() -> None:
+    global _live_read_rate_limited_count
+    with _live_read_metrics_lock:
+        _live_read_metrics.clear()
+        _live_read_rate_limited_count = 0
+
+
+def live_read_metrics_snapshot(top_limit: int = 5) -> dict[str, Any]:
+    with _live_read_metrics_lock:
+        metrics = [
+            {
+                "session_id": session_id,
+                "request_count": metric.request_count,
+                "cache_hit_count": metric.cache_hit_count,
+                "cache_hit_rate": (
+                    metric.cache_hit_count / metric.request_count
+                    if metric.request_count
+                    else 0.0
+                ),
+                "average_response_ms": (
+                    metric.total_response_ms / metric.request_count
+                    if metric.request_count
+                    else 0.0
+                ),
+            }
+            for session_id, metric in _live_read_metrics.items()
+        ]
+        total_requests = sum(metric["request_count"] for metric in metrics)
+        total_cache_hits = sum(metric["cache_hit_count"] for metric in metrics)
+        return {
+            "request_count": total_requests,
+            "cache_hit_count": total_cache_hits,
+            "cache_hit_rate": (
+                total_cache_hits / total_requests
+                if total_requests
+                else 0.0
+            ),
+            "rate_limited_429_count": _live_read_rate_limited_count,
+            "top_sessions_by_read_volume": sorted(
+                metrics,
+                key=lambda metric: (
+                    -metric["request_count"],
+                    metric["session_id"]
+                )
+            )[:top_limit],
+        }
+
+
+def reset_social_graph_metrics() -> None:
+    global _social_graph_metrics
+    with _social_graph_metrics_lock:
+        _social_graph_metrics = SocialGraphMetrics()
+
+
+def record_social_counter_counts(followers_count: int, following_count: int) -> None:
+    with _social_graph_metrics_lock:
+        _social_graph_metrics.largest_followers_count = max(
+            _social_graph_metrics.largest_followers_count,
+            max(followers_count, 0)
+        )
+        _social_graph_metrics.largest_following_count = max(
+            _social_graph_metrics.largest_following_count,
+            max(following_count, 0)
+        )
+
+
+def record_relationship_list_query_metric(offset: int, response_ms: float) -> None:
+    with _social_graph_metrics_lock:
+        _social_graph_metrics.relationship_list_request_count += 1
+        _social_graph_metrics.total_relationship_list_response_ms += max(response_ms, 0.0)
+        _social_graph_metrics.max_offset_pagination_depth = max(
+            _social_graph_metrics.max_offset_pagination_depth,
+            max(offset, 0)
+        )
+        if response_ms >= SOCIAL_GRAPH_SLOW_QUERY_MS:
+            _social_graph_metrics.slow_relationship_list_query_count += 1
+
+
+def record_active_list_refresh_metric(offset: int) -> None:
+    with _social_graph_metrics_lock:
+        _social_graph_metrics.active_list_refresh_request_count += 1
+        _social_graph_metrics.max_offset_pagination_depth = max(
+            _social_graph_metrics.max_offset_pagination_depth,
+            max(offset, 0)
+        )
+
+
+def record_bulk_relationship_status_metric(requested_user_count: int) -> None:
+    with _social_graph_metrics_lock:
+        _social_graph_metrics.bulk_relationship_status_request_count += 1
+        _social_graph_metrics.bulk_relationship_status_user_id_count += max(
+            requested_user_count,
+            0
+        )
+
+
+def record_notification_fanout_metric(fanout_size: int) -> None:
+    with _social_graph_metrics_lock:
+        _social_graph_metrics.notification_fanout_batch_count += 1
+        _social_graph_metrics.max_notification_fanout_size = max(
+            _social_graph_metrics.max_notification_fanout_size,
+            max(fanout_size, 0)
+        )
+
+
+def social_graph_metrics_snapshot() -> dict[str, Any]:
+    with _social_graph_metrics_lock:
+        relationship_request_count = (
+            _social_graph_metrics.relationship_list_request_count
+        )
+        return {
+            "largest_followers_count": _social_graph_metrics.largest_followers_count,
+            "largest_following_count": _social_graph_metrics.largest_following_count,
+            "relationship_list_request_count": relationship_request_count,
+            "slow_relationship_list_query_count": (
+                _social_graph_metrics.slow_relationship_list_query_count
+            ),
+            "average_relationship_list_response_ms": (
+                _social_graph_metrics.total_relationship_list_response_ms
+                / relationship_request_count
+                if relationship_request_count
+                else 0.0
+            ),
+            "max_offset_pagination_depth": (
+                _social_graph_metrics.max_offset_pagination_depth
+            ),
+            "active_list_refresh_request_count": (
+                _social_graph_metrics.active_list_refresh_request_count
+            ),
+            "bulk_relationship_status_request_count": (
+                _social_graph_metrics.bulk_relationship_status_request_count
+            ),
+            "bulk_relationship_status_user_id_count": (
+                _social_graph_metrics.bulk_relationship_status_user_id_count
+            ),
+            "notification_fanout_batch_count": (
+                _social_graph_metrics.notification_fanout_batch_count
+            ),
+            "max_notification_fanout_size": (
+                _social_graph_metrics.max_notification_fanout_size
+            ),
+        }
+
+
+def reset_live_read_rate_limits() -> None:
+    with _live_read_rate_limit_lock:
+        _live_read_rate_limit_events.clear()
+
+
+def live_read_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        first_forwarded = forwarded_for.split(",", 1)[0].strip()
+        if first_forwarded:
+            return first_forwarded
+    if request.client is not None and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def live_read_rate_limit_scopes(
+    session_id: str,
+    user_id: Optional[str],
+    client_ip: str
+) -> list[tuple[str, int]]:
+    scopes = []
+    if LIVE_READ_RATE_LIMIT_GLOBAL > 0:
+        scopes.append(("global", LIVE_READ_RATE_LIMIT_GLOBAL))
+    if LIVE_READ_RATE_LIMIT_PER_SESSION > 0:
+        scopes.append((f"session:{session_id}", LIVE_READ_RATE_LIMIT_PER_SESSION))
+    if user_id and LIVE_READ_RATE_LIMIT_PER_USER > 0:
+        scopes.append((f"user:{user_id}", LIVE_READ_RATE_LIMIT_PER_USER))
+    if client_ip and LIVE_READ_RATE_LIMIT_PER_IP > 0:
+        scopes.append((f"ip:{client_ip}", LIVE_READ_RATE_LIMIT_PER_IP))
+    return scopes
+
+
+def live_read_retry_after_seconds(events: list[float], now: float) -> int:
+    if not events:
+        return 1
+    retry_after = (min(events) + LIVE_READ_RATE_LIMIT_WINDOW_SECONDS) - now
+    return max(1, int(math.ceil(retry_after)))
+
+
+def enforce_live_read_rate_limit(
+    session_id: str,
+    user_id: Optional[str],
+    client_ip: str
+) -> None:
+    scopes = live_read_rate_limit_scopes(session_id, user_id, client_ip)
+    if not scopes:
+        return
+
+    now = time.monotonic()
+    window_start = now - LIVE_READ_RATE_LIMIT_WINDOW_SECONDS
+    with _live_read_rate_limit_lock:
+        for scope_key, limit in scopes:
+            events = _live_read_rate_limit_events.setdefault(scope_key, [])
+            events[:] = [event_time for event_time in events if event_time > window_start]
+            if len(events) >= limit:
+                retry_after_seconds = live_read_retry_after_seconds(events, now)
+                record_live_read_rate_limited()
+                raise ApiHTTPException(
+                    status_code=429,
+                    code=ErrorCode.LIVEFOLLOW_RATE_LIMITED,
+                    detail="LiveFollow live-read rate limit exceeded.",
+                    headers={"Retry-After": str(retry_after_seconds)}
+                )
+        for scope_key, _limit in scopes:
+            _live_read_rate_limit_events[scope_key].append(now)
+
+
+def invalidate_cached_live_responses(session_id: str) -> None:
+    for cache_key in live_response_cache_keys(session_id):
+        redis_client.delete(cache_key)
+
+
 def build_live_list_display_label(session: LiveSession) -> str:
     # Public UI label only. Share code is server-owned; no stronger identity is implied.
     return f"Live {session.share_code}"
@@ -4668,6 +6092,29 @@ def build_live_owner_display_label(
     if session.owner_user_id:
         return session.owner_user_id
     return session.id
+
+
+def build_live_spectator_stats_response(
+    stats: Optional[LiveSessionSpectatorStats]
+) -> Optional[dict[str, Any]]:
+    if stats is None:
+        return None
+    duration_seconds = int(
+        max(
+            0.0,
+            spectator_stats_delta_seconds(
+                stats.first_position_at,
+                stats.last_position_at
+            )
+        )
+    )
+    return {
+        "current_climb_sink_ms": stats.current_climb_sink_ms,
+        "highest_altitude_msl_meters": stats.highest_altitude_msl_meters,
+        "best_short_window_climb_ms": stats.best_short_window_climb_ms,
+        "distance_flown_meters": stats.distance_flown_meters,
+        "flight_duration_seconds": duration_seconds
+    }
 
 
 def build_authorized_live_active_item(
@@ -4737,6 +6184,9 @@ def build_live_response(
         "last_position_at": to_iso_utc(session.last_position_at),
         "ended_at": to_iso_utc(session.ended_at),
         "latest": latest,
+        "spectator_stats": build_live_spectator_stats_response(
+            get_live_session_spectator_stats(db, session.id)
+        ),
         "positions": [
             {
                 "lat": p.lat,
@@ -4871,7 +6321,14 @@ def post_position(
         )
         db.add(row)
 
-        session.last_position_at = utcnow()
+        accepted_at = utcnow()
+        session.last_position_at = accepted_at
+        db.flush()
+        update_live_session_spectator_stats_for_accepted_position(
+            db,
+            p.session_id,
+            accepted_at
+        )
         db.commit()
 
         latest = {
@@ -4884,6 +6341,7 @@ def post_position(
             "timestamp": to_iso_utc(position_ts)
         }
         redis_client.set(f"live:latest:{p.session_id}", json.dumps(latest))
+        invalidate_cached_live_responses(p.session_id)
 
         return {"ok": True}
     finally:
@@ -4932,6 +6390,7 @@ def task_upsert(
             )
             db.add(revision)
             db.commit()
+            invalidate_cached_live_responses(req.session_id)
 
             return {
                 "ok": True,
@@ -4972,6 +6431,7 @@ def task_upsert(
         )
         db.add(revision)
         db.commit()
+        invalidate_cached_live_responses(req.session_id)
 
         return {
             "ok": True,
@@ -4998,18 +6458,21 @@ def end_session(
                 "ok": True,
                 "session_id": session.id,
                 "status": "ended",
-                "ended_at": to_iso_utc(session.ended_at)
+                "ended_at": to_iso_utc(session.ended_at),
+                "unique_watchers_count": count_live_session_unique_viewers(db, session.id)
             }
 
         session.status = "ended"
         session.ended_at = utcnow()
         db.commit()
+        invalidate_cached_live_responses(session.id)
 
         return {
             "ok": True,
             "session_id": session.id,
             "status": "ended",
-            "ended_at": to_iso_utc(session.ended_at)
+            "ended_at": to_iso_utc(session.ended_at),
+            "unique_watchers_count": count_live_session_unique_viewers(db, session.id)
         }
     finally:
         db.close()
@@ -5029,7 +6492,7 @@ def start_authenticated_live_session(
             else current_user.privacy.default_live_visibility
         )
         now = utcnow()
-        end_active_owned_live_sessions(db, current_user.user.id, now)
+        ended_session_ids = end_active_owned_live_sessions(db, current_user.user.id, now)
 
         session_id = str(uuid.uuid4())
         write_token = generate_write_token()
@@ -5050,6 +6513,8 @@ def start_authenticated_live_session(
         )
         db.add(row)
         db.commit()
+        for ended_session_id in ended_session_ids:
+            invalidate_cached_live_responses(ended_session_id)
 
         return build_live_session_command_response(row, write_token=write_token)
     finally:
@@ -5071,9 +6536,10 @@ def patch_authenticated_live_session_visibility(
                 status_code=409,
                 code=ErrorCode.SESSION_ALREADY_ENDED,
                 detail="session already ended"
-            )
+        )
         session.visibility = validate_live_visibility(request.visibility)
         db.commit()
+        invalidate_cached_live_responses(session.id)
         return build_live_session_command_response(session)
     finally:
         db.close()
@@ -5321,33 +6787,47 @@ def search_private_follow_users(
     try:
         current_user = ensure_current_user_record(db, authorization)
         normalized_query = normalize_search_query(q)
-        blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
         search_query = (
-            db.query(PilotProfile)
+            db.query(PilotProfile, PrivacySetting)
             .join(PrivacySetting, PrivacySetting.user_id == PilotProfile.user_id)
             .filter(
                 PilotProfile.user_id != current_user.user.id,
                 PilotProfile.handle_normalized.isnot(None),
                 PilotProfile.display_name.isnot(None),
-                PrivacySetting.discoverability == DEFAULT_DISCOVERABILITY,
                 PilotProfile.handle_normalized.like(f"%{normalized_query}%")
             )
         )
-        search_query = filter_blocked_counterparts(
-            search_query,
-            PilotProfile.user_id,
-            blocked_user_ids
+        exact_match_rank = case(
+            (PilotProfile.handle_normalized == normalized_query, 0),
+            else_=1
         )
-        matching_profiles = search_query.all()
-        ordered_profiles = sorted(
-            matching_profiles,
-            key=lambda profile: (
-                0 if profile.handle_normalized == normalized_query else 1,
-                0 if profile.handle_normalized.startswith(normalized_query) else 1,
-                profile.handle_normalized or "",
-                profile.user_id
+        prefix_match_rank = case(
+            (PilotProfile.handle_normalized.like(f"{normalized_query}%"), 0),
+            else_=1
+        )
+        ordered_profile_rows = (
+            search_query
+            .order_by(
+                exact_match_rank,
+                prefix_match_rank,
+                PilotProfile.handle_normalized.asc(),
+                PilotProfile.user_id.asc()
             )
-        )[:SEARCH_RESULT_LIMIT]
+            .limit(SEARCH_RESULT_LIMIT)
+            .all()
+        )
+        ordered_profiles = [
+            profile
+            for profile, privacy in ordered_profile_rows
+            if relationship_policy_allows_profile_discovery(
+                build_relationship_policy_context(
+                    db,
+                    current_user.user.id,
+                    profile.user_id
+                ),
+                privacy
+            )
+        ]
         lookup = load_relationship_lookup(
             db,
             current_user.user.id,
@@ -5363,6 +6843,65 @@ def search_private_follow_users(
         db.close()
 
 
+@app.post("/api/v2/users/relationship-status/bulk")
+def get_bulk_relationship_status(
+    request: BulkRelationshipStatusRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        requested_user_ids = normalize_bulk_relationship_status_user_ids(request.user_ids)
+        record_bulk_relationship_status_metric(len(requested_user_ids))
+        if not requested_user_ids:
+            return {"items": []}
+
+        profile_rows = (
+            db.query(PilotProfile, PrivacySetting)
+            .join(PrivacySetting, PrivacySetting.user_id == PilotProfile.user_id)
+            .filter(
+                PilotProfile.user_id.in_(requested_user_ids),
+                PilotProfile.user_id != current_user.user.id,
+                PilotProfile.handle_normalized.isnot(None),
+                PilotProfile.display_name.isnot(None)
+            )
+            .all()
+        )
+        visible_user_ids = {
+            profile.user_id
+            for profile, privacy in profile_rows
+            if relationship_policy_allows_profile_discovery(
+                build_relationship_policy_context(
+                    db,
+                    current_user.user.id,
+                    profile.user_id
+                ),
+                privacy
+            )
+        }
+        ordered_visible_user_ids = [
+            user_id
+            for user_id in requested_user_ids
+            if user_id in visible_user_ids
+        ]
+        lookup = load_relationship_lookup(
+            db,
+            current_user.user.id,
+            ordered_visible_user_ids
+        )
+        return {
+            "items": [
+                {
+                    "user_id": user_id,
+                    "relationship_state": build_relationship_state(lookup, user_id)
+                }
+                for user_id in ordered_visible_user_ids
+            ]
+        }
+    finally:
+        db.close()
+
+
 @app.get("/api/v2/users/{user_id}/followers")
 def list_user_followers(
     user_id: str,
@@ -5372,6 +6911,7 @@ def list_user_followers(
 ):
     db = SessionLocal()
     try:
+        started_at = time.perf_counter()
         current_user = ensure_current_user_record(db, authorization)
         _target_profile, target_privacy = get_searchable_target_or_404(db, user_id)
         ensure_can_read_relationship_list(
@@ -5401,7 +6941,7 @@ def list_user_followers(
             .limit(page_limit)
             .all()
         )
-        return build_relationship_list_page_response(
+        response = build_relationship_list_page_response(
             db,
             current_user.user.id,
             profiles,
@@ -5409,6 +6949,11 @@ def list_user_followers(
             page_limit,
             offset
         )
+        record_relationship_list_query_metric(
+            offset=offset,
+            response_ms=(time.perf_counter() - started_at) * 1000.0
+        )
+        return response
     finally:
         db.close()
 
@@ -5422,6 +6967,7 @@ def list_user_following(
 ):
     db = SessionLocal()
     try:
+        started_at = time.perf_counter()
         current_user = ensure_current_user_record(db, authorization)
         _target_profile, target_privacy = get_searchable_target_or_404(db, user_id)
         ensure_can_read_relationship_list(
@@ -5444,14 +6990,33 @@ def list_user_following(
             blocked_user_ids
         )
         total = following_query.count()
+        if current_user.user.id == user_id:
+            following_query = following_query.outerjoin(
+                FavoriteFollow,
+                and_(
+                    FavoriteFollow.user_id == current_user.user.id,
+                    FavoriteFollow.favorite_user_id == FollowEdge.followed_user_id
+                )
+            )
+            order_by = (
+                case((FavoriteFollow.favorite_user_id.isnot(None), 0), else_=1),
+                FavoriteFollow.updated_at.desc(),
+                FollowEdge.created_at.desc(),
+                FollowEdge.followed_user_id.asc(),
+            )
+        else:
+            order_by = (
+                FollowEdge.created_at.desc(),
+                FollowEdge.followed_user_id.asc(),
+            )
         profiles = (
             following_query
-            .order_by(FollowEdge.created_at.desc(), FollowEdge.followed_user_id.asc())
+            .order_by(*order_by)
             .offset(offset)
             .limit(page_limit)
             .all()
         )
-        return build_relationship_list_page_response(
+        response = build_relationship_list_page_response(
             db,
             current_user.user.id,
             profiles,
@@ -5459,6 +7024,101 @@ def list_user_following(
             page_limit,
             offset
         )
+        record_relationship_list_query_metric(
+            offset=offset,
+            response_ms=(time.perf_counter() - started_at) * 1000.0
+        )
+        return response
+    finally:
+        db.close()
+
+
+@app.put("/api/v2/me/favorites/{user_id}")
+def favorite_follow(
+    user_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        target_user_id = user_id.strip()
+        if not target_user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="user_id is required"
+            )
+        if target_user_id == current_user.user.id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="cannot favorite yourself"
+            )
+        get_user_record_or_404(db, target_user_id)
+        if not follow_edge_exists(db, current_user.user.id, target_user_id):
+            raise ApiHTTPException(
+                status_code=409,
+                code=ErrorCode.FAVORITE_REQUIRES_FOLLOWING,
+                detail="favorite requires following this user"
+            )
+        now = utcnow()
+        favorite = (
+            db.query(FavoriteFollow)
+            .filter(
+                FavoriteFollow.user_id == current_user.user.id,
+                FavoriteFollow.favorite_user_id == target_user_id
+            )
+            .first()
+        )
+        created = favorite is None
+        if favorite is None:
+            favorite = FavoriteFollow(
+                user_id=current_user.user.id,
+                favorite_user_id=target_user_id,
+                created_at=now,
+                updated_at=now
+            )
+            db.add(favorite)
+        else:
+            favorite.updated_at = now
+        invalidate_social_cache_for_users(current_user.user.id)
+        db.commit()
+        return {
+            "ok": True,
+            "user_id": target_user_id,
+            "favorite": True,
+            "created": created,
+        }
+    finally:
+        db.close()
+
+
+@app.delete("/api/v2/me/favorites/{user_id}")
+def unfavorite_follow(
+    user_id: str,
+    authorization: Optional[str] = Header(default=None, alias="Authorization")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        target_user_id = user_id.strip()
+        if not target_user_id:
+            raise ApiHTTPException(
+                status_code=422,
+                code=ErrorCode.VALIDATION_ERROR,
+                detail="user_id is required"
+            )
+        get_user_record_or_404(db, target_user_id)
+        removed = remove_favorite_follow(db, current_user.user.id, target_user_id)
+        if removed:
+            invalidate_social_cache_for_users(current_user.user.id)
+        db.commit()
+        return {
+            "ok": True,
+            "user_id": target_user_id,
+            "favorite": False,
+            "removed": removed,
+        }
     finally:
         db.close()
 
@@ -5490,6 +7150,14 @@ def unfollow_user(
         )
         removed = edge is not None
         if edge is not None:
+            decrement_relationship_counters_for_follow_edge(
+                db,
+                edge.follower_user_id,
+                edge.followed_user_id,
+                utcnow()
+            )
+            remove_favorite_follow(db, edge.follower_user_id, edge.followed_user_id)
+            invalidate_social_cache_for_users(edge.follower_user_id, edge.followed_user_id)
             db.delete(edge)
             db.commit()
 
@@ -5530,6 +7198,14 @@ def remove_follower(
         )
         removed = edge is not None
         if edge is not None:
+            decrement_relationship_counters_for_follow_edge(
+                db,
+                edge.follower_user_id,
+                edge.followed_user_id,
+                utcnow()
+            )
+            remove_favorite_follow(db, edge.follower_user_id, edge.followed_user_id)
+            invalidate_social_cache_for_users(edge.follower_user_id, edge.followed_user_id)
             db.delete(edge)
             db.commit()
 
@@ -5574,19 +7250,22 @@ def block_user(
             )
             .first()
         )
+        now = utcnow()
         if block is None:
             db.add(
                 UserBlock(
                     blocker_user_id=current_user.user.id,
                     blocked_user_id=target_user_id,
-                    created_at=utcnow()
+                    created_at=now
                 )
             )
         remove_relationship_rows_between_users(
             db,
             current_user.user.id,
-            target_user_id
+            target_user_id,
+            now
         )
+        invalidate_social_cache_for_users(current_user.user.id, target_user_id)
         try:
             db.commit()
         except IntegrityError:
@@ -5604,8 +7283,10 @@ def block_user(
             remove_relationship_rows_between_users(
                 db,
                 current_user.user.id,
-                target_user_id
+                target_user_id,
+                utcnow()
             )
+            invalidate_social_cache_for_users(current_user.user.id, target_user_id)
             db.commit()
         return {
             "ok": True,
@@ -5644,6 +7325,7 @@ def unblock_user(
         removed = block is not None
         if block is not None:
             db.delete(block)
+            invalidate_social_cache_for_users(current_user.user.id, target_user_id)
             db.commit()
         return {
             "ok": True,
@@ -5786,11 +7468,14 @@ def create_follow_request(
 
 @app.get("/api/v2/follow-requests/incoming")
 def list_incoming_follow_requests(
-    authorization: Optional[str] = Header(default=None, alias="Authorization")
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    limit: int = RELATIONSHIP_LIST_DEFAULT_LIMIT,
+    cursor: Optional[str] = None
 ):
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
+        page_limit, offset = parse_relationship_list_page_params(limit, cursor)
         blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
         incoming_query = (
             db.query(FollowRequest, PilotProfile)
@@ -5805,13 +7490,17 @@ def list_incoming_follow_requests(
             FollowRequest.requester_user_id,
             blocked_user_ids
         )
+        total = incoming_query.count()
         request_rows = (
             incoming_query
             .order_by(FollowRequest.updated_at.desc(), FollowRequest.id.desc())
+            .offset(offset)
+            .limit(page_limit)
             .all()
         )
         counterpart_ids = [profile.user_id for _request, profile in request_rows]
         lookup = load_relationship_lookup(db, current_user.user.id, counterpart_ids)
+        next_offset = offset + page_limit
         return {
             "requests": [
                 build_follow_request_response(
@@ -5821,7 +7510,9 @@ def list_incoming_follow_requests(
                     lookup
                 )
                 for follow_request, profile in request_rows
-            ]
+            ],
+            "total": total,
+            "next_cursor": str(next_offset) if next_offset < total else None
         }
     finally:
         db.close()
@@ -5829,11 +7520,14 @@ def list_incoming_follow_requests(
 
 @app.get("/api/v2/follow-requests/outgoing")
 def list_outgoing_follow_requests(
-    authorization: Optional[str] = Header(default=None, alias="Authorization")
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    limit: int = RELATIONSHIP_LIST_DEFAULT_LIMIT,
+    cursor: Optional[str] = None
 ):
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
+        page_limit, offset = parse_relationship_list_page_params(limit, cursor)
         blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
         outgoing_query = (
             db.query(FollowRequest, PilotProfile)
@@ -5848,13 +7542,17 @@ def list_outgoing_follow_requests(
             FollowRequest.target_user_id,
             blocked_user_ids
         )
+        total = outgoing_query.count()
         request_rows = (
             outgoing_query
             .order_by(FollowRequest.updated_at.desc(), FollowRequest.id.desc())
+            .offset(offset)
+            .limit(page_limit)
             .all()
         )
         counterpart_ids = [profile.user_id for _request, profile in request_rows]
         lookup = load_relationship_lookup(db, current_user.user.id, counterpart_ids)
+        next_offset = offset + page_limit
         return {
             "requests": [
                 build_follow_request_response(
@@ -5864,7 +7562,9 @@ def list_outgoing_follow_requests(
                     lookup
                 )
                 for follow_request, profile in request_rows
-            ]
+            ],
+            "total": total,
+            "next_cursor": str(next_offset) if next_offset < total else None
         }
     finally:
         db.close()
@@ -6064,11 +7764,15 @@ def decline_follow_request(
 
 @app.get("/api/v2/live/following/active")
 def get_following_active_live_sessions(
+    limit: int = RELATIONSHIP_LIST_DEFAULT_LIMIT,
+    cursor: Optional[str] = None,
     authorization: Optional[str] = Header(default=None, alias="Authorization")
 ):
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
+        page_limit, offset = parse_relationship_list_page_params(limit, cursor)
+        record_active_list_refresh_metric(offset)
         blocked_user_ids = load_blocked_counterpart_user_ids(db, current_user.user.id)
         following_active_query = (
             db.query(LiveSession, PilotProfile)
@@ -6093,6 +7797,7 @@ def get_following_active_live_sessions(
             LiveSession.owner_user_id,
             blocked_user_ids
         )
+        total = following_active_query.count()
         rows = (
             following_active_query
             .order_by(
@@ -6100,13 +7805,19 @@ def get_following_active_live_sessions(
                 LiveSession.created_at.desc(),
                 LiveSession.id.asc()
             )
+            .offset(offset)
+            .limit(page_limit)
             .all()
         )
+        next_offset = offset + len(rows)
+        next_cursor = str(next_offset) if next_offset < total else None
         return {
+            "total": total,
             "items": [
                 build_authorized_live_active_item(session, owner_profile)
                 for session, owner_profile in rows
             ],
+            "next_cursor": next_cursor,
             "generated_at": to_iso_utc(utcnow())
         }
     finally:
@@ -6116,6 +7827,7 @@ def get_following_active_live_sessions(
 @app.get("/api/v2/live/users/{user_id}")
 def get_live_session_for_user(
     user_id: str,
+    request: Request,
     authorization: Optional[str] = Header(default=None, alias="Authorization")
 ):
     db = SessionLocal()
@@ -6128,12 +7840,29 @@ def get_live_session_for_user(
                 code=ErrorCode.SESSION_NOT_FOUND,
                 detail="not found"
             )
+        enforce_live_read_rate_limit(
+            session_id=session.id,
+            user_id=current_user.user.id,
+            client_ip=live_read_client_ip(request)
+        )
+        if record_authorized_live_session_viewer_if_needed(
+            db,
+            session,
+            current_user.user.id,
+            utcnow()
+        ):
+            db.commit()
         owner_profile = (
             db.query(PilotProfile)
             .filter(PilotProfile.user_id == session.owner_user_id)
             .first()
         )
-        return build_live_response(db, session, owner_profile)
+        return build_measured_live_response(
+            db,
+            session,
+            live_response_cache_key(session.id, LIVE_RESPONSE_CACHE_VARIANT_V2_USER),
+            owner_profile
+        )
     finally:
         db.close()
 
@@ -6141,6 +7870,7 @@ def get_live_session_for_user(
 @app.get("/api/v2/live/session/{session_id}")
 def get_authenticated_live_session(
     session_id: str,
+    request: Request,
     authorization: Optional[str] = Header(default=None, alias="Authorization")
 ):
     db = SessionLocal()
@@ -6153,12 +7883,29 @@ def get_authenticated_live_session(
                 code=ErrorCode.SESSION_NOT_FOUND,
                 detail="not found"
             )
+        enforce_live_read_rate_limit(
+            session_id=session.id,
+            user_id=current_user.user.id,
+            client_ip=live_read_client_ip(request)
+        )
+        if record_authorized_live_session_viewer_if_needed(
+            db,
+            session,
+            current_user.user.id,
+            utcnow()
+        ):
+            db.commit()
         owner_profile = (
             db.query(PilotProfile)
             .filter(PilotProfile.user_id == session.owner_user_id)
             .first()
         )
-        return build_live_response(db, session, owner_profile)
+        return build_measured_live_response(
+            db,
+            session,
+            live_response_cache_key(session.id, LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION),
+            owner_profile
+        )
     finally:
         db.close()
 
@@ -6189,7 +7936,7 @@ def get_active_live_sessions():
 
 
 @app.get("/api/v1/live/{session_id}")
-def get_live(session_id: str):
+def get_live(session_id: str, request: Request):
     db = SessionLocal()
     try:
         session = db.query(LiveSession).filter(LiveSession.id == session_id).first()
@@ -6200,13 +7947,22 @@ def get_live(session_id: str):
                 detail="not found"
             )
 
-        return build_live_response(db, session)
+        enforce_live_read_rate_limit(
+            session_id=session.id,
+            user_id=None,
+            client_ip=live_read_client_ip(request)
+        )
+        return build_measured_live_response(
+            db,
+            session,
+            live_response_cache_key(session.id, LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION)
+        )
     finally:
         db.close()
 
 
 @app.get("/api/v1/live/share/{share_code}")
-def get_live_by_share_code(share_code: str):
+def get_live_by_share_code(share_code: str, request: Request):
     db = SessionLocal()
     try:
         session = (
@@ -6224,6 +7980,15 @@ def get_live_by_share_code(share_code: str):
                 detail="not found"
             )
 
-        return build_live_response(db, session)
+        enforce_live_read_rate_limit(
+            session_id=session.id,
+            user_id=None,
+            client_ip=live_read_client_ip(request)
+        )
+        return build_measured_live_response(
+            db,
+            session,
+            live_response_cache_key(session.id, LIVE_RESPONSE_CACHE_VARIANT_V1_SHARE)
+        )
     finally:
         db.close()

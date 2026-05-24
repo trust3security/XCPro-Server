@@ -28,7 +28,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Deliver pending XCPro private-follow notification outbox events."
     )
-    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=main_module.NOTIFICATION_DELIVERY_DEFAULT_LIMIT,
+    )
     parser.add_argument("--confirm-send", action="store_true")
     return parser.parse_args(argv)
 

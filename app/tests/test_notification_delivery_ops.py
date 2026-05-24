@@ -56,6 +56,18 @@ class NotificationDeliveryOperationsTest(unittest.TestCase):
         with self.assertRaises(deliver_notifications.NotificationDeliveryScriptError):
             deliver_notifications.run(deliver_notifications.parse_args([]))
 
+    def test_delivery_limits_are_named_defaults_and_clamped(self):
+        args = deliver_notifications.parse_args(["--confirm-send"])
+
+        self.assertEqual(main_module.NOTIFICATION_DELIVERY_DEFAULT_LIMIT, args.limit)
+        self.assertEqual(1, main_module.normalize_notification_delivery_limit(-5))
+        self.assertEqual(
+            main_module.NOTIFICATION_DELIVERY_MAX_LIMIT,
+            main_module.normalize_notification_delivery_limit(
+                main_module.NOTIFICATION_DELIVERY_MAX_LIMIT + 1
+            )
+        )
+
     def test_delivery_script_delegates_confirmed_aggregate_delivery(self):
         original_deliver = deliver_notifications.main_module.deliver_pending_notification_events
         calls = []

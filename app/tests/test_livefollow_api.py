@@ -1,8 +1,13 @@
 import json
+import inspect as python_inspect
+import threading
 import tempfile
+import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from alembic import command
@@ -19,12 +24,22 @@ from app.scripts import deliver_notifications
 class FakeRedis:
     def __init__(self):
         self.values = {}
+        self.expires = {}
 
     def get(self, key):
         return self.values.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, ex=None):
         self.values[key] = value
+        if ex is None:
+            self.expires.pop(key, None)
+        else:
+            self.expires[key] = ex
+
+    def delete(self, *keys):
+        for key in keys:
+            self.values.pop(key, None)
+            self.expires.pop(key, None)
 
 
 class MutableClock:
@@ -53,6 +68,87 @@ class FakeFcmSender:
             raise failure
 
 
+class LiveSpectatorStatsPolicyTest(unittest.TestCase):
+    def test_first_valid_fix_initializes_stats_without_climb_or_distance(self):
+        first = self.point(altitude=500.0, seconds=0)
+
+        stats = main_module.build_live_spectator_stats_snapshot([first])
+
+        self.assertIsNotNone(stats)
+        self.assertEqual(first.timestamp, stats.first_position_at)
+        self.assertEqual(first.timestamp, stats.last_position_at)
+        self.assertEqual(1, stats.position_count)
+        self.assertEqual(500.0, stats.highest_altitude_msl_meters)
+        self.assertEqual(0.0, stats.distance_flown_meters)
+        self.assertIsNone(stats.current_climb_sink_ms)
+        self.assertIsNone(stats.best_short_window_climb_ms)
+
+    def test_normal_fix_pair_computes_distance_highest_and_current_climb(self):
+        first = self.point(lat=-33.9, lon=151.2, altitude=500.0, seconds=0)
+        second = self.point(lat=-33.901, lon=151.201, altitude=530.0, seconds=30)
+
+        stats = main_module.build_live_spectator_stats_snapshot([second, first])
+
+        self.assertIsNotNone(stats)
+        self.assertEqual(2, stats.position_count)
+        self.assertEqual(530.0, stats.highest_altitude_msl_meters)
+        self.assertAlmostEqual(
+            main_module.haversine_m(first.lat, first.lon, second.lat, second.lon),
+            stats.distance_flown_meters,
+            places=6
+        )
+        self.assertAlmostEqual(1.0, stats.current_climb_sink_ms, places=6)
+        self.assertAlmostEqual(1.0, stats.best_short_window_climb_ms, places=6)
+
+    def test_invalid_time_delta_suppresses_current_climb(self):
+        first = self.point(altitude=500.0, seconds=0)
+        stale = self.point(altitude=650.0, seconds=180)
+
+        stats = main_module.build_live_spectator_stats_snapshot([first, stale])
+
+        self.assertIsNotNone(stats)
+        self.assertIsNone(stats.current_climb_sink_ms)
+
+    def test_best_short_window_uses_positive_windowed_climb(self):
+        points = [
+            self.point(altitude=500.0, seconds=0),
+            self.point(altitude=515.0, seconds=15),
+            self.point(altitude=560.0, seconds=30),
+            self.point(altitude=540.0, seconds=60),
+        ]
+
+        stats = main_module.build_live_spectator_stats_snapshot(points)
+
+        self.assertIsNotNone(stats)
+        self.assertAlmostEqual(2.0, stats.best_short_window_climb_ms, places=6)
+
+    def test_invalid_non_finite_points_do_not_create_stats(self):
+        invalid = main_module.LiveSpectatorStatsPoint(
+            lat=float("nan"),
+            lon=151.2,
+            altitude_msl_meters=500.0,
+            timestamp=datetime(2026, 3, 20, 12, 0, 0)
+        )
+
+        stats = main_module.build_live_spectator_stats_snapshot([invalid])
+
+        self.assertIsNone(stats)
+
+    def point(
+        self,
+        lat: float = -33.9,
+        lon: float = 151.2,
+        altitude: float = 500.0,
+        seconds: int = 0
+    ) -> main_module.LiveSpectatorStatsPoint:
+        return main_module.LiveSpectatorStatsPoint(
+            lat=lat,
+            lon=lon,
+            altitude_msl_meters=altitude,
+            timestamp=datetime(2026, 3, 20, 12, 0, 0) + timedelta(seconds=seconds)
+        )
+
+
 class LiveFollowApiTest(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine(
@@ -72,6 +168,13 @@ class LiveFollowApiTest(unittest.TestCase):
         self.original_google_id_token_verifier = main_module.GOOGLE_ID_TOKEN_VERIFIER
         self.original_private_follow_bearer_secret = main_module.PRIVATE_FOLLOW_BEARER_SECRET
         self.original_push_token_encryption_secret = main_module.PUSH_TOKEN_ENCRYPTION_SECRET
+        self.original_live_read_rate_limit_config = (
+            main_module.LIVE_READ_RATE_LIMIT_WINDOW_SECONDS,
+            main_module.LIVE_READ_RATE_LIMIT_GLOBAL,
+            main_module.LIVE_READ_RATE_LIMIT_PER_USER,
+            main_module.LIVE_READ_RATE_LIMIT_PER_IP,
+            main_module.LIVE_READ_RATE_LIMIT_PER_SESSION,
+        )
 
         self.primary_bearer_token = "test-bearer-token-1"
         self.secondary_bearer_token = "test-bearer-token-2"
@@ -106,6 +209,9 @@ class LiveFollowApiTest(unittest.TestCase):
         main_module.GOOGLE_ID_TOKEN_VERIFIER = self.fake_google_id_token_verifier
         main_module.PRIVATE_FOLLOW_BEARER_SECRET = b"test-private-follow-secret"
         main_module.PUSH_TOKEN_ENCRYPTION_SECRET = b"test-push-token-encryption-secret"
+        main_module.reset_live_read_metrics()
+        main_module.reset_live_read_rate_limits()
+        main_module.reset_social_graph_metrics()
 
         self.client = TestClient(main_module.app)
 
@@ -120,6 +226,15 @@ class LiveFollowApiTest(unittest.TestCase):
         main_module.GOOGLE_ID_TOKEN_VERIFIER = self.original_google_id_token_verifier
         main_module.PRIVATE_FOLLOW_BEARER_SECRET = self.original_private_follow_bearer_secret
         main_module.PUSH_TOKEN_ENCRYPTION_SECRET = self.original_push_token_encryption_secret
+        (
+            main_module.LIVE_READ_RATE_LIMIT_WINDOW_SECONDS,
+            main_module.LIVE_READ_RATE_LIMIT_GLOBAL,
+            main_module.LIVE_READ_RATE_LIMIT_PER_USER,
+            main_module.LIVE_READ_RATE_LIMIT_PER_IP,
+            main_module.LIVE_READ_RATE_LIMIT_PER_SESSION,
+        ) = self.original_live_read_rate_limit_config
+        main_module.reset_live_read_rate_limits()
+        main_module.reset_social_graph_metrics()
         main_module.Base.metadata.drop_all(bind=self.engine)
         self.engine.dispose()
 
@@ -1223,7 +1338,9 @@ class LiveFollowApiTest(unittest.TestCase):
                 "discoverability": "hidden",
                 "follow_policy": "auto_approve",
                 "default_live_visibility": "public",
-                "connection_list_visibility": "mutuals_only"
+                "connection_list_visibility": "mutuals_only",
+                "social_notifications_enabled": False,
+                "live_notifications_enabled": True,
             },
             headers=self.bearer_headers()
         )
@@ -1239,6 +1356,8 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual("auto_approve", success.json()["follow_policy"])
         self.assertEqual("public", success.json()["default_live_visibility"])
         self.assertEqual("mutuals_only", success.json()["connection_list_visibility"])
+        self.assertEqual(False, success.json()["social_notifications_enabled"])
+        self.assertEqual(True, success.json()["live_notifications_enabled"])
 
         self.assertEqual(422, invalid.status_code)
         self.assertEqual(main_module.ErrorCode.INVALID_PRIVACY_SETTING, invalid.json()["code"])
@@ -1248,6 +1367,11 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual("auto_approve", me_response.json()["privacy"]["follow_policy"])
         self.assertEqual("public", me_response.json()["privacy"]["default_live_visibility"])
         self.assertEqual("mutuals_only", me_response.json()["privacy"]["connection_list_visibility"])
+        self.assertEqual(
+            False,
+            me_response.json()["privacy"]["social_notifications_enabled"]
+        )
+        self.assertEqual(True, me_response.json()["privacy"]["live_notifications_enabled"])
 
     def test_search_users_matches_handle_case_insensitively_and_hides_hidden_profiles(self):
         pilot_one = self.complete_profile(
@@ -1294,6 +1418,133 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(422, response.status_code)
         self.assertEqual(main_module.ErrorCode.SEARCH_QUERY_TOO_SHORT, response.json()["code"])
 
+    def test_search_users_returns_no_more_than_search_result_limit(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        for index in range(main_module.SEARCH_RESULT_LIMIT + 1):
+            self.seed_profile_user(
+                handle=f"search.match.{index:02d}",
+                display_name=f"Search Match {index:02d}"
+            )
+
+        response = self.client.get(
+            "/api/v2/users/search",
+            params={"q": "search.match"},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(main_module.SEARCH_RESULT_LIMIT, len(response.json()["users"]))
+
+    def test_bulk_relationship_status_returns_existing_relationship_states(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        following = self.seed_profile_user("bulk.following", "Bulk Following")
+        followed_by = self.seed_profile_user("bulk.followed", "Bulk Followed")
+        mutual = self.seed_profile_user("bulk.mutual", "Bulk Mutual")
+        outgoing = self.seed_profile_user("bulk.outgoing", "Bulk Outgoing")
+        incoming = self.seed_profile_user("bulk.incoming", "Bulk Incoming")
+        none = self.seed_profile_user("bulk.none", "Bulk None")
+        self.seed_follow_edge(current_profile["user_id"], following["user_id"])
+        self.seed_follow_edge(followed_by["user_id"], current_profile["user_id"])
+        self.seed_follow_edge(current_profile["user_id"], mutual["user_id"])
+        self.seed_follow_edge(mutual["user_id"], current_profile["user_id"])
+        self.seed_follow_request(current_profile["user_id"], outgoing["user_id"])
+        self.seed_follow_request(incoming["user_id"], current_profile["user_id"])
+
+        response = self.client.post(
+            "/api/v2/users/relationship-status/bulk",
+            json={
+                "user_ids": [
+                    following["user_id"],
+                    followed_by["user_id"],
+                    mutual["user_id"],
+                    outgoing["user_id"],
+                    incoming["user_id"],
+                    none["user_id"],
+                ]
+            },
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        states_by_user_id = {
+            item["user_id"]: item["relationship_state"]
+            for item in response.json()["items"]
+        }
+        self.assertEqual("following", states_by_user_id[following["user_id"]])
+        self.assertEqual("followed_by", states_by_user_id[followed_by["user_id"]])
+        self.assertEqual("mutual", states_by_user_id[mutual["user_id"]])
+        self.assertEqual("outgoing_pending", states_by_user_id[outgoing["user_id"]])
+        self.assertEqual("incoming_pending", states_by_user_id[incoming["user_id"]])
+        self.assertEqual("none", states_by_user_id[none["user_id"]])
+
+    def test_bulk_relationship_status_hides_blocked_hidden_and_deduplicates_ids(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        hidden_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="hidden.pilot",
+            display_name="Hidden Pilot"
+        )
+        self.patch_privacy(
+            token=self.secondary_bearer_token,
+            discoverability="hidden"
+        )
+        blocked_profile = self.seed_profile_user("blocked.bulk", "Blocked Bulk")
+        visible_profile = self.seed_profile_user("visible.bulk", "Visible Bulk")
+        current_user_id = self.user_id_for_token()
+        self.seed_block(current_user_id, blocked_profile["user_id"])
+
+        response = self.client.post(
+            "/api/v2/users/relationship-status/bulk",
+            json={
+                "user_ids": [
+                    hidden_profile["user_id"],
+                    blocked_profile["user_id"],
+                    visible_profile["user_id"],
+                    visible_profile["user_id"],
+                ]
+            },
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            [
+                {
+                    "user_id": visible_profile["user_id"],
+                    "relationship_state": "none",
+                }
+            ],
+            response.json()["items"]
+        )
+
+    def test_bulk_relationship_status_rejects_more_than_one_hundred_ids(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+
+        response = self.client.post(
+            "/api/v2/users/relationship-status/bulk",
+            json={"user_ids": [f"user-{index}" for index in range(101)]},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(422, response.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, response.json()["code"])
+
     def test_owner_can_read_followers_and_following_lists_with_counts_and_states(self):
         current_profile = self.complete_profile(
             token=self.primary_bearer_token,
@@ -1316,6 +1567,9 @@ class LiveFollowApiTest(unittest.TestCase):
         self.seed_follow_edge(current_profile["user_id"], followed_only["user_id"])
         self.seed_follow_edge(mutual["user_id"], current_profile["user_id"])
         self.seed_follow_edge(current_profile["user_id"], mutual["user_id"])
+        self.set_relationship_counter(follower_only["user_id"], 0, 1)
+        self.set_relationship_counter(followed_only["user_id"], 1, 0)
+        self.set_relationship_counter(mutual["user_id"], 1, 1)
 
         followers = self.client.get(
             f"/api/v2/users/{current_profile['user_id']}/followers",
@@ -1346,6 +1600,226 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(1, followers_by_handle["mutual.pilot"]["following_count"])
         self.assertEqual("following", following_by_handle["followed.only"]["relationship_state"])
         self.assertEqual("mutual", following_by_handle["mutual.pilot"]["relationship_state"])
+
+    def test_relationship_list_items_read_cached_counter_rows(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        follower = self.seed_profile_user(
+            handle="cached.follower",
+            display_name="Cached Follower"
+        )
+        self.seed_follow_edge(follower["user_id"], current_profile["user_id"])
+        self.set_relationship_counter(follower["user_id"], 7, 8)
+
+        followers = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/followers",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, followers.status_code)
+        self.assertEqual(1, followers.json()["total"])
+        self.assertEqual(7, followers.json()["items"][0]["followers_count"])
+        self.assertEqual(8, followers.json()["items"][0]["following_count"])
+
+    def test_favorite_follow_and_unfavorite_are_idempotent(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target = self.seed_profile_user("favorite.target", "Favorite Target")
+        self.seed_follow_edge(current_profile["user_id"], target["user_id"])
+
+        first_favorite = self.client.put(
+            f"/api/v2/me/favorites/{target['user_id']}",
+            headers=self.bearer_headers()
+        )
+        repeat_favorite = self.client.put(
+            f"/api/v2/me/favorites/{target['user_id']}",
+            headers=self.bearer_headers()
+        )
+        first_unfavorite = self.client.delete(
+            f"/api/v2/me/favorites/{target['user_id']}",
+            headers=self.bearer_headers()
+        )
+        repeat_unfavorite = self.client.delete(
+            f"/api/v2/me/favorites/{target['user_id']}",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, first_favorite.status_code)
+        self.assertEqual(True, first_favorite.json()["created"])
+        self.assertEqual(200, repeat_favorite.status_code)
+        self.assertEqual(False, repeat_favorite.json()["created"])
+        self.assertEqual(200, first_unfavorite.status_code)
+        self.assertEqual(True, first_unfavorite.json()["removed"])
+        self.assertEqual(200, repeat_unfavorite.status_code)
+        self.assertEqual(False, repeat_unfavorite.json()["removed"])
+        self.assertEqual(
+            0,
+            self.favorite_follow_count(current_profile["user_id"], target["user_id"])
+        )
+
+    def test_favorite_follow_requires_existing_follow_edge(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target = self.seed_profile_user("favorite.not.followed", "Favorite Not Followed")
+
+        response = self.client.put(
+            f"/api/v2/me/favorites/{target['user_id']}",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.FAVORITE_REQUIRES_FOLLOWING,
+            response.json()["code"]
+        )
+
+    def test_own_following_list_orders_favorites_first(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        normal_one = self.seed_profile_user("favorite.normal.one", "Favorite Normal One")
+        favorite = self.seed_profile_user("favorite.first", "Favorite First")
+        normal_two = self.seed_profile_user("favorite.normal.two", "Favorite Normal Two")
+        for target in (normal_one, favorite, normal_two):
+            self.seed_follow_edge(current_profile["user_id"], target["user_id"])
+        favorite_response = self.client.put(
+            f"/api/v2/me/favorites/{favorite['user_id']}",
+            headers=self.bearer_headers()
+        )
+
+        following = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/following",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, favorite_response.status_code)
+        self.assertEqual(200, following.status_code)
+        items = following.json()["items"]
+        self.assertEqual("favorite.first", items[0]["handle"])
+        self.assertEqual(True, items[0]["is_favorite"])
+        self.assertEqual(
+            {"favorite.normal.one": False, "favorite.normal.two": False},
+            {item["handle"]: item["is_favorite"] for item in items[1:]}
+        )
+
+    def test_unfollow_clears_favorite_without_changing_normal_unfollow_result(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target = self.seed_profile_user("favorite.unfollow", "Favorite Unfollow")
+        self.seed_follow_edge(current_profile["user_id"], target["user_id"])
+        favorite_response = self.client.put(
+            f"/api/v2/me/favorites/{target['user_id']}",
+            headers=self.bearer_headers()
+        )
+
+        unfollow_response = self.client.delete(
+            f"/api/v2/users/{target['user_id']}/follow",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, favorite_response.status_code)
+        self.assertEqual(200, unfollow_response.status_code)
+        self.assertEqual(True, unfollow_response.json()["removed"])
+        self.assertEqual("none", unfollow_response.json()["relationship_state"])
+        self.assertEqual(
+            0,
+            self.favorite_follow_count(current_profile["user_id"], target["user_id"])
+        )
+
+    def test_relationship_policy_helpers_cover_discovery_lists_and_live(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="policy.current",
+            display_name="Policy Current"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="policy.target",
+            display_name="Policy Target"
+        )
+
+        def read_policy():
+            db = self.session_local()
+            try:
+                context = main_module.build_relationship_policy_context(
+                    db,
+                    current_profile["user_id"],
+                    target_profile["user_id"]
+                )
+                privacy = (
+                    db.query(main_module.PrivacySetting)
+                    .filter(main_module.PrivacySetting.user_id == target_profile["user_id"])
+                    .first()
+                )
+                self.assertIsNotNone(privacy)
+                return context, privacy
+            finally:
+                db.close()
+
+        context, privacy = read_policy()
+        self.assertTrue(
+            main_module.relationship_policy_allows_profile_discovery(context, privacy)
+        )
+        self.assertFalse(
+            main_module.relationship_policy_allows_connection_list(context, privacy)
+        )
+        self.assertFalse(
+            main_module.relationship_policy_allows_follower_live_access(context)
+        )
+
+        self.seed_follow_edge(current_profile["user_id"], target_profile["user_id"])
+        self.patch_privacy(
+            token=self.secondary_bearer_token,
+            connection_list_visibility="mutuals_only"
+        )
+        context, privacy = read_policy()
+        self.assertTrue(
+            main_module.relationship_policy_allows_follower_live_access(context)
+        )
+        self.assertFalse(
+            main_module.relationship_policy_allows_connection_list(context, privacy)
+        )
+
+        self.seed_follow_edge(target_profile["user_id"], current_profile["user_id"])
+        context, privacy = read_policy()
+        self.assertTrue(
+            main_module.relationship_policy_allows_connection_list(context, privacy)
+        )
+
+        self.patch_privacy(
+            token=self.secondary_bearer_token,
+            discoverability="hidden"
+        )
+        context, privacy = read_policy()
+        self.assertFalse(
+            main_module.relationship_policy_allows_profile_discovery(context, privacy)
+        )
+
+        self.seed_block(target_profile["user_id"], current_profile["user_id"])
+        context, privacy = read_policy()
+        self.assertFalse(
+            main_module.relationship_policy_allows_profile_discovery(context, privacy)
+        )
+        self.assertFalse(
+            main_module.relationship_policy_allows_connection_list(context, privacy)
+        )
+        self.assertFalse(
+            main_module.relationship_policy_allows_follower_live_access(context)
+        )
 
     def test_owner_only_relationship_lists_reject_non_owner(self):
         current_profile = self.complete_profile(
@@ -1414,6 +1888,44 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(200, following.status_code)
         self.assertEqual(["pilot.two"], [item["handle"] for item in followers.json()["items"]])
         self.assertEqual(["public.followed"], [item["handle"] for item in following.json()["items"]])
+
+    def test_public_relationship_lists_reject_blocked_viewer(self):
+        target_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        self.patch_privacy(
+            token=self.primary_bearer_token,
+            connection_list_visibility="public"
+        )
+        viewer_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        self.seed_follow_edge(viewer_profile["user_id"], target_profile["user_id"])
+        self.seed_block(target_profile["user_id"], viewer_profile["user_id"])
+
+        followers = self.client.get(
+            f"/api/v2/users/{target_profile['user_id']}/followers",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        following = self.client.get(
+            f"/api/v2/users/{target_profile['user_id']}/following",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        self.assertEqual(403, followers.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.NOT_AUTHORIZED_TO_VIEW_FOLLOWERS,
+            followers.json()["code"]
+        )
+        self.assertEqual(403, following.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.NOT_AUTHORIZED_TO_VIEW_FOLLOWING,
+            following.json()["code"]
+        )
 
     def test_mutuals_only_relationship_lists_allow_mutual_and_reject_non_mutual(self):
         target_profile = self.complete_profile(
@@ -1489,6 +2001,43 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(0, following.json()["total"])
         self.assertEqual([], following.json()["items"])
 
+    def test_paged_social_endpoints_share_default_limit_contract(self):
+        self.assertEqual(50, main_module.RELATIONSHIP_LIST_DEFAULT_LIMIT)
+        self.assertEqual(200, main_module.RELATIONSHIP_LIST_MAX_LIMIT)
+        for endpoint in (
+            main_module.list_user_followers,
+            main_module.list_user_following,
+            main_module.get_following_active_live_sessions,
+        ):
+            signature = python_inspect.signature(endpoint)
+            self.assertEqual(
+                main_module.RELATIONSHIP_LIST_DEFAULT_LIMIT,
+                signature.parameters["limit"].default
+            )
+
+    def test_relationship_lists_default_to_fifty_rows(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        for index in range(51):
+            target = self.seed_profile_user(
+                handle=f"default.page.{index:02d}",
+                display_name=f"Default Page {index:02d}"
+            )
+            self.seed_follow_edge(current_profile["user_id"], target["user_id"])
+
+        response = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/following",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(51, response.json()["total"])
+        self.assertEqual(50, len(response.json()["items"]))
+        self.assertEqual("50", response.json()["next_cursor"])
+
     def test_relationship_lists_use_offset_cursor_and_validate_cursor(self):
         current_profile = self.complete_profile(
             token=self.primary_bearer_token,
@@ -1519,6 +2068,16 @@ class LiveFollowApiTest(unittest.TestCase):
             params={"cursor": "not-an-offset"},
             headers=self.bearer_headers()
         )
+        zero_limit = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/following",
+            params={"limit": 0},
+            headers=self.bearer_headers()
+        )
+        over_limit = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/following",
+            params={"limit": 201},
+            headers=self.bearer_headers()
+        )
 
         self.assertEqual(200, first_page.status_code)
         self.assertEqual(3, first_page.json()["total"])
@@ -1532,6 +2091,10 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertIsNone(second_page.json()["next_cursor"])
         self.assertEqual(422, invalid_cursor.status_code)
         self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, invalid_cursor.json()["code"])
+        self.assertEqual(422, zero_limit.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, zero_limit.json()["code"])
+        self.assertEqual(422, over_limit.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, over_limit.json()["code"])
 
     def test_follow_request_create_list_and_accept_persists_relationship(self):
         self.complete_profile(
@@ -1601,6 +2164,93 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual([], incoming_after.json()["requests"])
         self.assertEqual("following", search_from_requester.json()["users"][0]["relationship_state"])
         self.assertEqual("followed_by", search_from_target.json()["users"][0]["relationship_state"])
+
+    def test_follow_request_lists_default_to_fifty_and_allow_max_two_hundred(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        for index in range(51):
+            requester = self.seed_profile_user(
+                handle=f"incoming.{index}",
+                display_name=f"Incoming {index}"
+            )
+            self.seed_follow_request(requester["user_id"], current_profile["user_id"])
+
+        default_page = self.client.get(
+            "/api/v2/follow-requests/incoming",
+            headers=self.bearer_headers()
+        )
+        max_page = self.client.get(
+            "/api/v2/follow-requests/incoming",
+            params={"limit": 200},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, default_page.status_code)
+        self.assertEqual(51, default_page.json()["total"])
+        self.assertEqual(50, len(default_page.json()["requests"]))
+        self.assertEqual("50", default_page.json()["next_cursor"])
+        self.assertEqual(200, max_page.status_code)
+        self.assertEqual(51, len(max_page.json()["requests"]))
+        self.assertIsNone(max_page.json()["next_cursor"])
+
+    def test_follow_request_lists_use_offset_cursor_and_validate_cursor(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        for index in range(3):
+            target = self.seed_profile_user(
+                handle=f"outgoing.{index}",
+                display_name=f"Outgoing {index}"
+            )
+            self.seed_follow_request(current_profile["user_id"], target["user_id"])
+
+        first_page = self.client.get(
+            "/api/v2/follow-requests/outgoing",
+            params={"limit": 2},
+            headers=self.bearer_headers()
+        )
+        second_page = self.client.get(
+            "/api/v2/follow-requests/outgoing",
+            params={"limit": 2, "cursor": first_page.json()["next_cursor"]},
+            headers=self.bearer_headers()
+        )
+        invalid_cursor = self.client.get(
+            "/api/v2/follow-requests/outgoing",
+            params={"cursor": "not-an-offset"},
+            headers=self.bearer_headers()
+        )
+        zero_limit = self.client.get(
+            "/api/v2/follow-requests/incoming",
+            params={"limit": 0},
+            headers=self.bearer_headers()
+        )
+        over_limit = self.client.get(
+            "/api/v2/follow-requests/incoming",
+            params={"limit": 201},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, first_page.status_code)
+        self.assertEqual(3, first_page.json()["total"])
+        self.assertEqual(2, len(first_page.json()["requests"]))
+        self.assertEqual("2", first_page.json()["next_cursor"])
+        self.assertEqual(200, second_page.status_code)
+        self.assertEqual(1, len(second_page.json()["requests"]))
+        self.assertIsNone(second_page.json()["next_cursor"])
+        first_request_ids = {request["request_id"] for request in first_page.json()["requests"]}
+        second_request_ids = {request["request_id"] for request in second_page.json()["requests"]}
+        self.assertTrue(first_request_ids.isdisjoint(second_request_ids))
+        self.assertEqual(422, invalid_cursor.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, invalid_cursor.json()["code"])
+        self.assertEqual(422, zero_limit.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, zero_limit.json()["code"])
+        self.assertEqual(422, over_limit.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, over_limit.json()["code"])
 
     def test_follow_request_decline_clears_pending_and_allows_re_request(self):
         self.complete_profile(
@@ -1896,6 +2546,288 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertTrue(
             self.follow_edge_exists(target_profile["user_id"], current_profile["user_id"])
         )
+
+    def test_relationship_counter_helper_defaults_missing_and_upserts_row(self):
+        profile = self.seed_profile_user(
+            handle="counter.pilot",
+            display_name="Counter Pilot"
+        )
+        now = self.clock.utcnow()
+        later = now + timedelta(minutes=1)
+        db = self.session_local()
+        try:
+            self.assertEqual(
+                (0, 0),
+                main_module.get_cached_relationship_counts(db, profile["user_id"])
+            )
+
+            created = main_module.upsert_user_relationship_counter(
+                db,
+                user_id=profile["user_id"],
+                followers_count=3,
+                following_count=5,
+                updated_at=now
+            )
+            db.flush()
+
+            self.assertEqual(profile["user_id"], created.user_id)
+            self.assertEqual(
+                (3, 5),
+                main_module.get_cached_relationship_counts(db, profile["user_id"])
+            )
+
+            updated = main_module.upsert_user_relationship_counter(
+                db,
+                user_id=profile["user_id"],
+                followers_count=4,
+                following_count=6,
+                updated_at=later
+            )
+            db.flush()
+
+            self.assertEqual(profile["user_id"], updated.user_id)
+            self.assertEqual(
+                (4, 6),
+                main_module.get_cached_relationship_counts(db, profile["user_id"])
+            )
+            self.assertEqual(later, updated.updated_at)
+        finally:
+            db.rollback()
+            db.close()
+
+    def test_relationship_counter_recount_repairs_stale_counts_and_is_idempotent(self):
+        current_profile = self.seed_profile_user(
+            handle="counter.current",
+            display_name="Counter Current"
+        )
+        follower_profile = self.seed_profile_user(
+            handle="counter.follower",
+            display_name="Counter Follower"
+        )
+        followed_profile = self.seed_profile_user(
+            handle="counter.followed",
+            display_name="Counter Followed"
+        )
+        self.seed_follow_edge(follower_profile["user_id"], current_profile["user_id"])
+        self.seed_follow_edge(current_profile["user_id"], followed_profile["user_id"])
+        self.set_relationship_counter(current_profile["user_id"], 7, 8)
+        now = self.clock.utcnow()
+        db = self.session_local()
+        try:
+            repaired = main_module.recount_user_relationship_counter(
+                db,
+                current_profile["user_id"],
+                now
+            )
+            db.flush()
+            repeated = main_module.recount_user_relationship_counter(
+                db,
+                current_profile["user_id"],
+                now
+            )
+            db.flush()
+
+            self.assertEqual((1, 1), (repaired.followers_count, repaired.following_count))
+            self.assertEqual((1, 1), (repeated.followers_count, repeated.following_count))
+            self.assertEqual(
+                (1, 1),
+                main_module.get_cached_relationship_counts(db, current_profile["user_id"])
+            )
+        finally:
+            db.rollback()
+            db.close()
+
+    def test_relationship_counter_recount_all_repairs_every_user(self):
+        current_profile = self.seed_profile_user(
+            handle="counter.all.current",
+            display_name="Counter All Current"
+        )
+        follower_profile = self.seed_profile_user(
+            handle="counter.all.follower",
+            display_name="Counter All Follower"
+        )
+        self.seed_follow_edge(follower_profile["user_id"], current_profile["user_id"])
+        self.set_relationship_counter(current_profile["user_id"], 0, 9)
+        self.set_relationship_counter(follower_profile["user_id"], 4, 0)
+        db = self.session_local()
+        try:
+            repaired_count = main_module.recount_all_user_relationship_counters(
+                db,
+                self.clock.utcnow()
+            )
+            db.flush()
+
+            self.assertGreaterEqual(repaired_count, 2)
+            self.assertEqual(
+                (1, 0),
+                main_module.get_cached_relationship_counts(db, current_profile["user_id"])
+            )
+            self.assertEqual(
+                (0, 1),
+                main_module.get_cached_relationship_counts(db, follower_profile["user_id"])
+            )
+        finally:
+            db.rollback()
+            db.close()
+
+    def test_accept_follow_request_updates_relationship_counters_once(self):
+        requester_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        create_response = self.client.post(
+            "/api/v2/follow-requests",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, create_response.status_code)
+        self.assertEqual((0, 0), self.relationship_counter_counts(requester_profile["user_id"]))
+        self.assertEqual((0, 0), self.relationship_counter_counts(target_profile["user_id"]))
+
+        accept_response = self.client.post(
+            f"/api/v2/follow-requests/{create_response.json()['request_id']}/accept",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        repeat_accept = self.client.post(
+            f"/api/v2/follow-requests/{create_response.json()['request_id']}/accept",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        self.assertEqual(200, accept_response.status_code)
+        self.assertEqual(409, repeat_accept.status_code)
+        self.assertEqual((0, 1), self.relationship_counter_counts(requester_profile["user_id"]))
+        self.assertEqual((1, 0), self.relationship_counter_counts(target_profile["user_id"]))
+
+    def test_unfollow_decrements_relationship_counters_once(self):
+        requester_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        self.patch_privacy(
+            token=self.secondary_bearer_token,
+            follow_policy="auto_approve"
+        )
+        create_response = self.client.post(
+            "/api/v2/follow-requests",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, create_response.status_code)
+        self.assertEqual("accepted", create_response.json()["status"])
+
+        response = self.client.delete(
+            f"/api/v2/users/{target_profile['user_id']}/follow",
+            headers=self.bearer_headers()
+        )
+        repeat_response = self.client.delete(
+            f"/api/v2/users/{target_profile['user_id']}/follow",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.json()["removed"])
+        self.assertEqual(200, repeat_response.status_code)
+        self.assertFalse(repeat_response.json()["removed"])
+        self.assertEqual((0, 0), self.relationship_counter_counts(requester_profile["user_id"]))
+        self.assertEqual((0, 0), self.relationship_counter_counts(target_profile["user_id"]))
+
+    def test_remove_follower_decrements_relationship_counters_once(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        follower_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        self.patch_privacy(token=self.primary_bearer_token, follow_policy="auto_approve")
+        create_response = self.client.post(
+            "/api/v2/follow-requests",
+            json={"target_user_id": current_profile["user_id"]},
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        self.assertEqual(200, create_response.status_code)
+        self.assertEqual("accepted", create_response.json()["status"])
+
+        response = self.client.delete(
+            f"/api/v2/me/followers/{follower_profile['user_id']}",
+            headers=self.bearer_headers()
+        )
+        repeat_response = self.client.delete(
+            f"/api/v2/me/followers/{follower_profile['user_id']}",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.json()["removed"])
+        self.assertEqual(200, repeat_response.status_code)
+        self.assertFalse(repeat_response.json()["removed"])
+        self.assertEqual((0, 0), self.relationship_counter_counts(current_profile["user_id"]))
+        self.assertEqual((0, 0), self.relationship_counter_counts(follower_profile["user_id"]))
+
+    def test_block_cleanup_decrements_relationship_counters_for_removed_edges(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        self.patch_privacy(token=self.primary_bearer_token, follow_policy="auto_approve")
+        self.patch_privacy(token=self.secondary_bearer_token, follow_policy="auto_approve")
+        first_follow = self.client.post(
+            "/api/v2/follow-requests",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers()
+        )
+        second_follow = self.client.post(
+            "/api/v2/follow-requests",
+            json={"target_user_id": current_profile["user_id"]},
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        self.assertEqual(200, first_follow.status_code)
+        self.assertEqual(200, second_follow.status_code)
+        self.assertEqual((1, 1), self.relationship_counter_counts(current_profile["user_id"]))
+        self.assertEqual((1, 1), self.relationship_counter_counts(target_profile["user_id"]))
+
+        block_response = self.client.post(
+            "/api/v2/blocks",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers()
+        )
+        repeat_block = self.client.post(
+            "/api/v2/blocks",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, block_response.status_code)
+        self.assertEqual(200, repeat_block.status_code)
+        self.assertFalse(
+            self.follow_edge_exists(current_profile["user_id"], target_profile["user_id"])
+        )
+        self.assertFalse(
+            self.follow_edge_exists(target_profile["user_id"], current_profile["user_id"])
+        )
+        self.assertEqual((0, 0), self.relationship_counter_counts(current_profile["user_id"]))
+        self.assertEqual((0, 0), self.relationship_counter_counts(target_profile["user_id"]))
 
     def test_unfollow_revokes_follower_only_live_access_immediately(self):
         current_profile = self.complete_profile(
@@ -2631,6 +3563,70 @@ class LiveFollowApiTest(unittest.TestCase):
             json.loads(event.payload_json)
         )
 
+    def test_disabled_social_notification_preference_suppresses_follow_outbox_event(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="mute.notify.requester",
+            display_name="Mute Notify Requester"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="mute.notify.target",
+            display_name="Mute Notify Target"
+        )
+        privacy_response = self.client.patch(
+            "/api/v2/me/privacy",
+            json={"social_notifications_enabled": False},
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        create_response = self.client.post(
+            "/api/v2/follow-requests",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers(self.primary_bearer_token)
+        )
+
+        self.assertEqual(200, privacy_response.status_code)
+        self.assertEqual(False, privacy_response.json()["social_notifications_enabled"])
+        self.assertEqual(200, create_response.status_code)
+        self.assertEqual([], self.get_notification_outbox_rows())
+
+    def test_live_start_does_not_enqueue_all_follower_live_now_notifications(self):
+        owner_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="live.notify.owner",
+            display_name="Live Notify Owner"
+        )
+        for index in range(5):
+            token = self.add_static_bearer_token(
+                token=f"live-notify-follower-{index}",
+                subject=f"live-notify-follower-{index}",
+                display_name=f"Live Notify Follower {index}"
+            )
+            follower_profile = self.complete_profile(
+                token=token,
+                handle=f"live.notify.follower.{index}",
+                display_name=f"Live Notify Follower {index}"
+            )
+            self.seed_follow_edge(follower_profile["user_id"], owner_profile["user_id"])
+            register_response = self.client.post(
+                "/api/v2/me/push-tokens",
+                json=self.push_token_payload(
+                    token=f"[TEST_LIVE_NOW_PUSH_{index}]",
+                    device_id=f"live-now-device-{index}"
+                ),
+                headers=self.bearer_headers(token)
+            )
+            self.assertEqual(200, register_response.status_code)
+
+        start_response = self.client.post(
+            "/api/v2/live/session/start",
+            headers=self.bearer_headers(self.primary_bearer_token)
+        )
+
+        self.assertEqual(200, start_response.status_code)
+        self.assertEqual([], self.get_notification_outbox_rows())
+
     def test_follow_request_accept_enqueues_accepted_notification_for_requester(self):
         requester_profile = self.complete_profile(
             token=self.primary_bearer_token,
@@ -2931,6 +3927,63 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertIsNone(event.last_error)
         self.assertNotIn(raw_token, event.payload_json)
         self.assertNotIn(raw_token, event.dedupe_key)
+
+    def test_notification_delivery_limit_batches_pending_events(self):
+        actor_user_id = self.user_id_for_token(self.primary_bearer_token)
+        recipient_user_id = self.user_id_for_token(self.secondary_bearer_token)
+        now = self.clock.utcnow()
+        db = self.session_local()
+        try:
+            for index in range(3):
+                event_payload = {
+                    "event_type": main_module.NOTIFICATION_EVENT_FOLLOW_REQUEST_RECEIVED,
+                    "recipient_user_id": recipient_user_id,
+                    "actor_user_id": actor_user_id,
+                    "follow_request_id": "",
+                }
+                event_at = now + timedelta(seconds=index)
+                db.add(
+                    main_module.NotificationOutboxEvent(
+                        id=str(main_module.uuid.uuid4()),
+                        event_type=main_module.NOTIFICATION_EVENT_FOLLOW_REQUEST_RECEIVED,
+                        recipient_user_id=recipient_user_id,
+                        actor_user_id=actor_user_id,
+                        follow_request_id=None,
+                        dedupe_key=f"batch-limit:{index}",
+                        status=main_module.NOTIFICATION_OUTBOX_STATUS_PENDING,
+                        attempt_count=0,
+                        last_attempt_at=None,
+                        sent_at=None,
+                        last_error=None,
+                        last_error_retryable=None,
+                        payload_json=json.dumps(event_payload, sort_keys=True),
+                        created_at=event_at,
+                        updated_at=event_at,
+                    )
+                )
+            db.commit()
+        finally:
+            db.close()
+
+        summary = main_module.deliver_pending_notification_events(
+            limit=2,
+            sender=FakeFcmSender()
+        )
+
+        self.assertEqual(2, summary["events_attempted"])
+        notification_metrics = main_module.social_graph_metrics_snapshot()
+        self.assertEqual(1, notification_metrics["notification_fanout_batch_count"])
+        self.assertEqual(2, notification_metrics["max_notification_fanout_size"])
+        rows = self.get_notification_outbox_rows()
+        self.assertEqual(
+            [
+                main_module.NOTIFICATION_OUTBOX_STATUS_FAILED,
+                main_module.NOTIFICATION_OUTBOX_STATUS_FAILED,
+                main_module.NOTIFICATION_OUTBOX_STATUS_PENDING,
+            ],
+            [row.status for row in rows]
+        )
+        self.assertEqual([1, 1, 0], [row.attempt_count for row in rows])
 
     def test_notification_delivery_skips_revoked_fcm_tokens(self):
         raw_token = "[TEST_PUSH_TOKEN_DELIVERY_REVOKED]"
@@ -3681,6 +4734,1447 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual("followers", stored.visibility)
         self.assertIsNotNone(stored.share_code)
 
+    def test_live_session_viewer_helpers_are_idempotent_and_count_unique_users(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        viewer_one = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="viewer.one",
+            display_name="Viewer One"
+        )
+        viewer_two = self.complete_profile(
+            token=self.tertiary_bearer_token,
+            handle="viewer.two",
+            display_name="Viewer Two"
+        )
+        session = self.start_authenticated_session()
+        first_seen_at = self.clock.utcnow()
+
+        db = self.session_local()
+        try:
+            main_module.record_live_session_viewer(
+                db,
+                session["session_id"],
+                viewer_one["user_id"],
+                first_seen_at
+            )
+            db.commit()
+
+            self.clock.advance(seconds=5)
+            second_seen_at = self.clock.utcnow()
+            main_module.record_live_session_viewer(
+                db,
+                session["session_id"],
+                viewer_one["user_id"],
+                second_seen_at
+            )
+            main_module.record_live_session_viewer(
+                db,
+                session["session_id"],
+                viewer_two["user_id"],
+                second_seen_at
+            )
+            db.commit()
+
+            stored_viewer_one = (
+                db.query(main_module.LiveSessionViewer)
+                .filter(
+                    main_module.LiveSessionViewer.session_id == session["session_id"],
+                    main_module.LiveSessionViewer.viewer_user_id == viewer_one["user_id"]
+                )
+                .first()
+            )
+            self.assertIsNotNone(stored_viewer_one)
+            self.assertEqual(first_seen_at, stored_viewer_one.first_seen_at)
+            self.assertEqual(second_seen_at, stored_viewer_one.last_seen_at)
+            self.assertEqual(
+                2,
+                main_module.count_live_session_unique_viewers(db, session["session_id"])
+            )
+            self.assertEqual(
+                0,
+                main_module.count_live_session_unique_viewers(db, "missing-session")
+            )
+        finally:
+            db.close()
+
+    def test_live_session_spectator_stats_helpers_create_update_and_read(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session()
+        first_snapshot = main_module.LiveSpectatorStatsSnapshot(
+            first_position_at=datetime(2026, 3, 20, 12, 0, 0),
+            last_position_at=datetime(2026, 3, 20, 12, 0, 0),
+            position_count=1,
+            highest_altitude_msl_meters=500.0,
+            distance_flown_meters=0.0,
+            current_climb_sink_ms=None,
+            best_short_window_climb_ms=None
+        )
+        second_snapshot = main_module.LiveSpectatorStatsSnapshot(
+            first_position_at=datetime(2026, 3, 20, 12, 0, 0),
+            last_position_at=datetime(2026, 3, 20, 12, 0, 30),
+            position_count=2,
+            highest_altitude_msl_meters=560.0,
+            distance_flown_meters=1200.0,
+            current_climb_sink_ms=2.0,
+            best_short_window_climb_ms=2.0
+        )
+
+        db = self.session_local()
+        try:
+            self.assertIsNone(
+                main_module.get_live_session_spectator_stats(
+                    db,
+                    session["session_id"]
+                )
+            )
+
+            first_row = main_module.upsert_live_session_spectator_stats(
+                db,
+                session["session_id"],
+                first_snapshot,
+                self.clock.utcnow()
+            )
+            db.commit()
+            self.assertEqual(session["session_id"], first_row.session_id)
+            self.assertEqual(1, first_row.position_count)
+
+            self.clock.advance(seconds=5)
+            second_row = main_module.upsert_live_session_spectator_stats(
+                db,
+                session["session_id"],
+                second_snapshot,
+                self.clock.utcnow()
+            )
+            db.commit()
+
+            self.assertEqual(first_row.session_id, second_row.session_id)
+            self.assertEqual(1, db.query(main_module.LiveSessionSpectatorStats).count())
+            stored = main_module.get_live_session_spectator_stats(
+                db,
+                session["session_id"]
+            )
+            self.assertIsNotNone(stored)
+            self.assertEqual(2, stored.position_count)
+            self.assertEqual(560.0, stored.highest_altitude_msl_meters)
+            self.assertEqual(1200.0, stored.distance_flown_meters)
+            self.assertEqual(2.0, stored.current_climb_sink_ms)
+            self.assertEqual(2.0, stored.best_short_window_climb_ms)
+        finally:
+            db.close()
+
+    def test_position_ingest_updates_spectator_stats_only_for_accepted_positions(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session()
+        first_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        second_timestamp = first_timestamp + timedelta(seconds=30)
+        first_payload = self.position_payload(
+            session["session_id"],
+            timestamp=first_timestamp,
+            lat=-33.9,
+            lon=151.2,
+            alt=500.0
+        )
+        second_payload = self.position_payload(
+            session["session_id"],
+            timestamp=second_timestamp,
+            lat=-33.901,
+            lon=151.201,
+            alt=560.0
+        )
+
+        first_response = self.client.post(
+            "/api/v1/position",
+            json=first_payload,
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, first_response.status_code)
+
+        self.seed_live_response_cache_variants(session["session_id"])
+        second_response = self.client.post(
+            "/api/v1/position",
+            json=second_payload,
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, second_response.status_code)
+        self.assert_live_response_cache_empty(session["session_id"])
+
+        stats = self.live_session_spectator_stats(session["session_id"])
+        self.assertIsNotNone(stats)
+        self.assertEqual(2, stats.position_count)
+        self.assertEqual(560.0, stats.highest_altitude_msl_meters)
+        self.assertAlmostEqual(2.0, stats.current_climb_sink_ms, places=6)
+        self.assertAlmostEqual(2.0, stats.best_short_window_climb_ms, places=6)
+        stored_distance = stats.distance_flown_meters
+
+        duplicate_response = self.client.post(
+            "/api/v1/position",
+            json=second_payload,
+            headers=self.write_headers(session)
+        )
+        rejected_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(
+                session["session_id"],
+                timestamp=first_timestamp + timedelta(seconds=10),
+                lat=-33.902,
+                lon=151.202,
+                alt=600.0
+            ),
+            headers=self.write_headers(session)
+        )
+
+        self.assertEqual(200, duplicate_response.status_code)
+        self.assertTrue(duplicate_response.json()["deduped"])
+        self.assertEqual(409, rejected_response.status_code)
+        unchanged_stats = self.live_session_spectator_stats(session["session_id"])
+        self.assertEqual(2, unchanged_stats.position_count)
+        self.assertEqual(stored_distance, unchanged_stats.distance_flown_meters)
+
+    def test_position_ingest_updates_existing_spectator_stats_incrementally(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session()
+        first_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        second_timestamp = first_timestamp + timedelta(seconds=30)
+        first_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(
+                session["session_id"],
+                timestamp=first_timestamp,
+                lat=-33.9,
+                lon=151.2,
+                alt=500.0
+            ),
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, first_response.status_code)
+
+        with mock.patch.object(
+            main_module,
+            "build_live_spectator_stats_snapshot_for_session",
+            side_effect=AssertionError("unexpected full stats rebuild")
+        ):
+            second_response = self.client.post(
+                "/api/v1/position",
+                json=self.position_payload(
+                    session["session_id"],
+                    timestamp=second_timestamp,
+                    lat=-33.901,
+                    lon=151.201,
+                    alt=560.0
+                ),
+                headers=self.write_headers(session)
+            )
+
+        self.assertEqual(200, second_response.status_code)
+        stats = self.live_session_spectator_stats(session["session_id"])
+        self.assertIsNotNone(stats)
+        self.assertEqual(2, stats.position_count)
+        self.assertGreater(stats.distance_flown_meters, 0.0)
+        self.assertAlmostEqual(2.0, stats.current_climb_sink_ms, places=6)
+        self.assertAlmostEqual(2.0, stats.best_short_window_climb_ms, places=6)
+
+    def test_live_session_spectator_stats_rebuild_fixes_stale_row_idempotently(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session()
+        first_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        second_timestamp = first_timestamp + timedelta(seconds=30)
+        for payload in [
+            self.position_payload(
+                session["session_id"],
+                timestamp=first_timestamp,
+                lat=-33.9,
+                lon=151.2,
+                alt=500.0
+            ),
+            self.position_payload(
+                session["session_id"],
+                timestamp=second_timestamp,
+                lat=-33.901,
+                lon=151.201,
+                alt=560.0
+            ),
+        ]:
+            response = self.client.post(
+                "/api/v1/position",
+                json=payload,
+                headers=self.write_headers(session)
+            )
+            self.assertEqual(200, response.status_code)
+
+        db = self.session_local()
+        try:
+            stale = main_module.get_live_session_spectator_stats(
+                db,
+                session["session_id"]
+            )
+            stale.position_count = 99
+            stale.highest_altitude_msl_meters = 1.0
+            stale.distance_flown_meters = 0.0
+            db.commit()
+
+            repaired = main_module.rebuild_live_session_spectator_stats(
+                db,
+                session["session_id"],
+                self.clock.utcnow()
+            )
+            db.commit()
+            repaired_again = main_module.rebuild_live_session_spectator_stats(
+                db,
+                session["session_id"],
+                self.clock.utcnow()
+            )
+            db.commit()
+
+            self.assertEqual(2, repaired.position_count)
+            self.assertEqual(560.0, repaired.highest_altitude_msl_meters)
+            self.assertGreater(repaired.distance_flown_meters, 0.0)
+            self.assertEqual(repaired.position_count, repaired_again.position_count)
+            self.assertEqual(
+                repaired.distance_flown_meters,
+                repaired_again.distance_flown_meters
+            )
+        finally:
+            db.close()
+
+    def test_build_live_response_includes_server_owned_spectator_stats(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session()
+        first_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        second_timestamp = first_timestamp + timedelta(seconds=30)
+        for payload in [
+            self.position_payload(
+                session["session_id"],
+                timestamp=first_timestamp,
+                lat=-33.9,
+                lon=151.2,
+                alt=500.0
+            ),
+            self.position_payload(
+                session["session_id"],
+                timestamp=second_timestamp,
+                lat=-33.901,
+                lon=151.201,
+                alt=560.0
+            ),
+        ]:
+            response = self.client.post(
+                "/api/v1/position",
+                json=payload,
+                headers=self.write_headers(session)
+            )
+            self.assertEqual(200, response.status_code)
+
+        db = self.session_local()
+        try:
+            stored_session = self.get_live_session_row(session["session_id"])
+            live_response = main_module.build_live_response(db, stored_session)
+            stats = live_response["spectator_stats"]
+
+            self.assertIsNotNone(stats)
+            self.assertEqual(60.0, stats["highest_altitude_msl_meters"] - 500.0)
+            self.assertAlmostEqual(2.0, stats["current_climb_sink_ms"], places=6)
+            self.assertAlmostEqual(2.0, stats["best_short_window_climb_ms"], places=6)
+            self.assertGreater(stats["distance_flown_meters"], 0.0)
+            self.assertEqual(30, stats["flight_duration_seconds"])
+        finally:
+            db.close()
+
+    def test_build_live_response_uses_null_spectator_stats_when_row_missing(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session()
+
+        db = self.session_local()
+        try:
+            stored_session = self.get_live_session_row(session["session_id"])
+            live_response = main_module.build_live_response(db, stored_session)
+
+            self.assertIn("spectator_stats", live_response)
+            self.assertIsNone(live_response["spectator_stats"])
+        finally:
+            db.close()
+
+    def test_live_response_cache_keys_separate_route_variants(self):
+        session_id = "session-1"
+        keys = {
+            main_module.live_response_cache_key(
+                session_id,
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION
+            ),
+            main_module.live_response_cache_key(
+                session_id,
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V1_SHARE
+            ),
+            main_module.live_response_cache_key(
+                session_id,
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION
+            ),
+            main_module.live_response_cache_key(
+                session_id,
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V2_USER
+            ),
+        }
+
+        self.assertEqual(4, len(keys))
+        self.assertIn("live:response:v1_session:session-1", keys)
+        self.assertIn("live:response:v2_session:session-1", keys)
+
+    def test_live_response_cache_serialization_round_trips_response_payload(self):
+        payload = {
+            "session": "session-1",
+            "share_code": None,
+            "status": "active",
+            "visibility": "followers",
+            "owner_user_id": "pilot-1",
+            "display_label": "Pilot One",
+            "profile": {
+                "user_id": "pilot-1",
+                "handle": "pilot.one",
+                "display_name": "Pilot One",
+            },
+            "spectator_stats": {
+                "current_climb_sink_ms": 1.2,
+                "highest_altitude_msl_meters": 1240.0,
+                "best_short_window_climb_ms": 2.1,
+                "distance_flown_meters": 12345.6,
+                "flight_duration_seconds": 3720,
+            },
+            "positions": [
+                {
+                    "lat": -33.9,
+                    "lon": 151.2,
+                    "alt": 500.0,
+                    "agl_meters": 45.0,
+                    "speed": 12.5,
+                    "heading": 180.0,
+                    "timestamp": "2026-03-20T12:00:00Z",
+                }
+            ],
+            "task": None,
+        }
+        key = main_module.live_response_cache_key(
+            "session-1",
+            main_module.LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION
+        )
+
+        main_module.set_cached_live_response(key, payload)
+
+        self.assertEqual(payload, main_module.get_cached_live_response(key))
+        self.assertEqual(
+            payload,
+            main_module.deserialize_live_response_cache_payload(
+                main_module.serialize_live_response_cache_payload(payload)
+            )
+        )
+
+    def test_social_cache_keys_separate_counts_and_list_previews(self):
+        user_id = "pilot-1"
+        keys = set(main_module.social_cache_keys(user_id))
+
+        self.assertEqual(3, len(keys))
+        self.assertIn("social:counts:pilot-1", keys)
+        self.assertIn("social:followers_preview:pilot-1", keys)
+        self.assertIn("social:following_preview:pilot-1", keys)
+        with self.assertRaises(ValueError):
+            main_module.social_cache_key(user_id, "authorization")
+
+    def test_social_cache_serialization_round_trips_non_sensitive_payload(self):
+        payload = {
+            "user_id": "pilot-1",
+            "followers_count": 12,
+            "following_count": 3,
+            "preview": [
+                {
+                    "user_id": "pilot-2",
+                    "handle": "pilot.two",
+                    "display_name": "Pilot Two",
+                }
+            ],
+        }
+        key = main_module.social_cache_key(
+            "pilot-1",
+            main_module.SOCIAL_CACHE_SCOPE_FOLLOWERS_PREVIEW
+        )
+
+        main_module.set_cached_social_payload(key, payload)
+
+        self.assertEqual(payload, main_module.get_cached_social_payload(key))
+        self.assertEqual(
+            payload,
+            main_module.deserialize_social_cache_payload(
+                main_module.serialize_social_cache_payload(payload)
+            )
+        )
+
+    def test_social_cache_uses_short_ttl_fallback(self):
+        key = main_module.social_cache_key(
+            "pilot-1",
+            main_module.SOCIAL_CACHE_SCOPE_COUNTS
+        )
+
+        main_module.set_cached_social_payload(
+            key,
+            {"followers_count": 12, "following_count": 3}
+        )
+
+        self.assertEqual(
+            main_module.SOCIAL_CACHE_TTL_SECONDS,
+            main_module.redis_client.expires[key]
+        )
+
+    def test_social_cache_invalidation_clears_all_scopes_for_users(self):
+        for user_id in ["pilot-1", "pilot-2"]:
+            for cache_key in main_module.social_cache_keys(user_id):
+                main_module.set_cached_social_payload(cache_key, {"user_id": user_id})
+
+        main_module.invalidate_social_cache_for_users("pilot-1", "", "pilot-1", "pilot-2")
+
+        for user_id in ["pilot-1", "pilot-2"]:
+            for cache_key in main_module.social_cache_keys(user_id):
+                self.assertIsNone(main_module.get_cached_social_payload(cache_key))
+                self.assertNotIn(cache_key, main_module.redis_client.expires)
+
+    def test_social_cache_invalidates_on_relationship_mutations(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+
+        def prime(*user_ids):
+            for user_id in user_ids:
+                for cache_key in main_module.social_cache_keys(user_id):
+                    main_module.set_cached_social_payload(
+                        cache_key,
+                        {"user_id": user_id}
+                    )
+
+        def assert_cleared(*user_ids):
+            for user_id in user_ids:
+                for cache_key in main_module.social_cache_keys(user_id):
+                    self.assertIsNone(main_module.get_cached_social_payload(cache_key))
+
+        prime(current_profile["user_id"], target_profile["user_id"])
+        db = self.session_local()
+        try:
+            main_module.ensure_follow_edge(
+                db,
+                current_profile["user_id"],
+                target_profile["user_id"],
+                self.clock.utcnow()
+            )
+            db.commit()
+        finally:
+            db.close()
+        assert_cleared(current_profile["user_id"], target_profile["user_id"])
+
+        prime(current_profile["user_id"], target_profile["user_id"])
+        unfollow_response = self.client.delete(
+            f"/api/v2/users/{target_profile['user_id']}/follow",
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, unfollow_response.status_code)
+        assert_cleared(current_profile["user_id"], target_profile["user_id"])
+
+        self.seed_follow_edge(target_profile["user_id"], current_profile["user_id"])
+        prime(current_profile["user_id"], target_profile["user_id"])
+        remove_follower_response = self.client.delete(
+            f"/api/v2/me/followers/{target_profile['user_id']}",
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, remove_follower_response.status_code)
+        assert_cleared(current_profile["user_id"], target_profile["user_id"])
+
+        prime(current_profile["user_id"], target_profile["user_id"])
+        block_response = self.client.post(
+            "/api/v2/blocks",
+            json={"target_user_id": target_profile["user_id"]},
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, block_response.status_code)
+        assert_cleared(current_profile["user_id"], target_profile["user_id"])
+
+        prime(current_profile["user_id"], target_profile["user_id"])
+        unblock_response = self.client.delete(
+            f"/api/v2/blocks/{target_profile['user_id']}",
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, unblock_response.status_code)
+        assert_cleared(current_profile["user_id"], target_profile["user_id"])
+
+    def test_social_cache_invalidates_on_favorite_mutations(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        target_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        self.seed_follow_edge(current_profile["user_id"], target_profile["user_id"])
+
+        def prime_current():
+            for cache_key in main_module.social_cache_keys(current_profile["user_id"]):
+                main_module.set_cached_social_payload(cache_key, {"user_id": "pilot-1"})
+
+        def assert_current_cleared():
+            for cache_key in main_module.social_cache_keys(current_profile["user_id"]):
+                self.assertIsNone(main_module.get_cached_social_payload(cache_key))
+
+        prime_current()
+        favorite_response = self.client.put(
+            f"/api/v2/me/favorites/{target_profile['user_id']}",
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, favorite_response.status_code)
+        assert_current_cleared()
+
+        prime_current()
+        unfavorite_response = self.client.delete(
+            f"/api/v2/me/favorites/{target_profile['user_id']}",
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(200, unfavorite_response.status_code)
+        assert_current_cleared()
+
+    def test_relationship_count_maps_use_cached_social_counts_before_db(self):
+        profile = self.seed_profile_user(
+            handle="cached.counts",
+            display_name="Cached Counts"
+        )
+        self.set_relationship_counter(profile["user_id"], 1, 2)
+        main_module.set_cached_social_counts(profile["user_id"], 7, 8)
+
+        db = self.session_local()
+        try:
+            followers_counts, following_counts = main_module.load_livefollow_follow_count_maps(
+                db,
+                [profile["user_id"]]
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(7, followers_counts[profile["user_id"]])
+        self.assertEqual(8, following_counts[profile["user_id"]])
+
+    def test_relationship_count_maps_cache_miss_rebuilds_social_counts(self):
+        profile = self.seed_profile_user(
+            handle="missing.counts",
+            display_name="Missing Counts"
+        )
+        self.set_relationship_counter(profile["user_id"], 3, 4)
+        cache_key = main_module.social_cache_key(
+            profile["user_id"],
+            main_module.SOCIAL_CACHE_SCOPE_COUNTS
+        )
+
+        db = self.session_local()
+        try:
+            followers_counts, following_counts = main_module.load_livefollow_follow_count_maps(
+                db,
+                [profile["user_id"]]
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(3, followers_counts[profile["user_id"]])
+        self.assertEqual(4, following_counts[profile["user_id"]])
+        self.assertEqual(
+            {
+                "user_id": profile["user_id"],
+                "followers_count": 3,
+                "following_count": 4,
+            },
+            main_module.get_cached_social_payload(cache_key)
+        )
+
+    def test_relationship_list_response_shape_is_unchanged_with_social_count_cache(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        follower = self.seed_profile_user(
+            handle="cached.follower",
+            display_name="Cached Follower"
+        )
+        self.seed_follow_edge(follower["user_id"], current_profile["user_id"])
+        main_module.set_cached_social_counts(follower["user_id"], 9, 10)
+
+        response = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/followers",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        item = response.json()["items"][0]
+        self.assertEqual(
+            {
+                "user_id",
+                "handle",
+                "display_name",
+                "comp_number",
+                "followers_count",
+                "following_count",
+                "relationship_state",
+                "is_favorite",
+            },
+            set(item.keys())
+        )
+        self.assertEqual(9, item["followers_count"])
+        self.assertEqual(10, item["following_count"])
+
+    def test_social_cache_does_not_authorize_private_relationship_list(self):
+        target_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        main_module.set_cached_social_counts(target_profile["user_id"], 99, 88)
+        main_module.set_cached_social_payload(
+            main_module.social_cache_key(
+                target_profile["user_id"],
+                main_module.SOCIAL_CACHE_SCOPE_FOLLOWERS_PREVIEW
+            ),
+            {
+                "preview": [
+                    {
+                        "user_id": "stale-user",
+                        "handle": "stale.user",
+                        "display_name": "Stale User",
+                    }
+                ]
+            }
+        )
+
+        response = self.client.get(
+            f"/api/v2/users/{target_profile['user_id']}/followers",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.NOT_AUTHORIZED_TO_VIEW_FOLLOWERS,
+            response.json()["code"]
+        )
+
+    def test_social_cache_does_not_expose_blocked_or_hidden_users(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        visible_follower = self.seed_profile_user(
+            handle="visible.cached",
+            display_name="Visible Cached"
+        )
+        blocked_follower = self.seed_profile_user(
+            handle="blocked.cached",
+            display_name="Blocked Cached"
+        )
+        hidden_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="hidden.cached",
+            display_name="Hidden Cached"
+        )
+        self.patch_privacy(
+            token=self.secondary_bearer_token,
+            discoverability="hidden"
+        )
+        self.seed_follow_edge(visible_follower["user_id"], current_profile["user_id"])
+        self.seed_follow_edge(blocked_follower["user_id"], current_profile["user_id"])
+        self.seed_block(current_profile["user_id"], blocked_follower["user_id"])
+        main_module.set_cached_social_counts(blocked_follower["user_id"], 99, 88)
+        main_module.set_cached_social_payload(
+            main_module.social_cache_key(
+                current_profile["user_id"],
+                main_module.SOCIAL_CACHE_SCOPE_FOLLOWERS_PREVIEW
+            ),
+            {
+                "preview": [
+                    {
+                        "user_id": blocked_follower["user_id"],
+                        "handle": "blocked.cached",
+                        "display_name": "Blocked Cached",
+                    }
+                ]
+            }
+        )
+        main_module.set_cached_social_counts(hidden_profile["user_id"], 77, 66)
+
+        followers = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/followers",
+            headers=self.bearer_headers()
+        )
+        search = self.client.get(
+            "/api/v2/users/search",
+            params={"q": "hidden.cached"},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, followers.status_code)
+        self.assertEqual(
+            ["visible.cached"],
+            [item["handle"] for item in followers.json()["items"]]
+        )
+        self.assertEqual(200, search.status_code)
+        self.assertEqual([], search.json()["users"])
+
+    def test_social_graph_metrics_track_counts_lists_and_privacy_safe_labels(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        follower = self.seed_profile_user(
+            handle="metric.follower",
+            display_name="Metric Follower"
+        )
+        self.seed_follow_edge(follower["user_id"], current_profile["user_id"])
+        self.set_relationship_counter(follower["user_id"], 12, 34)
+
+        response = self.client.get(
+            f"/api/v2/users/{current_profile['user_id']}/followers",
+            headers=self.bearer_headers()
+        )
+        main_module.record_relationship_list_query_metric(
+            offset=250,
+            response_ms=main_module.SOCIAL_GRAPH_SLOW_QUERY_MS + 1.0
+        )
+        snapshot = main_module.social_graph_metrics_snapshot()
+        serialized_snapshot = json.dumps(snapshot, sort_keys=True)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(12, snapshot["largest_followers_count"])
+        self.assertEqual(34, snapshot["largest_following_count"])
+        self.assertEqual(2, snapshot["relationship_list_request_count"])
+        self.assertEqual(1, snapshot["slow_relationship_list_query_count"])
+        self.assertEqual(250, snapshot["max_offset_pagination_depth"])
+        self.assertNotIn(current_profile["user_id"], serialized_snapshot)
+        self.assertNotIn(follower["user_id"], serialized_snapshot)
+        self.assertNotIn("metric.follower", serialized_snapshot)
+
+    def test_social_graph_metrics_track_active_bulk_and_notification_volume(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        owner_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="pilot.two",
+            display_name="Pilot Two"
+        )
+        other_profile = self.seed_profile_user(
+            handle="metric.other",
+            display_name="Metric Other"
+        )
+        self.seed_follow_edge(current_profile["user_id"], owner_profile["user_id"])
+        session = self.start_authenticated_session(
+            token=self.secondary_bearer_token,
+            visibility="followers"
+        )
+        self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        active = self.client.get(
+            "/api/v2/live/following/active",
+            headers=self.bearer_headers()
+        )
+        bulk = self.client.post(
+            "/api/v2/users/relationship-status/bulk",
+            json={
+                "user_ids": [
+                    owner_profile["user_id"],
+                    other_profile["user_id"],
+                    other_profile["user_id"],
+                ]
+            },
+            headers=self.bearer_headers()
+        )
+        main_module.record_notification_fanout_metric(42)
+
+        snapshot = main_module.social_graph_metrics_snapshot()
+
+        self.assertEqual(200, active.status_code)
+        self.assertEqual(200, bulk.status_code)
+        self.assertEqual(1, snapshot["active_list_refresh_request_count"])
+        self.assertEqual(1, snapshot["bulk_relationship_status_request_count"])
+        self.assertEqual(2, snapshot["bulk_relationship_status_user_id_count"])
+        self.assertEqual(1, snapshot["notification_fanout_batch_count"])
+        self.assertEqual(42, snapshot["max_notification_fanout_size"])
+
+    def test_live_response_cache_hit_recomputes_dynamic_stale_status(self):
+        session = self.start_session()
+        position_response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers=self.write_headers(session)
+        )
+        active = self.client.get(f"/api/v1/live/{session['session_id']}")
+
+        self.clock.advance(seconds=main_module.STALE_AFTER_SECONDS + 1)
+        stale = self.client.get(f"/api/v1/live/{session['session_id']}")
+
+        self.assertEqual(200, position_response.status_code)
+        self.assertEqual(200, active.status_code)
+        self.assertEqual("active", active.json()["status"])
+        self.assertEqual(200, stale.status_code)
+        self.assertEqual("stale", stale.json()["status"])
+
+    def test_live_response_cache_invalidates_on_position_upload(self):
+        session = self.start_session()
+        self.seed_live_response_cache_variants(session["session_id"])
+
+        response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assert_live_response_cache_empty(session["session_id"])
+
+    def test_live_response_cache_invalidates_on_task_upsert_and_clear(self):
+        session = self.start_session()
+        self.seed_live_response_cache_variants(session["session_id"])
+
+        upsert = self.client.post(
+            "/api/v1/task/upsert",
+            json=self.task_payload(session["session_id"], task_name="Task Alpha"),
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        self.assertEqual(200, upsert.status_code)
+        self.assert_live_response_cache_empty(session["session_id"])
+
+        self.seed_live_response_cache_variants(session["session_id"])
+        clear = self.client.post(
+            "/api/v1/task/upsert",
+            json={
+                "session_id": session["session_id"],
+                "clear_task": True
+            },
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        self.assertEqual(200, clear.status_code)
+        self.assert_live_response_cache_empty(session["session_id"])
+
+    def test_live_response_cache_invalidates_on_visibility_change(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+        self.seed_live_response_cache_variants(session["session_id"])
+
+        response = self.client.patch(
+            f"/api/v2/live/session/{session['session_id']}/visibility",
+            json={"visibility": "followers"},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assert_live_response_cache_empty(session["session_id"])
+
+    def test_live_response_cache_invalidates_on_session_end(self):
+        session = self.start_session()
+        self.seed_live_response_cache_variants(session["session_id"])
+
+        response = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assert_live_response_cache_empty(session["session_id"])
+
+    def test_live_response_cache_invalidates_when_start_ends_previous_owned_session(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        first_session = self.start_authenticated_session(visibility="public")
+        self.seed_live_response_cache_variants(first_session["session_id"])
+
+        second_session = self.start_authenticated_session(visibility="public")
+
+        self.assertNotEqual(first_session["session_id"], second_session["session_id"])
+        self.assert_live_response_cache_empty(first_session["session_id"])
+
+    def test_authenticated_live_response_cache_hit_still_records_viewer(self):
+        owner_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        viewer_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="viewer.one",
+            display_name="Viewer One"
+        )
+        self.seed_follow_edge(viewer_profile["user_id"], owner_profile["user_id"])
+        session = self.start_authenticated_session(visibility="followers")
+        main_module.set_cached_live_response(
+            main_module.live_response_cache_key(
+                session["session_id"],
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION
+            ),
+            {
+                "session": session["session_id"],
+                "cached_marker": True,
+                "visibility": "followers",
+                "profile": {"handle": "cached-owner"},
+            }
+        )
+
+        response = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.json()["cached_marker"])
+        self.assertEqual(
+            1,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+
+    def test_live_response_cache_never_serves_private_payload_before_authorization(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="outsider.one",
+            display_name="Outsider One"
+        )
+        session = self.start_authenticated_session(visibility="followers")
+        private_payload = {
+            "session": session["session_id"],
+            "cached_private_marker": True,
+            "visibility": "followers",
+            "profile": {"handle": "pilot.one"},
+        }
+        main_module.set_cached_live_response(
+            main_module.live_response_cache_key(
+                session["session_id"],
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION
+            ),
+            private_payload
+        )
+        main_module.set_cached_live_response(
+            main_module.live_response_cache_key(
+                session["session_id"],
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION
+            ),
+            private_payload
+        )
+
+        public_read = self.client.get(f"/api/v1/live/{session['session_id']}")
+        outsider_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        self.assertEqual(404, public_read.status_code)
+        self.assertEqual(404, outsider_read.status_code)
+        self.assertEqual(
+            0,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+
+    def test_live_response_cache_miss_stores_public_and_authenticated_variants_separately(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+
+        public_read = self.client.get(f"/api/v1/live/{session['session_id']}")
+        authenticated_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers()
+        )
+        public_cached = main_module.get_cached_live_response(
+            main_module.live_response_cache_key(
+                session["session_id"],
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION
+            )
+        )
+        authenticated_cached = main_module.get_cached_live_response(
+            main_module.live_response_cache_key(
+                session["session_id"],
+                main_module.LIVE_RESPONSE_CACHE_VARIANT_V2_SESSION
+            )
+        )
+
+        self.assertEqual(200, public_read.status_code)
+        self.assertEqual(200, authenticated_read.status_code)
+        self.assertIsNone(public_cached["profile"])
+        self.assertIsNotNone(authenticated_cached["profile"])
+
+    def test_live_response_cache_miss_stores_spectator_stats(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+        first_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        second_timestamp = first_timestamp + timedelta(seconds=30)
+        for payload in [
+            self.position_payload(
+                session["session_id"],
+                timestamp=first_timestamp,
+                lat=-33.9,
+                lon=151.2,
+                alt=500.0
+            ),
+            self.position_payload(
+                session["session_id"],
+                timestamp=second_timestamp,
+                lat=-33.901,
+                lon=151.201,
+                alt=560.0
+            ),
+        ]:
+            response = self.client.post(
+                "/api/v1/position",
+                json=payload,
+                headers=self.write_headers(session)
+            )
+            self.assertEqual(200, response.status_code)
+
+        cache_key = main_module.live_response_cache_key(
+            session["session_id"],
+            main_module.LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION
+        )
+        db = self.session_local()
+        try:
+            session_row = (
+                db.query(main_module.LiveSession)
+                .filter(main_module.LiveSession.id == session["session_id"])
+                .first()
+            )
+            response = main_module.build_cached_live_response(
+                db,
+                session_row,
+                cache_key
+            )
+        finally:
+            db.close()
+        cached_response = main_module.get_cached_live_response(cache_key)
+
+        self.assertEqual(
+            response["spectator_stats"],
+            cached_response["spectator_stats"]
+        )
+        self.assertAlmostEqual(
+            2.0,
+            cached_response["spectator_stats"]["current_climb_sink_ms"],
+            places=6
+        )
+
+    def test_live_read_routes_expose_spectator_stats_after_authorization(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+        first_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        second_timestamp = first_timestamp + timedelta(seconds=30)
+        for payload in [
+            self.position_payload(
+                session["session_id"],
+                timestamp=first_timestamp,
+                lat=-33.9,
+                lon=151.2,
+                alt=500.0
+            ),
+            self.position_payload(
+                session["session_id"],
+                timestamp=second_timestamp,
+                lat=-33.901,
+                lon=151.201,
+                alt=560.0
+            ),
+        ]:
+            response = self.client.post(
+                "/api/v1/position",
+                json=payload,
+                headers=self.write_headers(session)
+            )
+            self.assertEqual(200, response.status_code)
+
+        public_by_session = self.client.get(f"/api/v1/live/{session['session_id']}")
+        public_by_share = self.client.get(f"/api/v1/live/share/{session['share_code']}")
+        authenticated = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, public_by_session.status_code)
+        self.assertEqual(200, public_by_share.status_code)
+        self.assertEqual(200, authenticated.status_code)
+        for response in [public_by_session, public_by_share, authenticated]:
+            stats = response.json()["spectator_stats"]
+            self.assertAlmostEqual(2.0, stats["current_climb_sink_ms"], places=6)
+            self.assertEqual(560.0, stats["highest_altitude_msl_meters"])
+            self.assertAlmostEqual(2.0, stats["best_short_window_climb_ms"], places=6)
+            self.assertGreater(stats["distance_flown_meters"], 0.0)
+            self.assertEqual(30, stats["flight_duration_seconds"])
+
+    def test_private_live_read_does_not_leak_spectator_stats_to_public_routes(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="followers")
+        response = self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers=self.write_headers(session)
+        )
+        self.assertEqual(200, response.status_code)
+
+        public_by_session = self.client.get(f"/api/v1/live/{session['session_id']}")
+        public_by_share = self.client.get(f"/api/v1/live/share/{session['share_code']}")
+
+        self.assertEqual(404, public_by_session.status_code)
+        self.assertEqual(404, public_by_share.status_code)
+        self.assertNotIn("spectator_stats", public_by_session.json())
+        self.assertNotIn("spectator_stats", public_by_share.json())
+
+    def test_concurrent_cold_cache_reads_rebuild_once(self):
+        session = self.start_session()
+        session_row = self.get_live_session_row(session["session_id"])
+        cache_key = main_module.live_response_cache_key(
+            session["session_id"],
+            main_module.LIVE_RESPONSE_CACHE_VARIANT_V1_SESSION
+        )
+        build_count = 0
+        build_count_lock = threading.Lock()
+        original_build_live_response = main_module.build_live_response
+
+        def counting_build_live_response(db, live_session, owner_profile=None):
+            nonlocal build_count
+            with build_count_lock:
+                build_count += 1
+            time.sleep(0.05)
+            return {
+                "session": live_session.id,
+                "build_count": build_count,
+            }
+
+        def read_cached_response():
+            db = self.session_local()
+            try:
+                return main_module.build_cached_live_response(
+                    db,
+                    session_row,
+                    cache_key
+                )
+            finally:
+                db.close()
+
+        main_module.build_live_response = counting_build_live_response
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(read_cached_response),
+                    executor.submit(read_cached_response),
+                ]
+                responses = [future.result() for future in futures]
+        finally:
+            main_module.build_live_response = original_build_live_response
+
+        self.assertEqual(1, build_count)
+        self.assertEqual([1, 1], [response["build_count"] for response in responses])
+
+    def test_live_read_metrics_track_cache_rate_latency_top_sessions_and_privacy(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        viewer_profile = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="viewer.one",
+            display_name="Viewer One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+
+        first_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        second_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        public_read = self.client.get(f"/api/v1/live/{session['session_id']}")
+        main_module.record_live_read_rate_limited()
+        snapshot = main_module.live_read_metrics_snapshot(top_limit=1)
+        top_session = snapshot["top_sessions_by_read_volume"][0]
+        serialized_snapshot = json.dumps(snapshot, sort_keys=True)
+
+        self.assertEqual(200, first_read.status_code)
+        self.assertEqual(200, second_read.status_code)
+        self.assertEqual(200, public_read.status_code)
+        self.assertEqual(3, snapshot["request_count"])
+        self.assertEqual(1, snapshot["cache_hit_count"])
+        self.assertAlmostEqual(1 / 3, snapshot["cache_hit_rate"])
+        self.assertEqual(1, snapshot["rate_limited_429_count"])
+        self.assertEqual(session["session_id"], top_session["session_id"])
+        self.assertEqual(3, top_session["request_count"])
+        self.assertGreaterEqual(top_session["average_response_ms"], 0.0)
+        self.assertNotIn(viewer_profile["user_id"], serialized_snapshot)
+        self.assertNotIn("viewer.one", serialized_snapshot)
+
+    def test_live_read_global_rate_limit_blocks_only_after_global_limit(self):
+        main_module.LIVE_READ_RATE_LIMIT_GLOBAL = 1
+        first_session = self.start_session()
+        second_session = self.start_session()
+
+        first_read = self.client.get(f"/api/v1/live/{first_session['session_id']}")
+        second_read = self.client.get(f"/api/v1/live/{second_session['session_id']}")
+
+        self.assertEqual(200, first_read.status_code)
+        self.assertEqual(429, second_read.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.LIVEFOLLOW_RATE_LIMITED,
+            second_read.json()["code"]
+        )
+        self.assertEqual(1, main_module.live_read_metrics_snapshot()["rate_limited_429_count"])
+
+    def test_live_read_session_rate_limit_blocks_only_same_session(self):
+        main_module.LIVE_READ_RATE_LIMIT_PER_SESSION = 1
+        first_session = self.start_session()
+        second_session = self.start_session()
+
+        first_read = self.client.get(f"/api/v1/live/{first_session['session_id']}")
+        blocked_same_session = self.client.get(f"/api/v1/live/{first_session['session_id']}")
+        other_session_read = self.client.get(f"/api/v1/live/{second_session['session_id']}")
+
+        self.assertEqual(200, first_read.status_code)
+        self.assertEqual(429, blocked_same_session.status_code)
+        self.assertEqual(200, other_session_read.status_code)
+
+    def test_live_read_ip_rate_limit_blocks_only_same_ip(self):
+        main_module.LIVE_READ_RATE_LIMIT_PER_IP = 1
+        first_session = self.start_session()
+        second_session = self.start_session()
+
+        first_read = self.client.get(
+            f"/api/v1/live/{first_session['session_id']}",
+            headers={"X-Forwarded-For": "203.0.113.1"}
+        )
+        blocked_same_ip = self.client.get(
+            f"/api/v1/live/{second_session['session_id']}",
+            headers={"X-Forwarded-For": "203.0.113.1"}
+        )
+        other_ip_read = self.client.get(
+            f"/api/v1/live/{second_session['session_id']}",
+            headers={"X-Forwarded-For": "203.0.113.2"}
+        )
+
+        self.assertEqual(200, first_read.status_code)
+        self.assertEqual(429, blocked_same_ip.status_code)
+        self.assertEqual(200, other_ip_read.status_code)
+
+    def test_live_read_user_rate_limit_blocks_only_same_user(self):
+        main_module.LIVE_READ_RATE_LIMIT_PER_USER = 1
+        first_session = self.start_session()
+        second_session = self.start_session()
+
+        first_read = self.client.get(
+            f"/api/v2/live/session/{first_session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        blocked_same_user = self.client.get(
+            f"/api/v2/live/session/{second_session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        other_user_read = self.client.get(
+            f"/api/v2/live/session/{second_session['session_id']}",
+            headers=self.bearer_headers(self.tertiary_bearer_token)
+        )
+
+        self.assertEqual(200, first_read.status_code)
+        self.assertEqual(429, blocked_same_user.status_code)
+        self.assertEqual(200, other_user_read.status_code)
+
+    def test_live_read_rate_limit_response_includes_retry_after(self):
+        main_module.LIVE_READ_RATE_LIMIT_WINDOW_SECONDS = 3.0
+        main_module.LIVE_READ_RATE_LIMIT_PER_SESSION = 1
+        session = self.start_session()
+
+        first_read = self.client.get(f"/api/v1/live/{session['session_id']}")
+        blocked_read = self.client.get(f"/api/v1/live/{session['session_id']}")
+
+        self.assertEqual(200, first_read.status_code)
+        self.assertNotIn("Retry-After", first_read.headers)
+        self.assertEqual(429, blocked_read.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.LIVEFOLLOW_RATE_LIMITED,
+            blocked_read.json()["code"]
+        )
+        retry_after = int(blocked_read.headers["Retry-After"])
+        self.assertGreaterEqual(retry_after, 1)
+        self.assertLessEqual(retry_after, 3)
+
     def test_authenticated_live_start_ends_previous_owned_sessions(self):
         self.complete_profile(
             token=self.primary_bearer_token,
@@ -3772,6 +6266,84 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertIsNone(items[0]["share_code"])
         self.assertEqual("Pilot Two", items[0]["display_label"])
 
+    def test_authenticated_following_active_paginates_with_offset_cursor(self):
+        current_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        owner_specs = [
+            ("active-owner-old-token", "active-owner-old", "active.old", "Active Old"),
+            ("active-owner-middle-token", "active-owner-middle", "active.middle", "Active Middle"),
+            ("active-owner-new-token", "active-owner-new", "active.new", "Active New"),
+        ]
+        active_sessions = []
+        base_timestamp = datetime(2026, 3, 20, 12, 0, 0, tzinfo=timezone.utc)
+        for index, (token, subject, handle, display_name) in enumerate(owner_specs):
+            self.add_static_bearer_token(token, subject, display_name)
+            owner_profile = self.complete_profile(
+                token=token,
+                handle=handle,
+                display_name=display_name
+            )
+            self.seed_follow_edge(current_profile["user_id"], owner_profile["user_id"])
+            session = self.start_authenticated_session(token=token, visibility="followers")
+            self.clock.set(datetime(2026, 3, 20, 12, 0, index))
+            upload = self.client.post(
+                "/api/v1/position",
+                json=self.position_payload(
+                    session["session_id"],
+                    timestamp=base_timestamp + timedelta(seconds=index)
+                ),
+                headers={"X-Session-Token": session["write_token"]}
+            )
+            self.assertEqual(200, upload.status_code)
+            active_sessions.append((handle, session["session_id"]))
+
+        first_page = self.client.get(
+            "/api/v2/live/following/active",
+            params={"limit": 2},
+            headers=self.bearer_headers()
+        )
+        second_page = self.client.get(
+            "/api/v2/live/following/active",
+            params={"limit": 2, "cursor": first_page.json()["next_cursor"]},
+            headers=self.bearer_headers()
+        )
+        invalid_cursor = self.client.get(
+            "/api/v2/live/following/active",
+            params={"cursor": "not-an-offset"},
+            headers=self.bearer_headers()
+        )
+        over_limit = self.client.get(
+            "/api/v2/live/following/active",
+            params={"limit": 201},
+            headers=self.bearer_headers()
+        )
+
+        self.assertEqual(200, first_page.status_code)
+        self.assertEqual(3, first_page.json()["total"])
+        self.assertEqual(
+            ["active.new", "active.middle"],
+            [item["profile"]["handle"] for item in first_page.json()["items"]]
+        )
+        self.assertEqual("2", first_page.json()["next_cursor"])
+        self.assertEqual(200, second_page.status_code)
+        self.assertEqual(
+            ["active.old"],
+            [item["profile"]["handle"] for item in second_page.json()["items"]]
+        )
+        self.assertIsNone(second_page.json()["next_cursor"])
+        self.assertEqual(422, invalid_cursor.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, invalid_cursor.json()["code"])
+        self.assertEqual(422, over_limit.status_code)
+        self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, over_limit.json()["code"])
+        for page in (first_page.json(), second_page.json()):
+            for item in page["items"]:
+                self.assertNotIn("unique_watchers_count", item)
+        for _handle, session_id in active_sessions:
+            self.assertEqual(0, self.live_session_unique_viewer_count(session_id))
+
     def test_authenticated_live_reads_and_user_lookup_enforce_follow_entitlement(self):
         self.complete_profile(
             token=self.primary_bearer_token,
@@ -3831,6 +6403,210 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(404, outsider_read.status_code)
         self.assertEqual(404, outsider_lookup.status_code)
 
+    def test_authenticated_live_detail_reads_record_unique_non_owner_viewers_only(self):
+        owner_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        viewer_one = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="viewer.one",
+            display_name="Viewer One"
+        )
+        viewer_two = self.complete_profile(
+            token=self.tertiary_bearer_token,
+            handle="viewer.two",
+            display_name="Viewer Two"
+        )
+        self.seed_follow_edge(viewer_one["user_id"], owner_profile["user_id"])
+        self.seed_follow_edge(viewer_two["user_id"], owner_profile["user_id"])
+        session = self.start_authenticated_session(visibility="followers")
+        self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        owner_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers()
+        )
+        self.assertEqual(
+            0,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+        first_viewer_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        repeated_viewer_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        self.assertEqual(
+            1,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+        active_list = self.client.get(
+            "/api/v2/live/following/active",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        self.assertEqual(
+            1,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+        second_viewer_lookup = self.client.get(
+            f"/api/v2/live/users/{owner_profile['user_id']}",
+            headers=self.bearer_headers(self.tertiary_bearer_token)
+        )
+
+        self.assertEqual(200, owner_read.status_code)
+        self.assertEqual(200, first_viewer_read.status_code)
+        self.assertEqual(200, repeated_viewer_read.status_code)
+        self.assertEqual(200, active_list.status_code)
+        self.assertEqual(200, second_viewer_lookup.status_code)
+        self.assertEqual(1, len(active_list.json()["items"]))
+        self.assertEqual(
+            2,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+
+    def test_viewer_recording_excludes_public_v1_unauthorized_and_ended_reads(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="viewer.one",
+            display_name="Viewer One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+        self.client.post(
+            "/api/v1/position",
+            json=self.position_payload(session["session_id"]),
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        public_by_session = self.client.get(f"/api/v1/live/{session['session_id']}")
+        public_by_share = self.client.get(f"/api/v1/live/share/{session['share_code']}")
+        missing_auth = self.client.get(f"/api/v2/live/session/{session['session_id']}")
+        end_response = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": session["write_token"]}
+        )
+        ended_authenticated_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+
+        self.assertEqual(200, public_by_session.status_code)
+        self.assertEqual(200, public_by_share.status_code)
+        self.assertEqual(401, missing_auth.status_code)
+        self.assertEqual(200, end_response.status_code)
+        self.assertEqual(200, ended_authenticated_read.status_code)
+        self.assertEqual(
+            0,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
+
+    def test_session_end_returns_unique_watchers_count_for_zero_and_repeat_stop(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+
+        first_end = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": session["write_token"]}
+        )
+        repeat_end = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        self.assertEqual(200, first_end.status_code)
+        self.assertEqual(200, repeat_end.status_code)
+        self.assertEqual(0, first_end.json()["unique_watchers_count"])
+        self.assertEqual(0, repeat_end.json()["unique_watchers_count"])
+        self.assertEqual(
+            first_end.json()["unique_watchers_count"],
+            repeat_end.json()["unique_watchers_count"]
+        )
+
+    def test_session_end_returns_unique_watchers_count_for_multiple_viewers(self):
+        owner_profile = self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        viewer_one = self.complete_profile(
+            token=self.secondary_bearer_token,
+            handle="viewer.one",
+            display_name="Viewer One"
+        )
+        viewer_two = self.complete_profile(
+            token=self.tertiary_bearer_token,
+            handle="viewer.two",
+            display_name="Viewer Two"
+        )
+        self.seed_follow_edge(viewer_one["user_id"], owner_profile["user_id"])
+        self.seed_follow_edge(viewer_two["user_id"], owner_profile["user_id"])
+        session = self.start_authenticated_session(visibility="followers")
+
+        first_viewer_read = self.client.get(
+            f"/api/v2/live/session/{session['session_id']}",
+            headers=self.bearer_headers(self.secondary_bearer_token)
+        )
+        second_viewer_read = self.client.get(
+            f"/api/v2/live/users/{owner_profile['user_id']}",
+            headers=self.bearer_headers(self.tertiary_bearer_token)
+        )
+        end_response = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": session["write_token"]}
+        )
+        repeat_end_response = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": session["write_token"]}
+        )
+
+        self.assertEqual(200, first_viewer_read.status_code)
+        self.assertEqual(200, second_viewer_read.status_code)
+        self.assertEqual(200, end_response.status_code)
+        self.assertEqual(200, repeat_end_response.status_code)
+        self.assertEqual(2, end_response.json()["unique_watchers_count"])
+        self.assertEqual(
+            end_response.json()["unique_watchers_count"],
+            repeat_end_response.json()["unique_watchers_count"]
+        )
+
+    def test_session_end_invalid_token_does_not_return_unique_watchers_count(self):
+        self.complete_profile(
+            token=self.primary_bearer_token,
+            handle="pilot.one",
+            display_name="Pilot One"
+        )
+        session = self.start_authenticated_session(visibility="public")
+
+        response = self.client.post(
+            "/api/v1/session/end",
+            json={"session_id": session["session_id"]},
+            headers={"X-Session-Token": "wrong-token"}
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertNotIn("unique_watchers_count", response.json())
+
     def test_blocked_follower_cannot_discover_or_read_follower_only_live_session(self):
         follower_profile = self.complete_profile(
             token=self.primary_bearer_token,
@@ -3871,6 +6647,10 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual([], active.json()["items"])
         self.assertEqual(404, read.status_code)
         self.assertEqual(404, lookup.status_code)
+        self.assertEqual(
+            0,
+            self.live_session_unique_viewer_count(session["session_id"])
+        )
 
     def test_visibility_patch_removes_public_v1_visibility_until_public_restored(self):
         self.complete_profile(
@@ -3971,6 +6751,41 @@ class LiveFollowApiTest(unittest.TestCase):
         finally:
             db.close()
 
+    def live_session_unique_viewer_count(self, session_id: str) -> int:
+        db = self.session_local()
+        try:
+            return main_module.count_live_session_unique_viewers(db, session_id)
+        finally:
+            db.close()
+
+    def live_session_spectator_stats(
+        self,
+        session_id: str
+    ) -> main_module.LiveSessionSpectatorStats | None:
+        db = self.session_local()
+        try:
+            stats = main_module.get_live_session_spectator_stats(db, session_id)
+            if stats is None:
+                return None
+            db.expunge(stats)
+            return stats
+        finally:
+            db.close()
+
+    def seed_live_response_cache_variants(self, session_id: str) -> None:
+        for cache_key in main_module.live_response_cache_keys(session_id):
+            main_module.set_cached_live_response(
+                cache_key,
+                {
+                    "session": session_id,
+                    "cache_key": cache_key,
+                }
+            )
+
+    def assert_live_response_cache_empty(self, session_id: str) -> None:
+        for cache_key in main_module.live_response_cache_keys(session_id):
+            self.assertIsNone(main_module.get_cached_live_response(cache_key))
+
     def write_headers(self, session):
         return {"X-Session-Token": session["write_token"]}
 
@@ -4066,6 +6881,10 @@ class LiveFollowApiTest(unittest.TestCase):
                     follow_policy=follow_policy,
                     default_live_visibility="followers",
                     connection_list_visibility="owner_only",
+                    social_notifications_enabled=(
+                        main_module.DEFAULT_SOCIAL_NOTIFICATIONS_ENABLED
+                    ),
+                    live_notifications_enabled=main_module.DEFAULT_LIVE_NOTIFICATIONS_ENABLED,
                     created_at=now,
                     updated_at=now,
                 )
@@ -4176,6 +6995,32 @@ class LiveFollowApiTest(unittest.TestCase):
         finally:
             db.close()
 
+    def relationship_counter_counts(self, user_id: str) -> tuple[int, int]:
+        db = self.session_local()
+        try:
+            return main_module.get_cached_relationship_counts(db, user_id)
+        finally:
+            db.close()
+
+    def set_relationship_counter(
+        self,
+        user_id: str,
+        followers_count: int,
+        following_count: int
+    ) -> None:
+        db = self.session_local()
+        try:
+            main_module.upsert_user_relationship_counter(
+                db,
+                user_id=user_id,
+                followers_count=followers_count,
+                following_count=following_count,
+                updated_at=self.clock.utcnow()
+            )
+            db.commit()
+        finally:
+            db.close()
+
     def get_follow_request_row(self, requester_user_id: str, target_user_id: str):
         db = self.session_local()
         try:
@@ -4201,6 +7046,20 @@ class LiveFollowApiTest(unittest.TestCase):
                 )
                 .first()
                 is not None
+            )
+        finally:
+            db.close()
+
+    def favorite_follow_count(self, user_id: str, favorite_user_id: str) -> int:
+        db = self.session_local()
+        try:
+            return (
+                db.query(main_module.FavoriteFollow)
+                .filter(
+                    main_module.FavoriteFollow.user_id == user_id,
+                    main_module.FavoriteFollow.favorite_user_id == favorite_user_id,
+                )
+                .count()
             )
         finally:
             db.close()
@@ -4527,12 +7386,16 @@ class PrivateFollowReleaseHardeningTest(unittest.TestCase):
                         "privacy_settings",
                         "follow_requests",
                         "follow_edges",
+                        "favorite_follows",
+                        "user_relationship_counters",
                         "blocks",
                         "device_push_tokens",
                         "notification_outbox_events",
                         "billing_google_purchases",
                         "billing_google_events",
                         "billing_audit_records",
+                        "live_session_viewers",
+                        "live_session_spectator_stats",
                     }.issubset(table_names)
                 )
                 push_token_columns = {
@@ -4576,6 +7439,15 @@ class PrivateFollowReleaseHardeningTest(unittest.TestCase):
                         "updated_at",
                     }.issubset(notification_outbox_columns)
                 )
+                privacy_columns = {
+                    column["name"] for column in db_inspector.get_columns("privacy_settings")
+                }
+                self.assertTrue(
+                    {
+                        "social_notifications_enabled",
+                        "live_notifications_enabled",
+                    }.issubset(privacy_columns)
+                )
                 self.assertIn(
                     "agl_meters",
                     {column["name"] for column in db_inspector.get_columns("live_positions")},
@@ -4585,6 +7457,124 @@ class PrivateFollowReleaseHardeningTest(unittest.TestCase):
                 }
                 self.assertIn("owner_user_id", live_session_columns)
                 self.assertIn("visibility", live_session_columns)
+                live_session_indexes = {
+                    index["name"] for index in db_inspector.get_indexes("live_sessions")
+                }
+                self.assertIn("ix_live_sessions_owner_user_id", live_session_indexes)
+                self.assertIn("ix_live_sessions_owner_status", live_session_indexes)
+                follow_request_indexes = {
+                    index["name"] for index in db_inspector.get_indexes("follow_requests")
+                }
+                self.assertTrue(
+                    {
+                        "ix_follow_requests_requester_user_id",
+                        "ix_follow_requests_target_user_id",
+                        "ix_follow_requests_requester_status_updated_at",
+                        "ix_follow_requests_target_status_updated_at",
+                    }.issubset(follow_request_indexes)
+                )
+                follow_edge_indexes = {
+                    index["name"] for index in db_inspector.get_indexes("follow_edges")
+                }
+                self.assertIn("ix_follow_edges_followed_user_id", follow_edge_indexes)
+                follow_edge_pk = db_inspector.get_pk_constraint("follow_edges")
+                self.assertEqual(
+                    ["follower_user_id", "followed_user_id"],
+                    follow_edge_pk["constrained_columns"]
+                )
+                favorite_follow_indexes = {
+                    index["name"] for index in db_inspector.get_indexes("favorite_follows")
+                }
+                self.assertIn(
+                    "ix_favorite_follows_favorite_user_id",
+                    favorite_follow_indexes
+                )
+                favorite_follow_pk = db_inspector.get_pk_constraint("favorite_follows")
+                self.assertEqual(
+                    ["user_id", "favorite_user_id"],
+                    favorite_follow_pk["constrained_columns"]
+                )
+                block_indexes = {
+                    index["name"] for index in db_inspector.get_indexes("blocks")
+                }
+                self.assertIn("ix_blocks_blocked_user_id", block_indexes)
+                live_session_viewer_columns = {
+                    column["name"] for column in db_inspector.get_columns("live_session_viewers")
+                }
+                self.assertTrue(
+                    {
+                        "id",
+                        "session_id",
+                        "viewer_user_id",
+                        "first_seen_at",
+                        "last_seen_at",
+                    }.issubset(live_session_viewer_columns)
+                )
+                live_session_viewer_indexes = {
+                    index["name"] for index in db_inspector.get_indexes("live_session_viewers")
+                }
+                self.assertIn(
+                    "ix_live_session_viewers_session_id",
+                    live_session_viewer_indexes
+                )
+                live_session_viewer_unique_constraints = {
+                    constraint["name"]
+                    for constraint in db_inspector.get_unique_constraints(
+                        "live_session_viewers"
+                    )
+                }
+                self.assertIn(
+                    "uq_live_session_viewers_session_viewer",
+                    live_session_viewer_unique_constraints
+                )
+                spectator_stats_columns = {
+                    column["name"]
+                    for column in db_inspector.get_columns(
+                        "live_session_spectator_stats"
+                    )
+                }
+                self.assertTrue(
+                    {
+                        "session_id",
+                        "first_position_at",
+                        "last_position_at",
+                        "position_count",
+                        "highest_altitude_msl_meters",
+                        "distance_flown_meters",
+                        "current_climb_sink_ms",
+                        "best_short_window_climb_ms",
+                        "updated_at",
+                    }.issubset(spectator_stats_columns)
+                )
+                spectator_stats_pk = db_inspector.get_pk_constraint(
+                    "live_session_spectator_stats"
+                )
+                self.assertEqual(
+                    ["session_id"],
+                    spectator_stats_pk["constrained_columns"]
+                )
+                spectator_stats_indexes = {
+                    index["name"]
+                    for index in db_inspector.get_indexes(
+                        "live_session_spectator_stats"
+                    )
+                }
+                self.assertIn(
+                    "ix_live_session_spectator_stats_session_id",
+                    spectator_stats_indexes
+                )
+                relationship_counter_columns = {
+                    column["name"]
+                    for column in db_inspector.get_columns("user_relationship_counters")
+                }
+                self.assertTrue(
+                    {
+                        "user_id",
+                        "followers_count",
+                        "following_count",
+                        "updated_at",
+                    }.issubset(relationship_counter_columns)
+                )
             finally:
                 verification_engine.dispose()
 
