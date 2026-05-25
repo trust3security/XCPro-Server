@@ -1,8 +1,10 @@
 import json
 import unittest
+from datetime import datetime, timezone
 
 from app import main as main_module
 from app.scripts import deliver_notifications
+from app.scripts import recount_relationship_counters
 
 
 class NotificationDeliveryOperationsTest(unittest.TestCase):
@@ -99,6 +101,91 @@ class NotificationDeliveryOperationsTest(unittest.TestCase):
         self.assertEqual(True, result["ok"])
         self.assertEqual(1, result["events_attempted"])
         self.assertEqual(1, result["tokens_sent"])
+
+    def test_recount_script_requires_explicit_confirm(self):
+        with self.assertRaises(
+            recount_relationship_counters.RelationshipCounterRecountScriptError
+        ):
+            recount_relationship_counters.run(
+                recount_relationship_counters.parse_args([])
+            )
+
+    def test_recount_script_commits_confirmed_aggregate_recount(self):
+        original_recount = (
+            recount_relationship_counters.main_module
+            .recount_all_user_relationship_counters
+        )
+        calls = []
+        db = FakeDbSession()
+        updated_at = datetime(2026, 5, 25, tzinfo=timezone.utc)
+
+        def fake_recount(session, recounted_at):
+            calls.append((session, recounted_at))
+            return 3
+
+        recount_relationship_counters.main_module.recount_all_user_relationship_counters = (
+            fake_recount
+        )
+        try:
+            result = recount_relationship_counters.run(
+                recount_relationship_counters.parse_args(["--confirm"]),
+                session_factory=lambda: db,
+                updated_at=updated_at,
+            )
+        finally:
+            recount_relationship_counters.main_module.recount_all_user_relationship_counters = (
+                original_recount
+            )
+
+        self.assertEqual([(db, updated_at)], calls)
+        self.assertEqual({"ok": True, "recounted_users": 3}, result)
+        self.assertEqual(1, db.commit_count)
+        self.assertEqual(0, db.rollback_count)
+        self.assertEqual(1, db.close_count)
+
+    def test_recount_script_rolls_back_on_failure(self):
+        original_recount = (
+            recount_relationship_counters.main_module
+            .recount_all_user_relationship_counters
+        )
+        db = FakeDbSession()
+
+        def failing_recount(_session, _recounted_at):
+            raise RuntimeError("recount failed")
+
+        recount_relationship_counters.main_module.recount_all_user_relationship_counters = (
+            failing_recount
+        )
+        try:
+            with self.assertRaises(RuntimeError):
+                recount_relationship_counters.run(
+                    recount_relationship_counters.parse_args(["--confirm"]),
+                    session_factory=lambda: db,
+                )
+        finally:
+            recount_relationship_counters.main_module.recount_all_user_relationship_counters = (
+                original_recount
+            )
+
+        self.assertEqual(0, db.commit_count)
+        self.assertEqual(1, db.rollback_count)
+        self.assertEqual(1, db.close_count)
+
+
+class FakeDbSession:
+    def __init__(self):
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.close_count = 0
+
+    def commit(self):
+        self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
+
+    def close(self):
+        self.close_count += 1
 
 
 if __name__ == "__main__":

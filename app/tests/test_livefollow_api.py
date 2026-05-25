@@ -149,6 +149,50 @@ class LiveSpectatorStatsPolicyTest(unittest.TestCase):
         )
 
 
+class LiveReadRateLimitConfigTest(unittest.TestCase):
+    def test_missing_env_uses_disabled_defaults(self):
+        config = main_module.load_live_read_rate_limit_config_from_env({})
+
+        self.assertEqual(60.0, config.window_seconds)
+        self.assertEqual(0, config.global_limit)
+        self.assertEqual(0, config.per_user_limit)
+        self.assertEqual(0, config.per_ip_limit)
+        self.assertEqual(0, config.per_session_limit)
+
+    def test_env_values_override_defaults(self):
+        config = main_module.load_live_read_rate_limit_config_from_env({
+            "XCPRO_LIVE_READ_RATE_LIMIT_WINDOW_SECONDS": "30.5",
+            "XCPRO_LIVE_READ_RATE_LIMIT_GLOBAL": "1000",
+            "XCPRO_LIVE_READ_RATE_LIMIT_PER_USER": "20",
+            "XCPRO_LIVE_READ_RATE_LIMIT_PER_IP": "40",
+            "XCPRO_LIVE_READ_RATE_LIMIT_PER_SESSION": "80",
+        })
+
+        self.assertEqual(30.5, config.window_seconds)
+        self.assertEqual(1000, config.global_limit)
+        self.assertEqual(20, config.per_user_limit)
+        self.assertEqual(40, config.per_ip_limit)
+        self.assertEqual(80, config.per_session_limit)
+
+    def test_invalid_rate_limit_env_fails_fast(self):
+        with self.assertRaisesRegex(RuntimeError, "non-negative integer"):
+            main_module.load_live_read_rate_limit_config_from_env({
+                "XCPRO_LIVE_READ_RATE_LIMIT_PER_USER": "not-a-number",
+            })
+
+    def test_negative_rate_limit_env_fails_fast(self):
+        with self.assertRaisesRegex(RuntimeError, "non-negative integer"):
+            main_module.load_live_read_rate_limit_config_from_env({
+                "XCPRO_LIVE_READ_RATE_LIMIT_PER_IP": "-1",
+            })
+
+    def test_invalid_rate_limit_window_env_fails_fast(self):
+        with self.assertRaisesRegex(RuntimeError, "non-negative number"):
+            main_module.load_live_read_rate_limit_config_from_env({
+                "XCPRO_LIVE_READ_RATE_LIMIT_WINDOW_SECONDS": "nan",
+            })
+
+
 class LiveFollowApiTest(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine(

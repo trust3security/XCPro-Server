@@ -64,12 +64,24 @@ Example format only:
 POSTGRES_DB=xcpro
 POSTGRES_PASSWORD=change-me
 DATABASE_URL=postgresql://postgres:change-me@db:5432/xcpro
+XCPRO_RUNTIME_ENV=prod
+XCPRO_GOOGLE_SERVER_CLIENT_IDS=your-google-server-client-id
+XCPRO_PRIVATE_FOLLOW_BEARER_SECRET=generated-secret
 XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET=generated-secret
 XCPRO_FCM_PROJECT_ID=your-firebase-project-id
 XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH=/run/secrets/fcm-service-account.json
+XCPRO_LIVE_READ_RATE_LIMIT_WINDOW_SECONDS=60
+XCPRO_LIVE_READ_RATE_LIMIT_GLOBAL=0
+XCPRO_LIVE_READ_RATE_LIMIT_PER_USER=0
+XCPRO_LIVE_READ_RATE_LIMIT_PER_IP=0
+XCPRO_LIVE_READ_RATE_LIMIT_PER_SESSION=0
 ```
 
 Do not commit the real production values.
+
+The live-read rate-limit defaults above intentionally leave rate limiting
+disabled (`0`) while metrics are observed. Set nonzero values only after a
+traffic-based decision; Android already honors `429 Retry-After` responses.
 
 ## Private-follow notification delivery
 
@@ -213,21 +225,42 @@ Because the API is built from `/opt/xcpro/app`, production must have updated ser
 
 Typical pattern:
 1. copy updated app files onto the server under `/opt/xcpro/app`
-2. rebuild/recreate the API container
+2. validate Compose config
+3. build the new API image without recreating the running API container
+4. run database migrations from a one-off API container
+5. run any required operational backfills from a one-off API container
+6. recreate the API container after migrations and backfills pass
 
 Example:
 
 ```bash
 cd /opt/xcpro
-docker compose up -d --build api
+docker compose config
+docker compose build api
+docker compose run --rm api python -m alembic -c /app/alembic.ini upgrade head
+docker compose run --rm api python /app/scripts/recount_relationship_counters.py --confirm
+docker compose up -d --no-deps --force-recreate api
 ```
 
 If the host is still using old compose:
 
 ```bash
 cd /opt/xcpro
-docker-compose up -d --build api
+docker-compose config
+docker-compose build api
+docker-compose run --rm api python -m alembic -c /app/alembic.ini upgrade head
+docker-compose run --rm api python /app/scripts/recount_relationship_counters.py --confirm
+docker-compose up -d --no-deps --force-recreate api
 ```
+
+Do not use `docker compose up -d --build api` for schema-changing deploys. It
+can start new API code against the old database schema before migrations have
+run. Build first, migrate and backfill through one-off containers, then recreate
+the API.
+
+Run the relationship-counter recount after migrations whenever deploying the
+cached follower/following counter table. The command is idempotent and prints
+aggregate output only.
 
 ## Database password rotation
 
@@ -265,8 +298,11 @@ cat /opt/xcpro/docker-compose.yml
 ls -la /opt/xcpro/.env
 docker inspect xcpro-api --format '{{.HostConfig.RestartPolicy.Name}}'
 docker ps
-curl -I http://127.0.0.1:8000
-curl -I https://api.xcpro.com.au
+curl -i http://127.0.0.1:8000/
+curl -i https://api.xcpro.com.au/
+docker compose run --rm api python /app/scripts/private_follow_env_preflight.py
+systemctl status xcpro-notification-delivery.timer --no-pager -l
+journalctl -u xcpro-notification-delivery.service -n 50 --no-pager
 ```
 
 Expected:
@@ -275,6 +311,12 @@ Expected:
 - `.env` exists with restricted permissions
 - `xcpro-api`, `xcpro-db`, `xcpro-redis` are running
 - local and public curl checks return an HTTP response
+- private-follow preflight reports `ok: true`
+- notification timer status and journal output remain aggregate-only
+
+Do not run `deliver_notifications.py --confirm-send` as a generic deploy smoke
+check. Use it only when intentionally delivering queued notification outbox
+events.
 
 ## Recommended next improvements
 

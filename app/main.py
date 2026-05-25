@@ -387,6 +387,15 @@ class FcmRuntimeConfig:
     service_account_json_path: Optional[str]
 
 
+@dataclass(frozen=True)
+class LiveReadRateLimitConfig:
+    window_seconds: float
+    global_limit: int
+    per_user_limit: int
+    per_ip_limit: int
+    per_session_limit: int
+
+
 def parse_boolean_env(name: str, raw_value: Optional[str], default: bool = False) -> bool:
     normalized = (raw_value or "").strip().lower()
     if not normalized:
@@ -397,6 +406,73 @@ def parse_boolean_env(name: str, raw_value: Optional[str], default: bool = False
         return False
     raise RuntimeError(
         f"{name} must be one of {sorted(PRIVATE_FOLLOW_BOOLEAN_TRUE_VALUES | PRIVATE_FOLLOW_BOOLEAN_FALSE_VALUES)}"
+    )
+
+
+def parse_non_negative_int_env(
+    name: str,
+    raw_value: Optional[str],
+    default: int
+) -> int:
+    normalized = (raw_value or "").strip()
+    if not normalized:
+        return default
+    try:
+        parsed = int(normalized)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} must be a non-negative integer")
+    return parsed
+
+
+def parse_non_negative_float_env(
+    name: str,
+    raw_value: Optional[str],
+    default: float
+) -> float:
+    normalized = (raw_value or "").strip()
+    if not normalized:
+        return default
+    try:
+        parsed = float(normalized)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a non-negative number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise RuntimeError(f"{name} must be a non-negative number")
+    return parsed
+
+
+def load_live_read_rate_limit_config_from_env(
+    env: Optional[dict[str, str]] = None
+) -> LiveReadRateLimitConfig:
+    resolved_env = os.environ if env is None else env
+    return LiveReadRateLimitConfig(
+        window_seconds=parse_non_negative_float_env(
+            "XCPRO_LIVE_READ_RATE_LIMIT_WINDOW_SECONDS",
+            resolved_env.get("XCPRO_LIVE_READ_RATE_LIMIT_WINDOW_SECONDS"),
+            60.0
+        ),
+        global_limit=parse_non_negative_int_env(
+            "XCPRO_LIVE_READ_RATE_LIMIT_GLOBAL",
+            resolved_env.get("XCPRO_LIVE_READ_RATE_LIMIT_GLOBAL"),
+            0
+        ),
+        per_user_limit=parse_non_negative_int_env(
+            "XCPRO_LIVE_READ_RATE_LIMIT_PER_USER",
+            resolved_env.get("XCPRO_LIVE_READ_RATE_LIMIT_PER_USER"),
+            0
+        ),
+        per_ip_limit=parse_non_negative_int_env(
+            "XCPRO_LIVE_READ_RATE_LIMIT_PER_IP",
+            resolved_env.get("XCPRO_LIVE_READ_RATE_LIMIT_PER_IP"),
+            0
+        ),
+        per_session_limit=parse_non_negative_int_env(
+            "XCPRO_LIVE_READ_RATE_LIMIT_PER_SESSION",
+            resolved_env.get("XCPRO_LIVE_READ_RATE_LIMIT_PER_SESSION"),
+            0
+        )
     )
 
 
@@ -5595,11 +5671,12 @@ class SocialGraphMetrics:
 _live_read_metrics: dict[str, LiveReadMetric] = {}
 _live_read_metrics_lock = threading.Lock()
 _live_read_rate_limited_count = 0
-LIVE_READ_RATE_LIMIT_WINDOW_SECONDS = 60.0
-LIVE_READ_RATE_LIMIT_GLOBAL = 0
-LIVE_READ_RATE_LIMIT_PER_USER = 0
-LIVE_READ_RATE_LIMIT_PER_IP = 0
-LIVE_READ_RATE_LIMIT_PER_SESSION = 0
+LIVE_READ_RATE_LIMIT_CONFIG = load_live_read_rate_limit_config_from_env()
+LIVE_READ_RATE_LIMIT_WINDOW_SECONDS = LIVE_READ_RATE_LIMIT_CONFIG.window_seconds
+LIVE_READ_RATE_LIMIT_GLOBAL = LIVE_READ_RATE_LIMIT_CONFIG.global_limit
+LIVE_READ_RATE_LIMIT_PER_USER = LIVE_READ_RATE_LIMIT_CONFIG.per_user_limit
+LIVE_READ_RATE_LIMIT_PER_IP = LIVE_READ_RATE_LIMIT_CONFIG.per_ip_limit
+LIVE_READ_RATE_LIMIT_PER_SESSION = LIVE_READ_RATE_LIMIT_CONFIG.per_session_limit
 _live_read_rate_limit_events: dict[str, list[float]] = {}
 _live_read_rate_limit_lock = threading.Lock()
 SOCIAL_GRAPH_SLOW_QUERY_MS = 500.0
