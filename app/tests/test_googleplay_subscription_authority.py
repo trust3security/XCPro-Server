@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
+from app.scripts import support_billing_snapshot as support_billing_snapshot_script
 
 
 class FakeRedis:
@@ -1308,6 +1309,307 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_billing_support_snapshot_reports_active_basic_without_mutation_or_raw_token(self):
+        purchase_token = "support-active-basic-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                acknowledgement_required=True,
+            ),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        before_counts = self.billing_row_counts()
+
+        db = self.session_local()
+        try:
+            snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual("BASIC", snapshot["entitlement"]["tier"])
+        self.assertEqual("MONTHLY", snapshot["entitlement"]["billingPeriod"])
+        self.assertEqual("xcpro_basic", snapshot["currentPurchase"]["productId"])
+        self.assertEqual("monthly", snapshot["currentPurchase"]["basePlanId"])
+        self.assertEqual(
+            main_module.hash_purchase_token(purchase_token),
+            snapshot["currentPurchase"]["purchaseTokenHash"],
+        )
+        self.assertEqual("ACKNOWLEDGED", snapshot["currentPurchase"]["acknowledgementState"])
+        self.assertFalse(snapshot["currentPurchase"]["acknowledgementPending"])
+        self.assertIsNone(snapshot["latestGoogleEvent"])
+        self.assertIsNone(snapshot["unavailableMetadata"]["latestOrderId"])
+        self.assert_plaintext_absent(snapshot, purchase_token)
+
+    def test_billing_support_snapshot_reports_superseded_linked_token_hash_only(self):
+        old_token = "support-superseded-old-token"
+        new_token = "support-superseded-new-token"
+        self.verifier.set_result(
+            old_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+            ),
+        )
+        old_sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=old_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, old_sync.status_code)
+        self.clock.advance(minutes=1)
+        self.verifier.set_result(
+            new_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="annual",
+                linked_purchase_token=old_token,
+            ),
+        )
+        new_sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="annual",
+                purchase_token=new_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, new_sync.status_code)
+        before_counts = self.billing_row_counts()
+
+        db = self.session_local()
+        try:
+            snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual("annual", snapshot["currentPurchase"]["basePlanId"])
+        self.assertEqual(
+            main_module.hash_purchase_token(new_token),
+            snapshot["currentPurchase"]["purchaseTokenHash"],
+        )
+        self.assertEqual(
+            main_module.hash_purchase_token(old_token),
+            snapshot["currentPurchase"]["linkedPurchaseTokenHash"],
+        )
+        self.assertEqual(
+            main_module.hash_purchase_token(old_token),
+            snapshot["linkedPreviousPurchase"]["purchaseTokenHash"],
+        )
+        self.assertEqual(
+            "SUPERSEDED_BY_LINKED_PURCHASE",
+            snapshot["linkedPreviousPurchase"]["supersededReason"],
+        )
+        self.assert_plaintext_absent(snapshot, old_token)
+        self.assert_plaintext_absent(snapshot, new_token)
+
+    def test_billing_support_snapshot_reports_acknowledgement_retry_state(self):
+        purchase_token = "support-ack-retry-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", acknowledgement_required=True),
+        )
+        self.acknowledger.set_result(
+            purchase_token,
+            main_module.GooglePlayVerificationTemporarilyUnavailable(),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        before_counts = self.billing_row_counts()
+
+        db = self.session_local()
+        try:
+            snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual("ACK_RETRYABLE", snapshot["currentPurchase"]["acknowledgementState"])
+        self.assertTrue(snapshot["currentPurchase"]["acknowledgementPending"])
+        self.assertTrue(snapshot["currentPurchase"]["acknowledgementRetryable"])
+        self.assertEqual("ACTIVE", snapshot["entitlement"]["status"])
+        self.assert_plaintext_absent(snapshot, purchase_token)
+
+    def test_billing_support_snapshot_reports_rtdn_evidence_without_raw_token(self):
+        purchase_token = "support-rtdn-evidence-token"
+        self.verifier.set_result(purchase_token, self.verification_result(status="ACTIVE"))
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        self.clock.advance(minutes=2)
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="EXPIRED", expiry_time_ms=1777000000000),
+        )
+        rtdn = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_envelope(
+                message_id="support-rtdn-evidence-message",
+                purchase_token=purchase_token,
+            ),
+            headers=self.rtdn_headers(),
+        )
+        self.assertEqual(200, rtdn.status_code)
+        before_counts = self.billing_row_counts()
+
+        db = self.session_local()
+        try:
+            snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual("EXPIRED", snapshot["entitlement"]["status"])
+        self.assertEqual("EXPIRED", snapshot["currentPurchase"]["googleSubscriptionState"])
+        self.assertEqual(
+            "SUBSCRIPTION_NOTIFICATION_13",
+            snapshot["latestGoogleEvent"]["eventType"],
+        )
+        self.assertEqual(
+            main_module.hash_purchase_token(purchase_token),
+            snapshot["latestGoogleEvent"]["purchaseTokenHash"],
+        )
+        self.assertEqual("REVOKED_OR_EXPIRED", snapshot["latestGoogleEvent"]["processingResult"])
+        self.assertEqual("REVOKED_OR_EXPIRED", snapshot["latestAudit"]["result"])
+        self.assert_plaintext_absent(snapshot, purchase_token)
+
+    def test_support_billing_snapshot_cli_resolves_by_user_email_and_provider_subject(self):
+        purchase_token = "support-cli-identity-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+            ),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        db = self.session_local()
+        try:
+            user_id = self.primary_user_id(db)
+        finally:
+            db.close()
+        before_counts = self.billing_row_counts()
+
+        for argv, expected_kind in (
+            (["--user-id", user_id], "userId"),
+            (["--email", "pilot1@example.com"], "email"),
+            (
+                ["--provider", "static", "--provider-subject", "pilot-1"],
+                "providerSubject",
+            ),
+        ):
+            with self.subTest(argv=argv):
+                result = support_billing_snapshot_script.run(
+                    support_billing_snapshot_script.parse_args(argv),
+                    session_factory=self.session_local,
+                )
+
+                self.assertEqual(before_counts, self.billing_row_counts())
+                self.assertTrue(result["ok"])
+                self.assertEqual(expected_kind, result["lookup"]["kind"])
+                self.assertEqual(user_id, result["snapshot"]["accountOwner"]["userId"])
+                self.assertEqual("BASIC", result["snapshot"]["entitlement"]["tier"])
+                self.assert_plaintext_absent(result, purchase_token)
+
+    def test_support_billing_snapshot_cli_resolves_by_purchase_token_hash(self):
+        purchase_token = "support-cli-token-hash-token"
+        purchase_token_hash = main_module.hash_purchase_token(purchase_token)
+        self.verifier.set_result(purchase_token, self.verification_result(status="ACTIVE"))
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        before_counts = self.billing_row_counts()
+
+        result = support_billing_snapshot_script.run(
+            support_billing_snapshot_script.parse_args(
+                ["--purchase-token-hash", purchase_token_hash]
+            ),
+            session_factory=self.session_local,
+        )
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertTrue(result["ok"])
+        self.assertEqual("purchaseTokenHash", result["lookup"]["kind"])
+        self.assertEqual(purchase_token_hash, result["lookup"]["purchaseTokenHash"])
+        self.assertEqual(
+            purchase_token_hash,
+            result["snapshot"]["currentPurchase"]["purchaseTokenHash"],
+        )
+        self.assert_plaintext_absent(result, purchase_token)
+
+    def test_support_billing_snapshot_cli_rejects_raw_purchase_token_without_mutation(self):
+        purchase_token = "support-cli-raw-token-rejected"
+        self.verifier.set_result(purchase_token, self.verification_result(status="ACTIVE"))
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        before_counts = self.billing_row_counts()
+
+        with self.assertRaises(support_billing_snapshot_script.SupportBillingSnapshotScriptError):
+            support_billing_snapshot_script.run(
+                support_billing_snapshot_script.parse_args(
+                    ["--purchase-token", purchase_token]
+                ),
+                session_factory=self.session_local,
+            )
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+
     def package_headers(
         self,
         token: str | None = None,
@@ -1464,6 +1766,25 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             return db.query(model).one()
         finally:
             db.close()
+
+    def primary_user_id(self, db) -> str:
+        return (
+            db.query(main_module.AuthIdentity)
+            .filter(main_module.AuthIdentity.provider_subject == "pilot-1")
+            .one()
+            .user_id
+        )
+
+    def billing_row_counts(self) -> dict[str, int]:
+        return {
+            "entitlements": self.count_rows(main_module.AccountEntitlementSnapshot),
+            "purchases": self.count_rows(main_module.BillingGooglePurchase),
+            "events": self.count_rows(main_module.BillingGoogleEvent),
+            "audits": self.count_rows(main_module.BillingAuditRecord),
+        }
+
+    def assert_plaintext_absent(self, value, plaintext: str):
+        self.assertNotIn(plaintext, json.dumps(value, default=str))
 
 
 if __name__ == "__main__":

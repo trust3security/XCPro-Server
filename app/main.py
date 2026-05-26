@@ -3725,6 +3725,223 @@ def is_superseded_google_play_purchase(purchase: BillingGooglePurchase) -> bool:
     return purchase.google_subscription_state == "SUPERSEDED_BY_LINKED_PURCHASE"
 
 
+SAFE_BILLING_AUDIT_DETAIL_KEYS = frozenset({
+    "packageName",
+    "productId",
+    "basePlanId",
+    "subscriptionStatus",
+    "acknowledgementRequired",
+    "linkedPurchaseTokenHash",
+    "source",
+    "supersededPurchaseToken",
+    "linkedPurchaseOwnedByDifferentAccount",
+    "ownedByDifferentAccount",
+})
+
+
+def safe_billing_audit_detail(detail_json: Optional[str]) -> dict[str, Any]:
+    if detail_json is None:
+        return {}
+    try:
+        parsed = json.loads(detail_json)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        key: parsed[key]
+        for key in SAFE_BILLING_AUDIT_DETAIL_KEYS
+        if key in parsed
+    }
+
+
+def build_support_entitlement_snapshot(
+    snapshot: Optional[AccountEntitlementSnapshot]
+) -> Optional[dict[str, Any]]:
+    if snapshot is None:
+        return None
+    return {
+        "tier": snapshot.tier,
+        "billingPeriod": snapshot.billing_period,
+        "status": snapshot.status,
+        "source": snapshot.source,
+        "verificationState": snapshot.verification_state,
+        "productId": snapshot.product_id,
+        "basePlanId": snapshot.base_plan_id,
+        "expiryTimeMs": snapshot.expiry_time_ms,
+        "autoRenewing": snapshot.auto_renewing,
+        "willLoseAccessAtMs": snapshot.will_lose_access_at_ms,
+        "verifiedAtMs": snapshot.verified_at_ms,
+        "fetchedAtMs": snapshot.fetched_at_ms,
+        "validUntilMs": snapshot.valid_until_ms,
+        "staleAfterMs": snapshot.stale_after_ms,
+        "hardRefreshAfterMs": snapshot.hard_refresh_after_ms,
+        "recoveryAction": snapshot.recovery_action,
+        "updatedAt": to_iso_utc(snapshot.updated_at),
+    }
+
+
+def build_support_purchase_snapshot(
+    purchase: Optional[BillingGooglePurchase]
+) -> Optional[dict[str, Any]]:
+    if purchase is None:
+        return None
+    acknowledgement_state = purchase.acknowledgement_state
+    return {
+        "productId": purchase.product_id,
+        "basePlanId": purchase.base_plan_id,
+        "purchaseTokenHash": purchase.purchase_token_hash,
+        "linkedPurchaseTokenHash": purchase.linked_purchase_token_hash,
+        "googleSubscriptionState": purchase.google_subscription_state,
+        "xcproSubscriptionStatus": purchase.xcpro_subscription_status,
+        "acknowledgementState": acknowledgement_state,
+        "acknowledgementPending": acknowledgement_state in {
+            "ACK_PENDING",
+            "ACK_RETRYABLE",
+            "ACK_FAILED",
+        },
+        "acknowledgementRetryable": acknowledgement_state == "ACK_RETRYABLE",
+        "expiryTimeMs": purchase.expiry_time_ms,
+        "autoRenewing": purchase.auto_renewing,
+        "lastVerifiedAtMs": purchase.last_verified_at_ms,
+        "supersededReason": (
+            purchase.google_subscription_state
+            if is_superseded_google_play_purchase(purchase)
+            else None
+        ),
+        "updatedAt": to_iso_utc(purchase.updated_at),
+    }
+
+
+def build_support_event_snapshot(
+    event: Optional[BillingGoogleEvent]
+) -> Optional[dict[str, Any]]:
+    if event is None:
+        return None
+    return {
+        "eventType": event.event_type,
+        "packageName": event.package_name,
+        "productId": event.product_id,
+        "purchaseTokenHash": event.purchase_token_hash,
+        "publishedAt": to_iso_utc(event.published_at),
+        "processedAt": to_iso_utc(event.processed_at),
+        "processingResult": event.processing_result,
+        "auditId": event.audit_id,
+        "updatedAt": to_iso_utc(event.updated_at),
+    }
+
+
+def build_support_audit_snapshot(
+    audit: Optional[BillingAuditRecord]
+) -> Optional[dict[str, Any]]:
+    if audit is None:
+        return None
+    return {
+        "auditId": audit.audit_id,
+        "eventType": audit.event_type,
+        "redactedSubject": audit.redacted_subject,
+        "purchaseTokenHash": audit.purchase_token_hash,
+        "result": audit.result,
+        "safeDetail": safe_billing_audit_detail(audit.detail_json),
+        "createdAt": to_iso_utc(audit.created_at),
+    }
+
+
+def select_support_current_purchase(
+    snapshot: Optional[AccountEntitlementSnapshot],
+    purchases: list[BillingGooglePurchase],
+) -> Optional[BillingGooglePurchase]:
+    if not purchases:
+        return None
+    if snapshot is not None and snapshot.product_id is not None and snapshot.base_plan_id is not None:
+        for purchase in purchases:
+            if (
+                purchase.product_id == snapshot.product_id
+                and purchase.base_plan_id == snapshot.base_plan_id
+                and purchase.google_subscription_state == snapshot.status
+                and not is_superseded_google_play_purchase(purchase)
+            ):
+                return purchase
+    for purchase in purchases:
+        if not is_superseded_google_play_purchase(purchase):
+            return purchase
+    return purchases[0]
+
+
+def build_billing_support_snapshot(db, user_id: str) -> dict[str, Any]:
+    user = db.query(User).filter(User.id == user_id).first()
+    auth_identity = (
+        db.query(AuthIdentity)
+        .filter(AuthIdentity.user_id == user_id)
+        .order_by(AuthIdentity.last_seen_at.desc(), AuthIdentity.created_at.desc())
+        .first()
+    )
+    entitlement = (
+        db.query(AccountEntitlementSnapshot)
+        .filter(AccountEntitlementSnapshot.user_id == user_id)
+        .first()
+    )
+    purchases = (
+        db.query(BillingGooglePurchase)
+        .filter(BillingGooglePurchase.user_id == user_id)
+        .order_by(
+            BillingGooglePurchase.last_verified_at_ms.desc(),
+            BillingGooglePurchase.updated_at.desc(),
+        )
+        .all()
+    )
+    current_purchase = select_support_current_purchase(entitlement, purchases)
+    linked_previous_purchase = None
+    if current_purchase is not None and current_purchase.linked_purchase_token_hash is not None:
+        for purchase in purchases:
+            if purchase.purchase_token_hash == current_purchase.linked_purchase_token_hash:
+                linked_previous_purchase = purchase
+                break
+
+    purchase_token_hashes = [purchase.purchase_token_hash for purchase in purchases]
+    latest_event = None
+    if purchase_token_hashes:
+        latest_event = (
+            db.query(BillingGoogleEvent)
+            .filter(BillingGoogleEvent.purchase_token_hash.in_(purchase_token_hashes))
+            .order_by(BillingGoogleEvent.updated_at.desc(), BillingGoogleEvent.created_at.desc())
+            .first()
+        )
+    latest_audit = (
+        db.query(BillingAuditRecord)
+        .filter(BillingAuditRecord.user_id == user_id)
+        .order_by(BillingAuditRecord.created_at.desc())
+        .first()
+    )
+
+    return {
+        "accountOwner": {
+            "userId": user_id,
+            "exists": user is not None,
+            "authProvider": auth_identity.provider if auth_identity is not None else None,
+            "authProviderSubject": (
+                auth_identity.provider_subject if auth_identity is not None else None
+            ),
+            "authProviderEmail": (
+                auth_identity.provider_email if auth_identity is not None else None
+            ),
+        },
+        "entitlement": build_support_entitlement_snapshot(entitlement),
+        "currentPurchase": build_support_purchase_snapshot(current_purchase),
+        "linkedPreviousPurchase": build_support_purchase_snapshot(linked_previous_purchase),
+        "latestGoogleEvent": build_support_event_snapshot(latest_event),
+        "latestAudit": build_support_audit_snapshot(latest_audit),
+        "unavailableMetadata": {
+            "latestOrderId": None,
+            "latestSuccessfulOrderId": None,
+            "regionCode": None,
+            "offerId": None,
+            "testPurchaseFlag": None,
+            "deferredReplacementEvidence": None,
+        },
+    }
+
+
 def verification_state_for_google_play_status(subscription_status: str) -> str:
     if subscription_status == "PENDING":
         return "UNVERIFIED"
