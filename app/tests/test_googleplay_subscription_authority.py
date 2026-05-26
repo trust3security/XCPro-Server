@@ -62,6 +62,24 @@ class FakeGooglePlayVerifier:
             raise main_module.GooglePlayVerificationTemporarilyUnavailable()
         return result
 
+    def verify_subscription_token_only(
+        self,
+        package_name: str,
+        purchase_token: str
+    ):
+        self.calls.append(
+            {
+                "packageName": package_name,
+                "purchaseToken": purchase_token,
+            }
+        )
+        result = self.results_by_token.get(purchase_token)
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise main_module.GooglePlayVerificationTemporarilyUnavailable()
+        return result
+
 
 class FakeGooglePlayAcknowledger:
     def __init__(self, session_local=None):
@@ -304,6 +322,142 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
         self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
 
+    def test_restore_derives_identity_without_android_product_or_base_plan(self):
+        purchase_token = "restore-derived-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_soaring",
+                base_plan_id="annual",
+                acknowledgement_required=True,
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/restore",
+            json=self.restore_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("ACCEPTED_VERIFIED", body["result"])
+        self.assertEqual("SOARING", body["entitlement"]["tier"])
+        self.assertEqual("annual", body["entitlement"]["basePlanId"])
+        self.assertTrue(body["acknowledgementRequired"])
+        self.assertTrue(body["acknowledgementCompleted"])
+        self.assertEqual(
+            [
+                {
+                    "packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                    "purchaseToken": purchase_token,
+                }
+            ],
+            self.verifier.calls,
+        )
+        self.assertEqual(
+            [
+                {
+                    "packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                    "productId": "xcpro_soaring",
+                    "purchaseToken": purchase_token,
+                }
+            ],
+            self.acknowledger.calls,
+        )
+        purchase = self.single_row(main_module.BillingGooglePurchase)
+        self.assertEqual("xcpro_soaring", purchase.product_id)
+        self.assertEqual("annual", purchase.base_plan_id)
+        self.assertEqual("ACTIVE", self.single_row(main_module.AccountEntitlementSnapshot).status)
+
+    def test_restore_forbids_android_authority_fields(self):
+        payload = self.restore_payload(purchase_token="restore-forbidden-authority-token")
+        payload.update(
+            {
+                "productId": "xcpro_basic",
+                "basePlanId": "monthly",
+                "priorProductId": "xcpro_basic",
+                "priorBasePlanId": "annual",
+                "replacementMode": "WITHOUT_PRORATION",
+            }
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/restore",
+            json=payload,
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(422, response.status_code)
+        self.assertEqual([], self.verifier.calls)
+        self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+        self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+
+    def test_restore_rejected_or_pending_verification_fails_closed_without_mutation(self):
+        cases = {
+            "restore-pending-token": self.verification_result(
+                status="PENDING",
+                product_id="xcpro_pro",
+                base_plan_id="monthly",
+            ),
+            "restore-rejected-token": main_module.GooglePlayVerificationRejected(
+                "verified subscription has no supported XCPro product/base plan"
+            ),
+        }
+
+        for purchase_token, result in cases.items():
+            with self.subTest(purchase_token=purchase_token):
+                self.verifier.set_result(purchase_token, result)
+
+                response = self.client.post(
+                    "/api/v1/subscriptions/googleplay/restore",
+                    json=self.restore_payload(purchase_token=purchase_token),
+                    headers=self.package_headers(),
+                )
+
+                self.assertEqual(200, response.status_code)
+                self.assertEqual("ERROR", response.json()["result"])
+                self.assertEqual("CONTACT_SUPPORT", response.json()["recoveryAction"])
+                self.assertEqual("FREE", response.json()["entitlement"]["tier"])
+                self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+                self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+
+    def test_restore_token_owned_by_different_account_does_not_reverify(self):
+        purchase_token = "restore-owned-by-primary-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+            ),
+        )
+        owner_response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, owner_response.status_code)
+        verifier_calls_after_owner_sync = len(self.verifier.calls)
+
+        restore = self.client.post(
+            "/api/v1/subscriptions/googleplay/restore",
+            json=self.restore_payload(purchase_token=purchase_token),
+            headers=self.package_headers(token=self.secondary_bearer_token),
+        )
+
+        self.assertEqual(200, restore.status_code)
+        self.assertEqual("TOKEN_ALREADY_OWNED", restore.json()["result"])
+        self.assertEqual("CHOOSE_CORRECT_ACCOUNT", restore.json()["recoveryAction"])
+        self.assertEqual("FREE", restore.json()["entitlement"]["tier"])
+        self.assertEqual(verifier_calls_after_owner_sync, len(self.verifier.calls))
+        self.assertEqual(1, self.count_rows(main_module.BillingGooglePurchase))
+
     def test_google_play_runtime_config_loads_operational_env(self):
         config = main_module.load_google_play_runtime_config(
             {
@@ -362,6 +516,60 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
         self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
 
+    def test_sync_verifier_rejection_fails_closed_without_paid_mutation(self):
+        purchase_token = "sync-rejected-token"
+        self.verifier.set_result(
+            purchase_token,
+            main_module.GooglePlayVerificationRejected("google rejected purchase"),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("ERROR", response.json()["result"])
+        self.assertEqual("CONTACT_SUPPORT", response.json()["recoveryAction"])
+        self.assertEqual("FREE", response.json()["entitlement"]["tier"])
+        self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+        self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+        audit = self.single_row(main_module.BillingAuditRecord)
+        audit_detail = json.loads(audit.detail_json)
+        self.assertEqual("google rejected purchase", audit_detail["error"])
+
+    def test_sync_verified_contract_mismatch_fails_closed_without_paid_mutation(self):
+        purchase_token = "sync-contract-mismatch-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_pro",
+                base_plan_id="annual",
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("ERROR", response.json()["result"])
+        self.assertEqual("CONTACT_SUPPORT", response.json()["recoveryAction"])
+        self.assertEqual("FREE", response.json()["entitlement"]["tier"])
+        self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+        self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+        audit = self.single_row(main_module.BillingAuditRecord)
+        audit_detail = json.loads(audit.detail_json)
+        self.assertEqual("verified product mismatch", audit_detail["error"])
+
     def test_real_verifier_maps_subscription_v2_states(self):
         api_client = FakeAndroidPublisherApiClient()
         verifier = main_module.GooglePlayPurchaseVerifier(api_client=api_client)
@@ -418,6 +626,129 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
                 )
 
                 self.assertEqual(expected_status, verified.subscription_status)
+
+    def test_token_only_verifier_derives_supported_product_base_plan_pairs(self):
+        api_client = FakeAndroidPublisherApiClient()
+        verifier = main_module.GooglePlayPurchaseVerifier(api_client=api_client)
+
+        for product_id in main_module.PRODUCT_ID_BY_TIER.values():
+            for base_plan_id in main_module.BASE_PLAN_BY_PERIOD.values():
+                with self.subTest(product_id=product_id, base_plan_id=base_plan_id):
+                    purchase_token = f"token-only-{product_id}-{base_plan_id}"
+                    api_client.set_subscription_response(
+                        purchase_token,
+                        self.publisher_subscription_response(
+                            subscription_state="SUBSCRIPTION_STATE_ACTIVE",
+                            product_id=product_id,
+                            base_plan_id=base_plan_id,
+                        ),
+                    )
+
+                    verified = verifier.verify_subscription_token_only(
+                        package_name=main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                        purchase_token=purchase_token,
+                    )
+
+                    self.assertEqual(main_module.XCPRO_RELEASE_PACKAGE_NAME, verified.package_name)
+                    self.assertEqual(product_id, verified.product_id)
+                    self.assertEqual(base_plan_id, verified.base_plan_id)
+                    self.assertEqual("ACTIVE", verified.subscription_status)
+
+        self.assertTrue(api_client.verify_calls)
+        self.assertNotIn("productId", api_client.verify_calls[0])
+
+    def test_token_only_verifier_selects_unique_latest_supported_line_item(self):
+        api_client = FakeAndroidPublisherApiClient()
+        verifier = main_module.GooglePlayPurchaseVerifier(api_client=api_client)
+        purchase_token = "token-only-latest-supported-line-item"
+        response = self.publisher_subscription_response(
+            subscription_state="SUBSCRIPTION_STATE_ACTIVE",
+            product_id="xcpro_basic",
+            base_plan_id="monthly",
+            expiry_time="2026-06-15T10:00:00Z",
+        )
+        response["lineItems"].append(
+            {
+                "productId": "xcpro_pro",
+                "expiryTime": "2026-07-15T10:00:00Z",
+                "autoRenewingPlan": {
+                    "autoRenewEnabled": True,
+                },
+                "offerDetails": {
+                    "basePlanId": "annual",
+                },
+            }
+        )
+        api_client.set_subscription_response(purchase_token, response)
+
+        verified = verifier.verify_subscription_token_only(
+            package_name=main_module.XCPRO_RELEASE_PACKAGE_NAME,
+            purchase_token=purchase_token,
+        )
+
+        self.assertEqual("xcpro_pro", verified.product_id)
+        self.assertEqual("annual", verified.base_plan_id)
+
+    def test_token_only_verifier_rejects_unsupported_or_ambiguous_evidence(self):
+        api_client = FakeAndroidPublisherApiClient()
+        verifier = main_module.GooglePlayPurchaseVerifier(api_client=api_client)
+        cases = {
+            "unknown-product": self.publisher_subscription_response(
+                subscription_state="SUBSCRIPTION_STATE_ACTIVE",
+                product_id="not_xcpro",
+                base_plan_id="monthly",
+            ),
+            "unknown-base-plan": self.publisher_subscription_response(
+                subscription_state="SUBSCRIPTION_STATE_ACTIVE",
+                product_id="xcpro_pro",
+                base_plan_id="weekly",
+            ),
+            "pending": self.publisher_subscription_response(
+                subscription_state="SUBSCRIPTION_STATE_PENDING",
+                product_id="xcpro_pro",
+                base_plan_id="monthly",
+            ),
+            "missing-line-items": {
+                "subscriptionState": "SUBSCRIPTION_STATE_ACTIVE",
+                "acknowledgementState": "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+            },
+            "ambiguous-line-items": {
+                "subscriptionState": "SUBSCRIPTION_STATE_ACTIVE",
+                "acknowledgementState": "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+                "lineItems": [
+                    {
+                        "productId": "xcpro_basic",
+                        "expiryTime": "2026-06-15T10:00:00Z",
+                        "autoRenewingPlan": {
+                            "autoRenewEnabled": True,
+                        },
+                        "offerDetails": {
+                            "basePlanId": "monthly",
+                        },
+                    },
+                    {
+                        "productId": "xcpro_xc",
+                        "expiryTime": "2026-06-15T10:00:00Z",
+                        "autoRenewingPlan": {
+                            "autoRenewEnabled": True,
+                        },
+                        "offerDetails": {
+                            "basePlanId": "annual",
+                        },
+                    },
+                ],
+            },
+        }
+
+        for purchase_token, response in cases.items():
+            with self.subTest(purchase_token=purchase_token):
+                api_client.set_subscription_response(purchase_token, response)
+
+                with self.assertRaises(main_module.GooglePlayVerificationRejected):
+                    verifier.verify_subscription_token_only(
+                        package_name=main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                        purchase_token=purchase_token,
+                    )
 
     def test_real_acknowledger_success_and_transient_failure(self):
         api_client = FakeAndroidPublisherApiClient()
@@ -1642,6 +1973,22 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             "obfuscatedProfileId": "obfuscated-profile",
             "clientSeenAtMs": 1777000000000,
             "appVersionCode": 1,
+        }
+
+    def restore_payload(
+        self,
+        package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME,
+        purchase_token: str = "restore-purchase-token-1",
+    ):
+        return {
+            "packageName": package_name,
+            "purchaseToken": purchase_token,
+            "clientPurchaseState": "PURCHASED",
+            "clientAcknowledged": False,
+            "obfuscatedAccountId": "obfuscated-account",
+            "clientSeenAtMs": 1777000000000,
+            "appVersionCode": 1,
+            "clientProductIds": ["xcpro_pro"],
         }
 
     def verification_result(

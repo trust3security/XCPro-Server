@@ -1740,6 +1740,20 @@ class GooglePlaySyncRequest(BaseModel):
     replacementMode: Optional[str] = None
 
 
+class GooglePlayRestoreRequest(BaseModel):
+    packageName: str
+    purchaseToken: str
+    clientPurchaseState: str
+    clientAcknowledged: bool
+    obfuscatedAccountId: Optional[str] = None
+    clientSeenAtMs: Optional[int] = None
+    appVersionCode: Optional[int] = None
+    clientProductIds: Optional[list[str]] = None
+
+    class Config:
+        extra = "forbid"
+
+
 class GooglePlaySyncResponse(BaseModel):
     result: str
     entitlement: dict[str, Any]
@@ -2120,6 +2134,12 @@ def select_google_play_subscription_line_item(
     )
 
 
+def google_play_line_item_product_id(line_item: Optional[dict[str, Any]]) -> str:
+    if line_item is None:
+        return ""
+    return str(line_item.get("productId", "")).strip()
+
+
 def google_play_line_item_base_plan_id(line_item: Optional[dict[str, Any]]) -> str:
     if line_item is None:
         return ""
@@ -2138,6 +2158,56 @@ def google_play_line_item_auto_renewing(line_item: Optional[dict[str, Any]]) -> 
     if isinstance(line_item.get("prepaidPlan"), dict):
         return False
     return None
+
+
+def google_play_line_item_expiry_time_ms(line_item: Optional[dict[str, Any]]) -> Optional[int]:
+    if line_item is None:
+        return None
+    return parse_google_play_timestamp_ms(line_item.get("expiryTime"))
+
+
+def supported_google_play_subscription_line_items(
+    response_json: dict[str, Any]
+) -> list[dict[str, Any]]:
+    raw_line_items = response_json.get("lineItems")
+    if not isinstance(raw_line_items, list):
+        return []
+    supported: list[dict[str, Any]] = []
+    for item in raw_line_items:
+        if not isinstance(item, dict):
+            continue
+        product_id = google_play_line_item_product_id(item)
+        base_plan_id = google_play_line_item_base_plan_id(item)
+        if product_id in TIER_BY_PRODUCT_ID and base_plan_id in PERIOD_BY_BASE_PLAN:
+            supported.append(item)
+    return supported
+
+
+def select_backend_derived_google_play_subscription_line_item(
+    response_json: dict[str, Any]
+) -> dict[str, Any]:
+    candidates = supported_google_play_subscription_line_items(response_json)
+    if not candidates:
+        raise GooglePlayVerificationRejected(
+            "verified subscription has no supported XCPro product/base plan"
+        )
+    if len(candidates) == 1:
+        return candidates[0]
+
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for item in candidates:
+        expiry_time_ms = google_play_line_item_expiry_time_ms(item)
+        if expiry_time_ms is None:
+            raise GooglePlayVerificationRejected(
+                "verified subscription has ambiguous supported line items"
+            )
+        ranked.append((expiry_time_ms, item))
+    ranked.sort(key=lambda entry: entry[0], reverse=True)
+    if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+        raise GooglePlayVerificationRejected(
+            "verified subscription has ambiguous supported line items"
+        )
+    return ranked[0][1]
 
 
 def map_google_play_subscription_state(
@@ -2221,6 +2291,46 @@ def build_google_play_verification_result_from_subscription_v2(
     )
 
 
+def build_google_play_token_only_verification_result_from_subscription_v2(
+    package_name: str,
+    response_json: dict[str, Any],
+) -> GooglePlayVerificationResult:
+    line_item = select_backend_derived_google_play_subscription_line_item(response_json)
+    product_id = google_play_line_item_product_id(line_item)
+    base_plan_id = google_play_line_item_base_plan_id(line_item)
+    expiry_time_ms = google_play_line_item_expiry_time_ms(line_item)
+    subscription_status = map_google_play_subscription_state(
+        response_json=response_json,
+        expiry_time_ms=expiry_time_ms,
+    )
+    if subscription_status not in PAID_CONTINUITY_STATUSES:
+        raise GooglePlayVerificationRejected(
+            "verified subscription is not in paid continuity"
+        )
+    if expiry_time_ms is None:
+        raise GooglePlayVerificationRejected(
+            "verified paid continuity is missing expiry"
+        )
+    acknowledgement_state = str(
+        response_json.get("acknowledgementState", "")
+    ).strip()
+    linked_purchase_token = str(
+        response_json.get("linkedPurchaseToken", "")
+    ).strip() or None
+    return GooglePlayVerificationResult(
+        package_name=package_name,
+        product_id=product_id,
+        base_plan_id=base_plan_id,
+        subscription_status=subscription_status,
+        expiry_time_ms=expiry_time_ms,
+        auto_renewing=google_play_line_item_auto_renewing(line_item),
+        acknowledgement_required=(
+            acknowledgement_state == "ACKNOWLEDGEMENT_STATE_PENDING"
+        ),
+        linked_purchase_token=linked_purchase_token,
+    )
+
+
 class GooglePlayPurchaseVerifier:
     def __init__(
         self,
@@ -2248,6 +2358,20 @@ class GooglePlayPurchaseVerifier:
         return build_google_play_verification_result_from_subscription_v2(
             package_name=package_name,
             requested_product_id=product_id,
+            response_json=response_json,
+        )
+
+    def verify_subscription_token_only(
+        self,
+        package_name: str,
+        purchase_token: str
+    ) -> GooglePlayVerificationResult:
+        response_json = self._api_client().get_subscription_v2(
+            package_name=package_name,
+            purchase_token=purchase_token,
+        )
+        return build_google_play_token_only_verification_result_from_subscription_v2(
+            package_name=package_name,
             response_json=response_json,
         )
 
@@ -3711,6 +3835,23 @@ def validate_verified_google_play_result(
     return None
 
 
+def validate_backend_derived_google_play_restore_result(
+    request_package_name: str,
+    verified: GooglePlayVerificationResult
+) -> Optional[str]:
+    if verified.package_name != request_package_name:
+        return "verified package mismatch"
+    if verified.product_id not in TIER_BY_PRODUCT_ID:
+        return "verified product is invalid"
+    if verified.base_plan_id not in PERIOD_BY_BASE_PLAN:
+        return "verified base plan is invalid"
+    if verified.subscription_status not in PAID_CONTINUITY_STATUSES:
+        return "verified subscription is not in paid continuity"
+    if verified.expiry_time_ms is None:
+        return "verified paid continuity is missing expiry"
+    return None
+
+
 def google_play_sync_result_for_status(subscription_status: str) -> str:
     if subscription_status == "PENDING":
         return "ACCEPTED_PENDING"
@@ -4108,21 +4249,26 @@ def apply_linked_purchase_token_policy(
     return None, linked_hash
 
 
-def process_google_play_purchase_for_user(
+def google_play_existing_purchase_blocking_outcome(
     db,
     user_id: str,
     package_name: str,
-    product_id: str,
-    base_plan_id: str,
     purchase_token_hash: str,
-    purchase_token: str,
-    event_type: str
-) -> GooglePlayProcessingOutcome:
+    event_type: str,
+    product_id: Optional[str],
+    base_plan_id: Optional[str],
+) -> Optional[GooglePlayProcessingOutcome]:
     existing_purchase = (
         db.query(BillingGooglePurchase)
         .filter(BillingGooglePurchase.purchase_token_hash == purchase_token_hash)
         .first()
     )
+    audit_product_id = product_id
+    audit_base_plan_id = base_plan_id
+    if existing_purchase is not None:
+        audit_product_id = audit_product_id or existing_purchase.product_id
+        audit_base_plan_id = audit_base_plan_id or existing_purchase.base_plan_id
+
     if existing_purchase is not None and existing_purchase.user_id != user_id:
         audit_id = create_billing_audit_record(
             db=db,
@@ -4132,8 +4278,8 @@ def process_google_play_purchase_for_user(
             result="TOKEN_ALREADY_OWNED",
             detail={
                 "packageName": package_name,
-                "productId": product_id,
-                "basePlanId": base_plan_id,
+                "productId": audit_product_id,
+                "basePlanId": audit_base_plan_id,
                 "ownedByDifferentAccount": True,
             },
         )
@@ -4156,8 +4302,8 @@ def process_google_play_purchase_for_user(
             result="SUPERSEDED_PURCHASE_IGNORED",
             detail={
                 "packageName": package_name,
-                "productId": product_id,
-                "basePlanId": base_plan_id,
+                "productId": audit_product_id,
+                "basePlanId": audit_base_plan_id,
                 "supersededPurchaseToken": True,
             },
         )
@@ -4170,6 +4316,148 @@ def process_google_play_purchase_for_user(
             acknowledgement_retry_after_ms=None,
             recovery_action="NONE",
         )
+    return None
+
+
+def process_verified_google_play_purchase_for_user(
+    db,
+    user_id: str,
+    package_name: str,
+    purchase_token_hash: str,
+    purchase_token: str,
+    verified: GooglePlayVerificationResult,
+    event_type: str
+) -> GooglePlayProcessingOutcome:
+    existing_outcome = google_play_existing_purchase_blocking_outcome(
+        db=db,
+        user_id=user_id,
+        package_name=package_name,
+        purchase_token_hash=purchase_token_hash,
+        event_type=event_type,
+        product_id=verified.product_id,
+        base_plan_id=verified.base_plan_id,
+    )
+    if existing_outcome is not None:
+        return existing_outcome
+
+    linked_outcome, linked_hash = apply_linked_purchase_token_policy(
+        db=db,
+        user_id=user_id,
+        purchase_token_hash=purchase_token_hash,
+        verified=verified,
+        event_type=event_type,
+    )
+    if linked_outcome is not None:
+        return linked_outcome
+
+    result = google_play_sync_result_for_status(verified.subscription_status)
+    should_acknowledge = (
+        verified.acknowledgement_required
+        and verified.subscription_status in PAID_CONTINUITY_STATUSES
+    )
+    acknowledgement_state = (
+        "ACK_PENDING"
+        if verified.acknowledgement_required
+        else "NOT_REQUIRED"
+    )
+    fetched_at_ms = to_epoch_ms(utcnow())
+    purchase = upsert_google_play_purchase_from_result(
+        db=db,
+        user_id=user_id,
+        package_name=package_name,
+        purchase_token_hash=purchase_token_hash,
+        verified=verified,
+        fetched_at_ms=fetched_at_ms,
+        acknowledgement_state=acknowledgement_state,
+    )
+    write_entitlement_snapshot_from_google_play_result(
+        db=db,
+        user_id=user_id,
+        verified=verified,
+        fetched_at_ms=fetched_at_ms,
+    )
+    audit_id = create_billing_audit_record(
+        db=db,
+        user_id=user_id,
+        event_type=event_type,
+        purchase_token_hash=purchase_token_hash,
+        result=result,
+        detail={
+            "packageName": package_name,
+            "productId": verified.product_id,
+            "basePlanId": verified.base_plan_id,
+            "subscriptionStatus": verified.subscription_status,
+            "acknowledgementRequired": verified.acknowledgement_required,
+            "linkedPurchaseTokenHash": linked_hash,
+        },
+    )
+    db.commit()
+
+    acknowledgement_completed = False
+    acknowledgement_retry_after_ms = None
+    acknowledgement_transient_failure = False
+    if should_acknowledge:
+        try:
+            acknowledgement_completed = GOOGLE_PLAY_PURCHASE_ACKNOWLEDGER.acknowledge_subscription(
+                package_name=package_name,
+                product_id=verified.product_id,
+                purchase_token=purchase_token,
+            )
+        except GooglePlayVerificationTemporarilyUnavailable:
+            acknowledgement_completed = False
+            acknowledgement_transient_failure = True
+
+        purchase = (
+            db.query(BillingGooglePurchase)
+            .filter(BillingGooglePurchase.id == purchase.id)
+            .first()
+        )
+        if purchase is not None:
+            purchase.acknowledgement_state = (
+                "ACKNOWLEDGED"
+                if acknowledgement_completed
+                else (
+                    "ACK_RETRYABLE"
+                    if acknowledgement_transient_failure
+                    else "ACK_FAILED"
+                )
+            )
+            purchase.updated_at = utcnow()
+            db.commit()
+        if not acknowledgement_completed:
+            acknowledgement_retry_after_ms = DENIED_ENTITLEMENT_STALE_AFTER_MS
+
+    return GooglePlayProcessingOutcome(
+        result=result,
+        audit_id=audit_id,
+        acknowledgement_required=verified.acknowledgement_required,
+        acknowledgement_completed=acknowledgement_completed,
+        acknowledgement_retry_after_ms=acknowledgement_retry_after_ms,
+        recovery_action="NONE",
+    )
+
+
+def process_google_play_purchase_for_user(
+    db,
+    user_id: str,
+    package_name: str,
+    product_id: str,
+    base_plan_id: str,
+    purchase_token_hash: str,
+    purchase_token: str,
+    event_type: str
+) -> GooglePlayProcessingOutcome:
+    existing_outcome = google_play_existing_purchase_blocking_outcome(
+        db=db,
+        user_id=user_id,
+        package_name=package_name,
+        purchase_token_hash=purchase_token_hash,
+        event_type=event_type,
+        product_id=product_id,
+        base_plan_id=base_plan_id,
+    )
+    if existing_outcome is not None:
+        return existing_outcome
 
     try:
         verified = GOOGLE_PLAY_PURCHASE_VERIFIER.verify_subscription(
@@ -4253,100 +4541,123 @@ def process_google_play_purchase_for_user(
             recovery_action="CONTACT_SUPPORT",
         )
 
-    linked_outcome, linked_hash = apply_linked_purchase_token_policy(
-        db=db,
-        user_id=user_id,
-        purchase_token_hash=purchase_token_hash,
-        verified=verified,
-        event_type=event_type,
-    )
-    if linked_outcome is not None:
-        return linked_outcome
-
-    result = google_play_sync_result_for_status(verified.subscription_status)
-    should_acknowledge = (
-        verified.acknowledgement_required
-        and verified.subscription_status in PAID_CONTINUITY_STATUSES
-    )
-    acknowledgement_state = (
-        "ACK_PENDING"
-        if verified.acknowledgement_required
-        else "NOT_REQUIRED"
-    )
-    fetched_at_ms = to_epoch_ms(utcnow())
-    purchase = upsert_google_play_purchase_from_result(
+    return process_verified_google_play_purchase_for_user(
         db=db,
         user_id=user_id,
         package_name=package_name,
         purchase_token_hash=purchase_token_hash,
+        purchase_token=purchase_token,
         verified=verified,
-        fetched_at_ms=fetched_at_ms,
-        acknowledgement_state=acknowledgement_state,
-    )
-    write_entitlement_snapshot_from_google_play_result(
-        db=db,
-        user_id=user_id,
-        verified=verified,
-        fetched_at_ms=fetched_at_ms,
-    )
-    audit_id = create_billing_audit_record(
-        db=db,
-        user_id=user_id,
         event_type=event_type,
-        purchase_token_hash=purchase_token_hash,
-        result=result,
-        detail={
-            "packageName": package_name,
-            "productId": product_id,
-            "basePlanId": base_plan_id,
-            "subscriptionStatus": verified.subscription_status,
-            "acknowledgementRequired": verified.acknowledgement_required,
-            "linkedPurchaseTokenHash": linked_hash,
-        },
     )
-    db.commit()
 
-    acknowledgement_completed = False
-    acknowledgement_retry_after_ms = None
-    acknowledgement_transient_failure = False
-    if should_acknowledge:
-        try:
-            acknowledgement_completed = GOOGLE_PLAY_PURCHASE_ACKNOWLEDGER.acknowledge_subscription(
-                package_name=package_name,
-                product_id=product_id,
-                purchase_token=purchase_token,
-            )
-        except GooglePlayVerificationTemporarilyUnavailable:
-            acknowledgement_completed = False
-            acknowledgement_transient_failure = True
 
-        purchase = (
-            db.query(BillingGooglePurchase)
-            .filter(BillingGooglePurchase.id == purchase.id)
-            .first()
+def process_google_play_restore_for_user(
+    db,
+    user_id: str,
+    package_name: str,
+    purchase_token_hash: str,
+    purchase_token: str,
+    event_type: str
+) -> GooglePlayProcessingOutcome:
+    existing_outcome = google_play_existing_purchase_blocking_outcome(
+        db=db,
+        user_id=user_id,
+        package_name=package_name,
+        purchase_token_hash=purchase_token_hash,
+        event_type=event_type,
+        product_id=None,
+        base_plan_id=None,
+    )
+    if existing_outcome is not None:
+        return existing_outcome
+
+    try:
+        verified = GOOGLE_PLAY_PURCHASE_VERIFIER.verify_subscription_token_only(
+            package_name=package_name,
+            purchase_token=purchase_token,
         )
-        if purchase is not None:
-            purchase.acknowledgement_state = (
-                "ACKNOWLEDGED"
-                if acknowledgement_completed
-                else (
-                    "ACK_RETRYABLE"
-                    if acknowledgement_transient_failure
-                    else "ACK_FAILED"
-                )
-            )
-            purchase.updated_at = utcnow()
-            db.commit()
-        if not acknowledgement_completed:
-            acknowledgement_retry_after_ms = DENIED_ENTITLEMENT_STALE_AFTER_MS
+    except GooglePlayVerificationTemporarilyUnavailable:
+        audit_id = create_billing_audit_record(
+            db=db,
+            user_id=user_id,
+            event_type=event_type,
+            purchase_token_hash=purchase_token_hash,
+            result="VERIFICATION_TEMPORARILY_UNAVAILABLE",
+            detail={
+                "packageName": package_name,
+                "source": "RESTORE",
+            },
+        )
+        db.commit()
+        return GooglePlayProcessingOutcome(
+            result="VERIFICATION_TEMPORARILY_UNAVAILABLE",
+            audit_id=audit_id,
+            acknowledgement_required=False,
+            acknowledgement_completed=False,
+            acknowledgement_retry_after_ms=DENIED_ENTITLEMENT_STALE_AFTER_MS,
+            recovery_action="RETRY_LATER",
+        )
+    except GooglePlayVerificationRejected as exc:
+        audit_id = create_billing_audit_record(
+            db=db,
+            user_id=user_id,
+            event_type=event_type,
+            purchase_token_hash=purchase_token_hash,
+            result="ERROR",
+            detail={
+                "packageName": package_name,
+                "error": str(exc),
+                "source": "RESTORE",
+            },
+        )
+        db.commit()
+        return GooglePlayProcessingOutcome(
+            result="ERROR",
+            audit_id=audit_id,
+            acknowledgement_required=False,
+            acknowledgement_completed=False,
+            acknowledgement_retry_after_ms=None,
+            recovery_action="CONTACT_SUPPORT",
+        )
 
-    return GooglePlayProcessingOutcome(
-        result=result,
-        audit_id=audit_id,
-        acknowledgement_required=verified.acknowledgement_required,
-        acknowledgement_completed=acknowledgement_completed,
-        acknowledgement_retry_after_ms=acknowledgement_retry_after_ms,
-        recovery_action="NONE",
+    contract_error = validate_backend_derived_google_play_restore_result(
+        request_package_name=package_name,
+        verified=verified,
+    )
+    if contract_error is not None:
+        audit_id = create_billing_audit_record(
+            db=db,
+            user_id=user_id,
+            event_type=event_type,
+            purchase_token_hash=purchase_token_hash,
+            result="ERROR",
+            detail={
+                "packageName": package_name,
+                "productId": verified.product_id,
+                "basePlanId": verified.base_plan_id,
+                "error": contract_error,
+                "source": "RESTORE",
+            },
+        )
+        db.commit()
+        return GooglePlayProcessingOutcome(
+            result="ERROR",
+            audit_id=audit_id,
+            acknowledgement_required=False,
+            acknowledgement_completed=False,
+            acknowledgement_retry_after_ms=None,
+            recovery_action="CONTACT_SUPPORT",
+        )
+
+    return process_verified_google_play_purchase_for_user(
+        db=db,
+        user_id=user_id,
+        package_name=package_name,
+        purchase_token_hash=purchase_token_hash,
+        purchase_token=purchase_token,
+        verified=verified,
+        event_type=event_type,
     )
 
 
@@ -7025,6 +7336,46 @@ def sync_google_play_subscription(
             purchase_token_hash=purchase_token_hash,
             purchase_token=request.purchaseToken,
             event_type="GOOGLE_PLAY_SYNC",
+        )
+        return build_google_play_sync_response(
+            result=outcome.result,
+            entitlement_response=build_entitlement_response(db, current_user),
+            acknowledgement_required=outcome.acknowledgement_required,
+            acknowledgement_completed=outcome.acknowledgement_completed,
+            acknowledgement_retry_after_ms=outcome.acknowledgement_retry_after_ms,
+            recovery_action=outcome.recovery_action,
+            audit_id=outcome.audit_id,
+        )
+    finally:
+        db.close()
+
+
+@app.post(
+    "/api/v1/subscriptions/googleplay/restore",
+    response_model=GooglePlaySyncResponse
+)
+def restore_google_play_subscription(
+    request: GooglePlayRestoreRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        purchase_token_hash = hash_purchase_token(request.purchaseToken)
+        resolved_package_name = validate_google_play_package_context(
+            header_package_name=package_name,
+            request_package_name=request.packageName,
+        )
+        validate_google_play_client_purchase_state(request.clientPurchaseState)
+
+        outcome = process_google_play_restore_for_user(
+            db=db,
+            user_id=current_user.user.id,
+            package_name=resolved_package_name,
+            purchase_token_hash=purchase_token_hash,
+            purchase_token=request.purchaseToken,
+            event_type="GOOGLE_PLAY_RESTORE",
         )
         return build_google_play_sync_response(
             result=outcome.result,
