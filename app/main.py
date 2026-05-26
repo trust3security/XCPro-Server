@@ -191,6 +191,7 @@ GOOGLE_PLAY_SYNC_RESULT_VALUES = frozenset({
     "CANONICAL_FREE",
     "ACCOUNT_MISMATCH",
     "TOKEN_ALREADY_OWNED",
+    "SUPERSEDED_PURCHASE_IGNORED",
     "INVALID_PRODUCT",
     "INVALID_BASE_PLAN",
     "INVALID_PACKAGE",
@@ -223,6 +224,7 @@ GOOGLE_PLAY_RTDN_PROCESSING_RESULTS = frozenset({
     "ACCEPTED_PENDING",
     "REVOKED_OR_EXPIRED",
     "TOKEN_NOT_OWNED",
+    "SUPERSEDED_PURCHASE_IGNORED",
     "INVALID_PRODUCT",
     "INVALID_BASE_PLAN",
     "INVALID_PACKAGE",
@@ -3719,6 +3721,10 @@ def google_play_sync_result_for_status(subscription_status: str) -> str:
     return "ACCEPTED_VERIFIED"
 
 
+def is_superseded_google_play_purchase(purchase: BillingGooglePurchase) -> bool:
+    return purchase.google_subscription_state == "SUPERSEDED_BY_LINKED_PURCHASE"
+
+
 def verification_state_for_google_play_status(subscription_status: str) -> str:
     if subscription_status == "PENDING":
         return "UNVERIFIED"
@@ -3922,6 +3928,30 @@ def process_google_play_purchase_for_user(
             acknowledgement_completed=False,
             acknowledgement_retry_after_ms=None,
             recovery_action="CHOOSE_CORRECT_ACCOUNT",
+        )
+
+    if existing_purchase is not None and is_superseded_google_play_purchase(existing_purchase):
+        audit_id = create_billing_audit_record(
+            db=db,
+            user_id=user_id,
+            event_type=event_type,
+            purchase_token_hash=purchase_token_hash,
+            result="SUPERSEDED_PURCHASE_IGNORED",
+            detail={
+                "packageName": package_name,
+                "productId": product_id,
+                "basePlanId": base_plan_id,
+                "supersededPurchaseToken": True,
+            },
+        )
+        db.commit()
+        return GooglePlayProcessingOutcome(
+            result="SUPERSEDED_PURCHASE_IGNORED",
+            audit_id=audit_id,
+            acknowledgement_required=False,
+            acknowledgement_completed=False,
+            acknowledgement_retry_after_ms=None,
+            recovery_action="NONE",
         )
 
     try:

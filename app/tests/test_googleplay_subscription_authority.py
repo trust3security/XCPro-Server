@@ -614,6 +614,105 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_late_rtdn_for_superseded_linked_purchase_does_not_overwrite_active_entitlement(self):
+        old_token = "linked-late-rtdn-old-basic-token"
+        new_token = "linked-late-rtdn-new-basic-token"
+        self.verifier.set_result(
+            old_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+            ),
+        )
+        old_response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=old_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, old_response.status_code)
+        self.assertEqual("ACTIVE", old_response.json()["entitlement"]["status"])
+
+        self.verifier.set_result(
+            new_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                linked_purchase_token=old_token,
+            ),
+        )
+        new_response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                purchase_token=new_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, new_response.status_code)
+        self.assertEqual("ACCEPTED_VERIFIED", new_response.json()["result"])
+        self.assertEqual("BASIC", new_response.json()["entitlement"]["tier"])
+        self.assertEqual("ACTIVE", new_response.json()["entitlement"]["status"])
+        verifier_calls_after_replacement = len(self.verifier.calls)
+
+        self.verifier.set_result(
+            old_token,
+            self.verification_result(
+                status="SUSPENDED",
+                product_id="xcpro_basic",
+                base_plan_id="monthly",
+                expiry_time_ms=1777000000000,
+                auto_renewing=False,
+            ),
+        )
+        late_old_rtdn = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_envelope(
+                message_id="late-old-basic-linked-token",
+                purchase_token=old_token,
+                product_id="xcpro_basic",
+            ),
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, late_old_rtdn.status_code)
+        self.assertEqual("SUPERSEDED_PURCHASE_IGNORED", late_old_rtdn.json()["result"])
+        self.assertEqual(verifier_calls_after_replacement, len(self.verifier.calls))
+        entitlement_response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, entitlement_response.status_code)
+        entitlement = entitlement_response.json()["entitlement"]
+        self.assertEqual("BASIC", entitlement["tier"])
+        self.assertEqual("ACTIVE", entitlement["status"])
+        self.assertEqual("monthly", entitlement["basePlanId"])
+
+        db = self.session_local()
+        try:
+            old_purchase = (
+                db.query(main_module.BillingGooglePurchase)
+                .filter(
+                    main_module.BillingGooglePurchase.purchase_token_hash
+                    == main_module.hash_purchase_token(old_token)
+                )
+                .one()
+            )
+            event = self.single_row(main_module.BillingGoogleEvent)
+            self.assertEqual(
+                "SUPERSEDED_BY_LINKED_PURCHASE",
+                old_purchase.google_subscription_state,
+            )
+            self.assertEqual("SUPERSEDED_PURCHASE_IGNORED", event.processing_result)
+        finally:
+            db.close()
+
     def test_linked_purchase_token_different_account_denies_paid_grant(self):
         old_token = "linked-different-account-old-token"
         new_token = "linked-different-account-new-token"
