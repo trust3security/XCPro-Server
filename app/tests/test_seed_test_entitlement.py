@@ -58,7 +58,7 @@ class SeedTestEntitlementScriptTest(unittest.TestCase):
             self.assertEqual("GOOGLE_PLAY", snapshot.source)
             self.assertEqual("VERIFIED", snapshot.verification_state)
             self.assertEqual("xcpro_soaring", snapshot.product_id)
-            self.assertEqual("monthly", snapshot.base_plan_id)
+            self.assertEqual("monthly-auto2", snapshot.base_plan_id)
             self.assertIsNotNone(snapshot.valid_until_ms)
         finally:
             db.close()

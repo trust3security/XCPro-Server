@@ -322,6 +322,92 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
         self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
 
+    def test_canonical_base_plans_are_current_and_legacy_ids_remain_readback_supported(self):
+        self.assertEqual("monthly-auto2", main_module.BASE_PLAN_BY_PERIOD["MONTHLY"])
+        self.assertEqual("annual-auto2", main_module.BASE_PLAN_BY_PERIOD["ANNUAL"])
+        expected_periods = {
+            "monthly-auto2": "MONTHLY",
+            "annual-auto2": "ANNUAL",
+            "monthly": "MONTHLY",
+            "annual": "ANNUAL",
+            "monthly-auto": "MONTHLY",
+            "annual-auto": "ANNUAL",
+        }
+        self.assertEqual(expected_periods, main_module.PERIOD_BY_BASE_PLAN)
+
+    def test_sync_accepts_canonical_base_plan_and_stores_verified_exact_id(self):
+        purchase_token = "canonical-monthly-auto2-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_pro",
+                base_plan_id="monthly-auto2",
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_pro",
+                base_plan_id="monthly-auto2",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("ACCEPTED_VERIFIED", body["result"])
+        self.assertEqual("MONTHLY", body["entitlement"]["billingPeriod"])
+        self.assertEqual("monthly-auto2", body["entitlement"]["basePlanId"])
+        self.assertEqual("monthly-auto2", self.single_row(
+            main_module.AccountEntitlementSnapshot
+        ).base_plan_id)
+        self.assertEqual("monthly-auto2", self.single_row(
+            main_module.BillingGooglePurchase
+        ).base_plan_id)
+
+    def test_sync_acknowledges_canonical_annual_base_plan_after_verification(self):
+        purchase_token = "canonical-annual-auto2-ack-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_basic",
+                base_plan_id="annual-auto2",
+                acknowledgement_required=True,
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_basic",
+                base_plan_id="annual-auto2",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("ACCEPTED_VERIFIED", body["result"])
+        self.assertEqual("BASIC", body["entitlement"]["tier"])
+        self.assertEqual("ANNUAL", body["entitlement"]["billingPeriod"])
+        self.assertEqual("annual-auto2", body["entitlement"]["basePlanId"])
+        self.assertTrue(body["acknowledgementRequired"])
+        self.assertTrue(body["acknowledgementCompleted"])
+        self.assertEqual(
+            [{"packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+              "productId": "xcpro_basic",
+              "purchaseToken": purchase_token}],
+            self.acknowledger.calls,
+        )
+        purchase = self.single_row(main_module.BillingGooglePurchase)
+        self.assertEqual("annual-auto2", purchase.base_plan_id)
+        self.assertEqual("ACKNOWLEDGED", purchase.acknowledgement_state)
+
     def test_restore_derives_identity_without_android_product_or_base_plan(self):
         purchase_token = "restore-derived-token"
         self.verifier.set_result(
@@ -569,6 +655,37 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         audit = self.single_row(main_module.BillingAuditRecord)
         audit_detail = json.loads(audit.detail_json)
         self.assertEqual("verified product mismatch", audit_detail["error"])
+
+    def test_sync_verified_base_plan_mismatch_fails_closed_without_paid_mutation(self):
+        purchase_token = "sync-base-plan-mismatch-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_pro",
+                base_plan_id="monthly",
+            ),
+        )
+
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_pro",
+                base_plan_id="monthly-auto2",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("ERROR", response.json()["result"])
+        self.assertEqual("CONTACT_SUPPORT", response.json()["recoveryAction"])
+        self.assertEqual("FREE", response.json()["entitlement"]["tier"])
+        self.assertEqual(0, self.count_rows(main_module.AccountEntitlementSnapshot))
+        self.assertEqual(0, self.count_rows(main_module.BillingGooglePurchase))
+        audit = self.single_row(main_module.BillingAuditRecord)
+        audit_detail = json.loads(audit.detail_json)
+        self.assertEqual("verified base plan mismatch", audit_detail["error"])
 
     def test_real_verifier_maps_subscription_v2_states(self):
         api_client = FakeAndroidPublisherApiClient()

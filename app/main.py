@@ -152,10 +152,16 @@ PRODUCT_ID_BY_TIER = {
 }
 TIER_BY_PRODUCT_ID = {product_id: tier for tier, product_id in PRODUCT_ID_BY_TIER.items()}
 BASE_PLAN_BY_PERIOD = {
-    "MONTHLY": "monthly",
-    "ANNUAL": "annual",
+    "MONTHLY": "monthly-auto2",
+    "ANNUAL": "annual-auto2",
+}
+LEGACY_BASE_PLANS_BY_PERIOD = {
+    "MONTHLY": frozenset({"monthly", "monthly-auto"}),
+    "ANNUAL": frozenset({"annual", "annual-auto"}),
 }
 PERIOD_BY_BASE_PLAN = {base_plan_id: period for period, base_plan_id in BASE_PLAN_BY_PERIOD.items()}
+for period, base_plan_ids in LEGACY_BASE_PLANS_BY_PERIOD.items():
+    PERIOD_BY_BASE_PLAN.update({base_plan_id: period for base_plan_id in base_plan_ids})
 PAID_CONTINUITY_STATUSES = frozenset({"ACTIVE", "GRACE_PERIOD", "CANCELED_BUT_ACTIVE"})
 DENIED_SUBSCRIPTION_STATUSES = frozenset({
     "PENDING",
@@ -3081,14 +3087,14 @@ def require_stored_entitlement_contract(snapshot: AccountEntitlementSnapshot) ->
         }
 
     expected_product_id = PRODUCT_ID_BY_TIER.get(tier)
-    expected_base_plan_id = BASE_PLAN_BY_PERIOD.get(billing_period)
-    if source != "GOOGLE_PLAY" or expected_product_id is None or expected_base_plan_id is None:
+    stored_base_plan_period = PERIOD_BY_BASE_PLAN.get(snapshot.base_plan_id)
+    if source != "GOOGLE_PLAY" or expected_product_id is None or stored_base_plan_period is None:
         raise ApiHTTPException(
             status_code=500,
             code=ErrorCode.ENTITLEMENT_STATE_INVALID,
             detail="stored paid entitlement product context is invalid"
         )
-    if snapshot.product_id != expected_product_id or snapshot.base_plan_id != expected_base_plan_id:
+    if snapshot.product_id != expected_product_id or stored_base_plan_period != billing_period:
         raise ApiHTTPException(
             status_code=500,
             code=ErrorCode.ENTITLEMENT_STATE_INVALID,
