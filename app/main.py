@@ -294,6 +294,8 @@ class ErrorCode:
     ENTITLEMENT_STATE_INVALID = "entitlement_state_invalid"
     INVALID_GOOGLE_ID_TOKEN = "invalid_google_id_token"
     INVALID_FIREBASE_ID_TOKEN = "invalid_firebase_id_token"
+    EMAIL_VERIFICATION_REQUIRED = "email_verification_required"
+    AUTH_RECOVERY_REQUIRED = "auth_recovery_required"
     SESSION_NOT_FOUND = "session_not_found"
     MISSING_SESSION_TOKEN = "missing_session_token"
     SESSION_TOKEN_UNAVAILABLE = "session_token_unavailable"
@@ -1968,6 +1970,10 @@ class GoogleAuthExchangeRequest(BaseModel):
     google_id_token: str
 
 
+class FirebaseAuthExchangeRequest(BaseModel):
+    firebase_id_token: str
+
+
 class FollowRequestCreateRequest(BaseModel):
     target_user_id: str
 
@@ -3197,6 +3203,124 @@ def ensure_current_user_record_for_identity(
     )
 
 
+FIREBASE_EMAIL_PASSWORD_SIGN_IN_PROVIDERS = frozenset({"password", "email-password"})
+
+
+def build_firebase_bearer_identity(
+    identity: ResolvedFirebaseIdentity
+) -> ResolvedBearerIdentity:
+    return ResolvedBearerIdentity(
+        provider="firebase",
+        provider_subject=identity.firebase_uid,
+        email=identity.email,
+        display_name=identity.display_name
+    )
+
+
+def single_firebase_google_provider_subject(
+    identity: ResolvedFirebaseIdentity
+) -> Optional[str]:
+    google_subjects = [
+        str(provider_subject or "").strip()
+        for provider_subject in identity.provider_identities.get("google.com", [])
+        if str(provider_subject or "").strip()
+    ]
+    if len(google_subjects) != 1:
+        return None
+    return google_subjects[0]
+
+
+def find_auth_identity(db, provider: str, provider_subject: str) -> Optional[AuthIdentity]:
+    return (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider == provider,
+            AuthIdentity.provider_subject == provider_subject
+        )
+        .first()
+    )
+
+
+def create_auth_identity_for_user(
+    db,
+    user_id: str,
+    identity: ResolvedBearerIdentity
+) -> AuthIdentity:
+    now = utcnow()
+    auth_identity = AuthIdentity(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        provider=identity.provider,
+        provider_subject=identity.provider_subject,
+        provider_email=trim_to_none(identity.email),
+        created_at=now,
+        updated_at=now,
+        last_seen_at=now
+    )
+    db.add(auth_identity)
+    db.flush()
+    return auth_identity
+
+
+def find_verified_email_non_firebase_conflict(
+    db,
+    email: Optional[str]
+) -> Optional[AuthIdentity]:
+    normalized_email = trim_to_none(email)
+    if normalized_email is None:
+        return None
+    return (
+        db.query(AuthIdentity)
+        .filter(
+            AuthIdentity.provider != "firebase",
+            AuthIdentity.provider_email.isnot(None),
+            func.lower(AuthIdentity.provider_email) == normalized_email.lower()
+        )
+        .first()
+    )
+
+
+def ensure_current_user_record_for_firebase_identity(
+    db,
+    firebase_identity: ResolvedFirebaseIdentity
+) -> CurrentUserRecord:
+    bearer_identity = build_firebase_bearer_identity(firebase_identity)
+    existing_firebase_identity = find_auth_identity(
+        db,
+        bearer_identity.provider,
+        bearer_identity.provider_subject
+    )
+    if existing_firebase_identity is not None:
+        return ensure_current_user_record_for_identity(db, bearer_identity)
+
+    google_provider_subject = single_firebase_google_provider_subject(firebase_identity)
+    if google_provider_subject is not None:
+        legacy_google_identity = find_auth_identity(
+            db,
+            "google",
+            google_provider_subject
+        )
+        if legacy_google_identity is not None:
+            create_auth_identity_for_user(
+                db,
+                legacy_google_identity.user_id,
+                bearer_identity
+            )
+            return ensure_current_user_record_for_identity(db, bearer_identity)
+
+    if (
+        firebase_identity.email_verified and
+        find_verified_email_non_firebase_conflict(db, firebase_identity.email) is not None
+    ):
+        raise ApiHTTPException(
+            status_code=409,
+            code=ErrorCode.AUTH_RECOVERY_REQUIRED,
+            detail="account recovery is required"
+        )
+
+    return ensure_current_user_record_for_identity(db, bearer_identity)
+
+
 def build_profile_response(profile: PilotProfile) -> dict[str, Optional[str]]:
     return {
         "user_id": profile.user_id,
@@ -3240,6 +3364,20 @@ def build_google_auth_exchange_response(
         "access_token": access_token,
         "token_type": "Bearer",
         "auth_method": "google",
+        "user_id": current_user.user.id,
+        "expires_at": to_iso_utc(expires_at)
+    }
+
+
+def build_firebase_auth_exchange_response(
+    current_user: CurrentUserRecord,
+    access_token: str
+) -> dict[str, Any]:
+    expires_at = utcnow() + timedelta(seconds=PRIVATE_FOLLOW_BEARER_TTL_SECONDS)
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "auth_method": "firebase",
         "user_id": current_user.user.id,
         "expires_at": to_iso_utc(expires_at)
     }
@@ -7476,6 +7614,49 @@ def exchange_google_auth_token(
         current_user = ensure_current_user_record_for_identity(db, identity)
         access_token = issue_private_follow_bearer(identity)
         return build_google_auth_exchange_response(current_user, access_token)
+    finally:
+        db.close()
+
+
+@app.post("/api/v2/auth/firebase/exchange")
+def exchange_firebase_auth_token(
+    request: FirebaseAuthExchangeRequest
+):
+    trimmed_token = request.firebase_id_token.strip()
+    if not trimmed_token:
+        raise invalid_firebase_id_token_exception(
+            status_code=422,
+            detail="firebase_id_token is required"
+        )
+
+    if not callable(FIREBASE_ID_TOKEN_VERIFIER):
+        raise firebase_auth_unavailable_exception(
+            "Firebase Auth verifier is unavailable"
+        )
+
+    firebase_identity = FIREBASE_ID_TOKEN_VERIFIER(trimmed_token)
+    if firebase_identity is None:
+        raise invalid_firebase_id_token_exception()
+
+    if (
+        firebase_identity.sign_in_provider in FIREBASE_EMAIL_PASSWORD_SIGN_IN_PROVIDERS and
+        not firebase_identity.email_verified
+    ):
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.EMAIL_VERIFICATION_REQUIRED,
+            detail="email verification is required"
+        )
+
+    bearer_identity = build_firebase_bearer_identity(firebase_identity)
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record_for_firebase_identity(
+            db,
+            firebase_identity
+        )
+        access_token = issue_private_follow_bearer(bearer_identity)
+        return build_firebase_auth_exchange_response(current_user, access_token)
     finally:
         db.close()
 
