@@ -3370,6 +3370,7 @@ def build_google_auth_exchange_response(
 
 
 def build_firebase_auth_exchange_response(
+    db,
     current_user: CurrentUserRecord,
     access_token: str
 ) -> dict[str, Any]:
@@ -3379,7 +3380,9 @@ def build_firebase_auth_exchange_response(
         "token_type": "Bearer",
         "auth_method": "firebase",
         "user_id": current_user.user.id,
-        "expires_at": to_iso_utc(expires_at)
+        "expires_at": to_iso_utc(expires_at),
+        "profile": build_me_response(db, current_user),
+        "entitlement": build_entitlement_response(db, current_user)["entitlement"],
     }
 
 
@@ -7620,7 +7623,8 @@ def exchange_google_auth_token(
 
 @app.post("/api/v2/auth/firebase/exchange")
 def exchange_firebase_auth_token(
-    request: FirebaseAuthExchangeRequest
+    request: FirebaseAuthExchangeRequest,
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
 ):
     trimmed_token = request.firebase_id_token.strip()
     if not trimmed_token:
@@ -7648,6 +7652,7 @@ def exchange_firebase_auth_token(
             detail="email verification is required"
         )
 
+    validate_entitlement_package_name(package_name)
     bearer_identity = build_firebase_bearer_identity(firebase_identity)
     db = SessionLocal()
     try:
@@ -7656,7 +7661,7 @@ def exchange_firebase_auth_token(
             firebase_identity
         )
         access_token = issue_private_follow_bearer(bearer_identity)
-        return build_firebase_auth_exchange_response(current_user, access_token)
+        return build_firebase_auth_exchange_response(db, current_user, access_token)
     finally:
         db.close()
 

@@ -480,6 +480,9 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             main_module.PRIVATE_FOLLOW_BEARER_SECRET
         )
         self.original_utcnow = main_module.utcnow
+        self.original_private_follow_runtime_config = (
+            main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG
+        )
 
         self.clock = MutableClock(datetime(2026, 3, 20, 12, 0, 0))
         self.firebase_id_token = "firebase-id-token-1"
@@ -503,6 +506,9 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             self.original_private_follow_bearer_secret
         )
         main_module.utcnow = self.original_utcnow
+        main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG = (
+            self.original_private_follow_runtime_config
+        )
         main_module.Base.metadata.drop_all(bind=self.engine)
         self.engine.dispose()
 
@@ -594,10 +600,25 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         body = response.json()
-        self.assert_firebase_exchange_response_is_session_only(body)
+        self.assert_firebase_exchange_response_has_bootstrap(body)
         self.assertEqual("Bearer", body["token_type"])
         self.assertEqual("firebase", body["auth_method"])
         self.assertNotIn(self.firebase_id_token, str(body))
+        self.assertEqual(body["user_id"], body["profile"]["user_id"])
+        self.assertEqual("Firebase Pilot", body["profile"]["display_name"])
+        self.assertEqual("searchable", body["profile"]["privacy"]["discoverability"])
+        self.assertEqual(
+            {
+                "following_count": 0,
+                "max_following": 1,
+                "status": "under_limit",
+            },
+            body["profile"]["relationship_limits"],
+        )
+        self.assertEqual(body["user_id"], body["entitlement"]["accountSubject"])
+        self.assertEqual("FREE", body["entitlement"]["tier"])
+        self.assertEqual("FREE_CANONICAL", body["entitlement"]["verificationState"])
+        self.assertIsNone(body["entitlement"]["validUntilMs"])
 
         bearer_identity = main_module.verify_private_follow_bearer(body["access_token"])
         self.assertEqual("firebase", bearer_identity.provider)
@@ -751,13 +772,32 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             db.close()
 
     def test_non_identity_authority_claims_do_not_grant_access_or_appear_in_response(self):
-        self.verifier_results[self.firebase_id_token] = self.firebase_identity()
+        firebase_identity = self.firebase_identity()
+        object.__setattr__(
+            firebase_identity,
+            "customClaims",
+            {"entitlement": "SOARING", "paid": True, "LiveFollow": True},
+        )
+        object.__setattr__(
+            firebase_identity,
+            "custom_claims",
+            {"tier": "SOARING", "subscription_state": "ACTIVE"},
+        )
+        self.verifier_results[self.firebase_id_token] = firebase_identity
 
         exchange_response = self.exchange(self.firebase_id_token)
 
         self.assertEqual(200, exchange_response.status_code)
         exchange_body = exchange_response.json()
-        self.assert_firebase_exchange_response_is_session_only(exchange_body)
+        self.assert_firebase_exchange_response_has_bootstrap(exchange_body)
+        self.assertEqual("FREE", exchange_body["entitlement"]["tier"])
+        self.assertEqual(
+            "FREE_CANONICAL",
+            exchange_body["entitlement"]["verificationState"],
+        )
+        self.assertNotIn("SOARING", str(exchange_body))
+        self.assertNotIn("customClaims", str(exchange_body))
+        self.assertNotIn("custom_claims", str(exchange_body))
 
         entitlement_response = self.client.get(
             "/api/v1/subscriptions/entitlements",
@@ -771,6 +811,159 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         entitlement = entitlement_response.json()["entitlement"]
         self.assertEqual("FREE", entitlement["tier"])
         self.assertEqual("FREE_CANONICAL", entitlement["verificationState"])
+
+    def test_firebase_exchange_returns_current_server_stored_paid_entitlement_snapshot(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity()
+        first_response = self.exchange(self.firebase_id_token)
+        self.assertEqual(200, first_response.status_code)
+        user_id = first_response.json()["user_id"]
+        valid_until_ms = 1780000000000
+        self.upsert_entitlement_snapshot(
+            user_id=user_id,
+            tier="SOARING",
+            billing_period="ANNUAL",
+            status="ACTIVE",
+            product_id="xcpro_soaring",
+            base_plan_id="annual",
+            expiry_time_ms=valid_until_ms,
+            valid_until_ms=valid_until_ms,
+        )
+
+        second_response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(200, second_response.status_code)
+        body = second_response.json()
+        self.assertEqual(user_id, body["user_id"])
+        entitlement = body["entitlement"]
+        self.assertEqual(user_id, entitlement["accountSubject"])
+        self.assertEqual("SOARING", entitlement["tier"])
+        self.assertEqual("ANNUAL", entitlement["billingPeriod"])
+        self.assertEqual("ACTIVE", entitlement["status"])
+        self.assertEqual("GOOGLE_PLAY", entitlement["source"])
+        self.assertEqual("VERIFIED", entitlement["verificationState"])
+        self.assertEqual("xcpro_soaring", entitlement["productId"])
+        self.assertEqual("annual", entitlement["basePlanId"])
+        self.assertEqual(valid_until_ms, entitlement["validUntilMs"])
+        self.assertEqual(
+            {
+                "following_count": 0,
+                "max_following": 15,
+                "status": "under_limit",
+            },
+            body["profile"]["relationship_limits"],
+        )
+
+    def test_firebase_exchange_returns_denied_and_recovery_entitlements_without_valid_until(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity()
+        first_response = self.exchange(self.firebase_id_token)
+        self.assertEqual(200, first_response.status_code)
+        user_id = first_response.json()["user_id"]
+        cases = [
+            ("ON_HOLD", "VERIFIED", "OPEN_PLAY_SUBSCRIPTIONS"),
+            ("RECOVERY_REQUIRED", "ACCOUNT_MISMATCH", "CHOOSE_CORRECT_ACCOUNT"),
+        ]
+
+        for status, verification_state, recovery_action in cases:
+            with self.subTest(status=status):
+                self.upsert_entitlement_snapshot(
+                    user_id=user_id,
+                    tier="SOARING",
+                    billing_period="MONTHLY",
+                    status=status,
+                    verification_state=verification_state,
+                    product_id="xcpro_soaring",
+                    base_plan_id="monthly",
+                    expiry_time_ms=1777777777000,
+                    valid_until_ms=1777777777000,
+                    recovery_action=recovery_action,
+                )
+
+                response = self.exchange(self.firebase_id_token)
+
+                self.assertEqual(200, response.status_code)
+                entitlement = response.json()["entitlement"]
+                self.assertEqual("SOARING", entitlement["tier"])
+                self.assertEqual(status, entitlement["status"])
+                self.assertEqual(verification_state, entitlement["verificationState"])
+                self.assertEqual(recovery_action, entitlement["recoveryAction"])
+                self.assertIsNone(entitlement["validUntilMs"])
+
+    def test_firebase_exchange_malformed_stored_entitlement_fails_closed(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity()
+        first_response = self.exchange(self.firebase_id_token)
+        self.assertEqual(200, first_response.status_code)
+        user_id = first_response.json()["user_id"]
+        self.upsert_entitlement_snapshot(
+            user_id=user_id,
+            status="ALIEN_ACTIVE",
+        )
+
+        response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(500, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.ENTITLEMENT_STATE_INVALID,
+            response.json()["code"],
+        )
+
+    def test_firebase_exchange_missing_or_invalid_package_header_fails_invalid_package(self):
+        cases = [
+            ("missing", None),
+            ("invalid", "com.example.other"),
+        ]
+
+        for case_name, package_name in cases:
+            with self.subTest(case_name=case_name):
+                token = f"{case_name}-package-token"
+                self.verifier_results[token] = self.firebase_identity(
+                    firebase_uid=f"firebase-{case_name}-package"
+                )
+
+                response = self.exchange(token, package_name=package_name)
+
+                self.assertEqual(400, response.status_code)
+                self.assertEqual(
+                    main_module.ErrorCode.INVALID_PACKAGE,
+                    response.json()["code"],
+                )
+
+    def test_firebase_exchange_debug_package_requires_runtime_opt_in(self):
+        self.override_private_follow_runtime_config(
+            runtime_env=main_module.RUNTIME_ENV_PROD,
+            allow_debug_entitlement_package=False,
+        )
+        denied_token = "debug-package-denied-token"
+        self.verifier_results[denied_token] = self.firebase_identity(
+            firebase_uid="firebase-debug-denied"
+        )
+
+        denied_response = self.exchange(
+            denied_token,
+            package_name=main_module.XCPRO_DEBUG_PACKAGE_NAME,
+        )
+
+        self.assertEqual(400, denied_response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.INVALID_PACKAGE,
+            denied_response.json()["code"],
+        )
+
+        self.override_private_follow_runtime_config(
+            runtime_env=main_module.RUNTIME_ENV_PROD,
+            allow_debug_entitlement_package=True,
+        )
+        allowed_token = "debug-package-allowed-token"
+        self.verifier_results[allowed_token] = self.firebase_identity(
+            firebase_uid="firebase-debug-allowed"
+        )
+
+        allowed_response = self.exchange(
+            allowed_token,
+            package_name=main_module.XCPRO_DEBUG_PACKAGE_NAME,
+        )
+
+        self.assertEqual(200, allowed_response.status_code)
+        self.assertEqual("FREE", allowed_response.json()["entitlement"]["tier"])
 
     def test_response_never_contains_raw_firebase_id_token(self):
         raw_token = "raw-firebase-token-never-returned"
@@ -827,16 +1020,80 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             return result
         return self.firebase_identity()
 
-    def exchange(self, token: str):
+    def exchange(
+        self,
+        token: str,
+        package_name: str | None = main_module.XCPRO_RELEASE_PACKAGE_NAME,
+    ):
+        headers = {}
+        if package_name is not None:
+            headers["X-XCPro-Package-Name"] = package_name
         return self.client.post(
             "/api/v2/auth/firebase/exchange",
             json={"firebase_id_token": token},
+            headers=headers,
         )
 
     def bearer_headers(self, token: str):
         return {"Authorization": f"Bearer {token}"}
 
-    def assert_firebase_exchange_response_is_session_only(self, body):
+    def upsert_entitlement_snapshot(
+        self,
+        user_id: str,
+        tier: str = "SOARING",
+        billing_period: str = "MONTHLY",
+        status: str = "ACTIVE",
+        source: str = "GOOGLE_PLAY",
+        verification_state: str = "VERIFIED",
+        product_id: str | None = "xcpro_soaring",
+        base_plan_id: str | None = "monthly",
+        expiry_time_ms: int | None = 1777777777000,
+        auto_renewing: bool | None = True,
+        will_lose_access_at_ms: int | None = None,
+        verified_at_ms: int | None = 1777000000000,
+        fetched_at_ms: int = 1777000000000,
+        valid_until_ms: int | None = 1777777777000,
+        stale_after_ms: int | None = None,
+        hard_refresh_after_ms: int | None = None,
+        recovery_action: str = "NONE",
+    ):
+        now = self.clock.utcnow()
+        db = self.session_local()
+        try:
+            db.merge(
+                main_module.AccountEntitlementSnapshot(
+                    user_id=user_id,
+                    tier=tier,
+                    billing_period=billing_period,
+                    status=status,
+                    source=source,
+                    verification_state=verification_state,
+                    product_id=product_id,
+                    base_plan_id=base_plan_id,
+                    expiry_time_ms=expiry_time_ms,
+                    auto_renewing=auto_renewing,
+                    will_lose_access_at_ms=will_lose_access_at_ms,
+                    verified_at_ms=verified_at_ms,
+                    fetched_at_ms=fetched_at_ms,
+                    valid_until_ms=valid_until_ms,
+                    stale_after_ms=stale_after_ms,
+                    hard_refresh_after_ms=hard_refresh_after_ms,
+                    recovery_action=recovery_action,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def override_private_follow_runtime_config(self, **overrides):
+        main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG = replace(
+            main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG,
+            **overrides,
+        )
+
+    def assert_firebase_exchange_response_has_bootstrap(self, body):
         self.assertEqual(
             {
                 "access_token",
@@ -844,11 +1101,12 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
                 "auth_method",
                 "user_id",
                 "expires_at",
+                "profile",
+                "entitlement",
             },
             set(body.keys()),
         )
         for authority_field in (
-            "entitlement",
             "entitlements",
             "tier",
             "subscription",
@@ -859,7 +1117,6 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             "liveFollow",
             "LiveFollow",
             "live_follow",
-            "profile",
         ):
             with self.subTest(authority_field=authority_field):
                 self.assertNotIn(authority_field, body)
