@@ -66,6 +66,8 @@ POSTGRES_PASSWORD=change-me
 DATABASE_URL=postgresql://postgres:change-me@db:5432/xcpro
 XCPRO_RUNTIME_ENV=prod
 XCPRO_GOOGLE_SERVER_CLIENT_IDS=your-google-server-client-id
+XCPRO_FIREBASE_AUTH_PROJECT_ID=your-firebase-auth-project-id
+XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH=/run/secrets/firebase-auth-service-account.json
 XCPRO_PRIVATE_FOLLOW_BEARER_SECRET=generated-secret
 XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET=generated-secret
 XCPRO_FCM_PROJECT_ID=your-firebase-project-id
@@ -83,10 +85,47 @@ The live-read rate-limit defaults above intentionally leave rate limiting
 disabled (`0`) while metrics are observed. Set nonzero values only after a
 traffic-based decision; Android already honors `429 Retry-After` responses.
 
+## Firebase Auth identity configuration
+
+Firebase Auth is the V1 account identity provider for XCPro session exchange.
+It is identity only. It must not own entitlement authority, Google Play
+verification, billing records, LiveFollow permission, or paid-access decisions.
+It is separate from FCM, which is only the private-follow push transport.
+
+The Firebase Auth service account JSON should live outside Git on the
+production host:
+
+```text
+/opt/xcpro/secrets/firebase-auth-service-account.json
+```
+
+The API container receives it read-only at:
+
+```text
+/run/secrets/firebase-auth-service-account.json
+```
+
+Production `.env` must provide:
+
+```dotenv
+XCPRO_FIREBASE_AUTH_PROJECT_ID=your-firebase-auth-project-id
+XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH=/run/secrets/firebase-auth-service-account.json
+```
+
+`XCPRO_FIREBASE_AUTH_PROJECT_ID` is required by staging/prod preflight. The
+service-account path is optional at runtime so deployments that provide
+Firebase Admin SDK default credentials can omit it, but the Compose deployment
+mounts the explicit JSON path above.
+
+This config checkpoint does not add
+`POST /api/v2/auth/firebase/exchange` yet, and it does not remove
+`POST /api/v2/auth/google/exchange`.
+
 ## Private-follow notification delivery
 
 Private-follow push notifications are delivered by `XCPro_Server` through
-Firebase Cloud Messaging. Firebase is only the push transport:
+Firebase Cloud Messaging. For this notification path, Firebase is only the push
+transport:
 - do not add Firebase-hosted backend logic
 - do not use paid Firebase services for this path
 - do not log raw FCM device tokens
@@ -312,6 +351,8 @@ Expected:
 - `xcpro-api`, `xcpro-db`, `xcpro-redis` are running
 - local and public curl checks return an HTTP response
 - private-follow preflight reports `ok: true`
+- staging/prod preflight includes Firebase Auth config and fails if
+  `XCPRO_FIREBASE_AUTH_PROJECT_ID` is missing
 - notification timer status and journal output remain aggregate-only
 
 Do not run `deliver_notifications.py --confirm-send` as a generic deploy smoke

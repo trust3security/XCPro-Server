@@ -14,6 +14,8 @@ services:
       XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE: ${XCPRO_ALLOW_DEBUG_ENTITLEMENT_PACKAGE:-false}
       XCPRO_GOOGLE_SERVER_CLIENT_IDS: ${XCPRO_GOOGLE_SERVER_CLIENT_IDS}
       XCPRO_GOOGLE_SERVER_CLIENT_ID: ${XCPRO_GOOGLE_SERVER_CLIENT_ID:-}
+      XCPRO_FIREBASE_AUTH_PROJECT_ID: ${XCPRO_FIREBASE_AUTH_PROJECT_ID:-}
+      XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH: ${XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH:-/run/secrets/firebase-auth-service-account.json}
       XCPRO_PRIVATE_FOLLOW_BEARER_SECRET: ${XCPRO_PRIVATE_FOLLOW_BEARER_SECRET}
       XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET: ${XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET}
       XCPRO_GOOGLE_PLAY_PACKAGE_NAME: ${XCPRO_GOOGLE_PLAY_PACKAGE_NAME:-com.trust3.xcpro}
@@ -32,6 +34,12 @@ services:
       - type: bind
         source: /opt/xcpro/secrets/google-play-service-account.json
         target: /run/secrets/google-play-service-account.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/xcpro/secrets/firebase-auth-service-account.json
+        target: /run/secrets/firebase-auth-service-account.json
         read_only: true
         bind:
           create_host_path: false

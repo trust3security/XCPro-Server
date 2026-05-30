@@ -5,7 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 from urllib.parse import quote
 import uuid
 import os
@@ -377,6 +377,8 @@ class PrivateFollowRuntimeConfig:
     private_follow_bearer_secret: Optional[bytes]
     push_token_encryption_secret: Optional[bytes]
     private_follow_bearer_ttl_seconds: int
+    firebase_auth_project_id: Optional[str] = None
+    firebase_auth_service_account_json_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -608,6 +610,14 @@ def load_private_follow_bearer_ttl_seconds_from_env(
     )
 
 
+def load_optional_trimmed_env_value(
+    env: Mapping[str, str],
+    name: str
+) -> Optional[str]:
+    value = (env.get(name, "") or "").strip()
+    return value or None
+
+
 def build_private_follow_runtime_config(
     env: Optional[dict[str, str]] = None
 ) -> PrivateFollowRuntimeConfig:
@@ -633,7 +643,15 @@ def build_private_follow_runtime_config(
         google_server_client_ids=load_google_server_client_ids_from_env(resolved_env),
         private_follow_bearer_secret=load_private_follow_bearer_secret_from_env(resolved_env),
         push_token_encryption_secret=load_push_token_encryption_secret_from_env(resolved_env),
-        private_follow_bearer_ttl_seconds=load_private_follow_bearer_ttl_seconds_from_env(resolved_env)
+        private_follow_bearer_ttl_seconds=load_private_follow_bearer_ttl_seconds_from_env(resolved_env),
+        firebase_auth_project_id=load_optional_trimmed_env_value(
+            resolved_env,
+            "XCPRO_FIREBASE_AUTH_PROJECT_ID"
+        ),
+        firebase_auth_service_account_json_path=load_optional_trimmed_env_value(
+            resolved_env,
+            "XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH"
+        )
     )
 
 
@@ -725,6 +743,8 @@ def collect_private_follow_preflight_errors(
             errors.append(
                 "Missing XCPRO_GOOGLE_SERVER_CLIENT_ID or XCPRO_GOOGLE_SERVER_CLIENT_IDS"
             )
+        if config.firebase_auth_project_id is None:
+            errors.append("Missing XCPRO_FIREBASE_AUTH_PROJECT_ID")
         if config.private_follow_bearer_secret is None:
             errors.append("Missing XCPRO_PRIVATE_FOLLOW_BEARER_SECRET")
         if config.push_token_encryption_secret is None:
@@ -747,6 +767,10 @@ def collect_private_follow_preflight_warnings(
     if config.runtime_env == RUNTIME_ENV_DEV and not config.google_server_client_ids:
         warnings.append(
             "Google exchange remains unavailable until XCPRO_GOOGLE_SERVER_CLIENT_ID(S) is configured"
+        )
+    if config.runtime_env == RUNTIME_ENV_DEV and config.firebase_auth_project_id is None:
+        warnings.append(
+            "Firebase Auth exchange remains unavailable until XCPRO_FIREBASE_AUTH_PROJECT_ID is configured"
         )
     if config.runtime_env == RUNTIME_ENV_DEV and config.private_follow_bearer_secret is None:
         warnings.append(
@@ -777,6 +801,10 @@ def build_private_follow_preflight_report(
         "has_static_bearer_tokens_env": resolved_config.has_static_bearer_tokens_env,
         "active_static_bearer_tokens": len(resolved_config.static_bearer_tokens),
         "has_google_server_client_ids": bool(resolved_config.google_server_client_ids),
+        "has_firebase_auth_project_id": resolved_config.firebase_auth_project_id is not None,
+        "has_firebase_auth_service_account_json_path": (
+            resolved_config.firebase_auth_service_account_json_path is not None
+        ),
         "has_private_follow_bearer_secret": resolved_config.private_follow_bearer_secret is not None,
         "has_push_token_encryption_secret": resolved_config.push_token_encryption_secret is not None,
         "private_follow_bearer_ttl_seconds": resolved_config.private_follow_bearer_ttl_seconds,

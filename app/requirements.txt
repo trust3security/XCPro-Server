@@ -5,5 +5,6 @@ redis
 alembic
 httpx
 google-auth
+firebase-admin
 requests
 cryptography

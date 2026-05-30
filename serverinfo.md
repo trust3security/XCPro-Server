@@ -67,6 +67,9 @@ The timer runs once per minute with `OnCalendar=*:0/1`. The service uses
 `flock` on `/run/xcpro-notification-delivery.lock` so delivery runs do not
 overlap. The FCM service account JSON stays outside Git under
 `/opt/xcpro/secrets/` and is mounted read-only into the container.
+The Firebase Auth service account JSON follows the same outside-Git model and
+is mounted read-only into the API container when explicit Firebase Admin SDK
+credentials are used.
 
 ## API service
 
@@ -115,6 +118,42 @@ The repo should contain only an example file such as:
 ```text
 .env.example
 ```
+
+Production env and secret inventory includes:
+- `POSTGRES_DB`
+- `POSTGRES_PASSWORD`
+- `DATABASE_URL`
+- `XCPRO_RUNTIME_ENV`
+- `XCPRO_GOOGLE_SERVER_CLIENT_IDS` or `XCPRO_GOOGLE_SERVER_CLIENT_ID`
+- `XCPRO_FIREBASE_AUTH_PROJECT_ID`
+- `XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH`
+- `XCPRO_PRIVATE_FOLLOW_BEARER_SECRET`
+- `XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET`
+- `XCPRO_GOOGLE_PLAY_PACKAGE_NAME`
+- `XCPRO_GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_PATH`
+- `XCPRO_GOOGLE_PLAY_RTDN_OIDC_AUDIENCE`
+- `XCPRO_GOOGLE_PLAY_RTDN_EXPECTED_SERVICE_ACCOUNT_EMAIL`
+- `XCPRO_FCM_PROJECT_ID`
+- `XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH`
+- live-read rate-limit variables
+
+The Firebase Auth service-account file path is currently:
+
+```text
+/opt/xcpro/secrets/firebase-auth-service-account.json
+```
+
+It is mounted into the API container at:
+
+```text
+/run/secrets/firebase-auth-service-account.json
+```
+
+Firebase Auth is identity only for XCPro account/session exchange. It is
+separate from FCM and must not own entitlement authority, Google Play
+verification, billing records, LiveFollow permission, or paid-access decisions.
+The Firebase exchange endpoint is not enabled by this config checkpoint, and
+the existing Google exchange endpoint remains in place.
 
 ## Compose tooling
 

@@ -7381,23 +7381,77 @@ class PrivateFollowReleaseHardeningTest(unittest.TestCase):
         self.assertEqual(1, len(enabled.static_bearer_tokens))
         self.assertIn("dev-token", enabled.static_bearer_tokens)
 
-    def test_preflight_requires_google_client_id_and_bearer_secret_in_prod(self):
+    def test_build_runtime_config_loads_firebase_auth_env(self):
+        config = main_module.build_private_follow_runtime_config(
+            {
+                "XCPRO_RUNTIME_ENV": "dev",
+                "XCPRO_FIREBASE_AUTH_PROJECT_ID": " xcpro-firebase-auth ",
+                "XCPRO_FIREBASE_AUTH_SERVICE_ACCOUNT_JSON_PATH": (
+                    " /run/secrets/firebase-auth-service-account.json "
+                ),
+            }
+        )
+
+        self.assertEqual("xcpro-firebase-auth", config.firebase_auth_project_id)
+        self.assertEqual(
+            "/run/secrets/firebase-auth-service-account.json",
+            config.firebase_auth_service_account_json_path,
+        )
+
+    def test_preflight_requires_auth_config_and_secrets_in_staging_and_prod(self):
+        for runtime_env in ("staging", "prod"):
+            with self.subTest(runtime_env=runtime_env):
+                report = main_module.build_private_follow_preflight_report(
+                    main_module.build_private_follow_runtime_config(
+                        {
+                            "XCPRO_RUNTIME_ENV": runtime_env,
+                        }
+                    )
+                )
+
+                self.assertFalse(report["ok"])
+                self.assertEqual(
+                    [
+                        "Missing XCPRO_GOOGLE_SERVER_CLIENT_ID or XCPRO_GOOGLE_SERVER_CLIENT_IDS",
+                        "Missing XCPRO_FIREBASE_AUTH_PROJECT_ID",
+                        "Missing XCPRO_PRIVATE_FOLLOW_BEARER_SECRET",
+                        "Missing XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET",
+                    ],
+                    report["errors"],
+                )
+
+    def test_preflight_allows_firebase_default_credentials_when_project_is_set(self):
         report = main_module.build_private_follow_preflight_report(
             main_module.build_private_follow_runtime_config(
                 {
                     "XCPRO_RUNTIME_ENV": "prod",
+                    "XCPRO_GOOGLE_SERVER_CLIENT_IDS": "google-client-id",
+                    "XCPRO_FIREBASE_AUTH_PROJECT_ID": "xcpro-firebase-auth",
+                    "XCPRO_PRIVATE_FOLLOW_BEARER_SECRET": "bearer-secret",
+                    "XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET": "push-secret",
                 }
             )
         )
 
-        self.assertFalse(report["ok"])
-        self.assertEqual(
-            [
-                "Missing XCPRO_GOOGLE_SERVER_CLIENT_ID or XCPRO_GOOGLE_SERVER_CLIENT_IDS",
-                "Missing XCPRO_PRIVATE_FOLLOW_BEARER_SECRET",
-                "Missing XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET",
-            ],
-            report["errors"],
+        self.assertTrue(report["ok"])
+        self.assertEqual([], report["errors"])
+        self.assertTrue(report["has_firebase_auth_project_id"])
+        self.assertFalse(report["has_firebase_auth_service_account_json_path"])
+
+    def test_dev_preflight_warns_without_failing_when_firebase_auth_missing(self):
+        report = main_module.build_private_follow_preflight_report(
+            main_module.build_private_follow_runtime_config(
+                {
+                    "XCPRO_RUNTIME_ENV": "dev",
+                }
+            )
+        )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual([], report["errors"])
+        self.assertIn(
+            "Firebase Auth exchange remains unavailable until XCPRO_FIREBASE_AUTH_PROJECT_ID is configured",
+            report["warnings"],
         )
 
     def test_fresh_db_alembic_upgrade_reaches_head(self):
