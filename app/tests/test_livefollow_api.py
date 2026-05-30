@@ -1303,6 +1303,12 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual("google", exchange_body["auth_method"])
         self.assertIsNotNone(exchange_body["access_token"])
         self.assertIsNotNone(exchange_body["user_id"])
+        bearer_identity = main_module.verify_private_follow_bearer(
+            exchange_body["access_token"]
+        )
+        self.assertIsNotNone(bearer_identity)
+        self.assertEqual("google", bearer_identity.provider)
+        self.assertEqual("google-user-1", bearer_identity.provider_subject)
 
         me_response = self.client.get(
             "/api/v2/me",

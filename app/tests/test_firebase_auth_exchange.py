@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -108,6 +109,9 @@ class FirebaseAuthVerifierSeamTest(unittest.TestCase):
         self.original_firebase_auth = main_module.firebase_auth
         self.original_firebase_credentials = main_module.firebase_credentials
         self.original_firebase_exceptions = main_module.firebase_exceptions
+        self.original_firebase_id_token_verifier = (
+            main_module.FIREBASE_ID_TOKEN_VERIFIER
+        )
         self.original_firebase_app = main_module._FIREBASE_AUTH_APP
         self.original_firebase_app_config_key = main_module._FIREBASE_AUTH_APP_CONFIG_KEY
         self.reset_firebase_app_cache()
@@ -120,6 +124,9 @@ class FirebaseAuthVerifierSeamTest(unittest.TestCase):
         main_module.firebase_auth = self.original_firebase_auth
         main_module.firebase_credentials = self.original_firebase_credentials
         main_module.firebase_exceptions = self.original_firebase_exceptions
+        main_module.FIREBASE_ID_TOKEN_VERIFIER = (
+            self.original_firebase_id_token_verifier
+        )
         main_module._FIREBASE_AUTH_APP = self.original_firebase_app
         main_module._FIREBASE_AUTH_APP_CONFIG_KEY = (
             self.original_firebase_app_config_key
@@ -288,21 +295,119 @@ class FirebaseAuthVerifierSeamTest(unittest.TestCase):
         self.assertNotIn(raw_token, str(raised.exception.detail))
         self.assertNotIn("cert fetch failed", str(raised.exception.detail))
 
-    def test_non_identity_authority_claims_are_not_exposed(self):
+    def test_custom_claims_and_non_identity_authority_claims_are_not_exposed(self):
         decoded_token = self.decoded_token()
-        decoded_token["tier"] = "PRO"
-        decoded_token["subscription_state"] = "ACTIVE"
-        decoded_token["device_limit"] = 99
-        decoded_token["live_follow_enabled"] = True
+        decoded_token.update(
+            {
+                "tier": "SOARING",
+                "paid": True,
+                "subscription_state": "ACTIVE",
+                "entitlement": {"tier": "SOARING"},
+                "subscription": {"status": "ACTIVE"},
+                "billing": {"provider": "firebase"},
+                "device": {"limit": 99},
+                "liveFollow": {"enabled": True},
+                "custom_claims": {
+                    "tier": "SOARING",
+                    "paid": True,
+                    "subscription": "ACTIVE",
+                },
+                "customClaims": {
+                    "entitlement": "SOARING",
+                    "LiveFollow": True,
+                },
+            }
+        )
         self.install_firebase_fakes(decoded_token=decoded_token)
 
         identity = main_module.verify_firebase_id_token_for_exchange("valid-token")
 
-        self.assertEqual("firebase-uid-1", identity.firebase_uid)
-        self.assertFalse(hasattr(identity, "tier"))
-        self.assertFalse(hasattr(identity, "subscription_state"))
-        self.assertFalse(hasattr(identity, "device_limit"))
-        self.assertFalse(hasattr(identity, "live_follow_enabled"))
+        self.assertEqual(
+            {
+                "firebase_uid",
+                "email",
+                "email_verified",
+                "display_name",
+                "sign_in_provider",
+                "provider_identities",
+            },
+            set(identity.__dict__.keys()),
+        )
+        for authority_attribute in (
+            "tier",
+            "paid",
+            "subscription_state",
+            "entitlement",
+            "subscription",
+            "billing",
+            "device",
+            "liveFollow",
+            "custom_claims",
+            "customClaims",
+        ):
+            with self.subTest(authority_attribute=authority_attribute):
+                self.assertFalse(hasattr(identity, authority_attribute))
+
+    def test_exchange_endpoint_sanitizes_firebase_admin_sdk_exception_details(self):
+        cases = [
+            (
+                "raw-firebase-token-invalid-sdk-detail",
+                Exception(
+                    "Firebase Admin SDK invalid token detail includes "
+                    "raw-firebase-token-invalid-sdk-detail"
+                ),
+                401,
+                main_module.ErrorCode.INVALID_FIREBASE_ID_TOKEN,
+                "Firebase Admin SDK invalid token detail",
+            ),
+            (
+                "raw-firebase-token-unavailable-sdk-detail",
+                FakeFirebaseAuth.CertificateFetchError(
+                    "certificate fetch failed for "
+                    "raw-firebase-token-unavailable-sdk-detail"
+                ),
+                503,
+                main_module.ErrorCode.AUTH_UNAVAILABLE,
+                "certificate fetch failed",
+            ),
+        ]
+
+        for raw_token, exception, status_code, code, raw_detail in cases:
+            with self.subTest(raw_token=raw_token):
+                self.reset_firebase_app_cache()
+                self.install_firebase_fakes(exception_to_raise=exception)
+                main_module.FIREBASE_ID_TOKEN_VERIFIER = (
+                    main_module.verify_firebase_id_token_for_exchange
+                )
+                client = TestClient(main_module.app)
+                try:
+                    response = client.post(
+                        "/api/v2/auth/firebase/exchange",
+                        json={"firebase_id_token": raw_token},
+                    )
+                finally:
+                    client.close()
+
+                self.assertEqual(status_code, response.status_code)
+                self.assertEqual(code, response.json()["code"])
+                serialized = str(response.json())
+                self.assertNotIn(raw_token, serialized)
+                self.assertNotIn(raw_detail, serialized)
+
+    def test_firebase_auth_exchange_path_does_not_log_or_print_raw_tokens(self):
+        source = "\n".join(
+            inspect.getsource(target)
+            for target in (
+                main_module.exchange_firebase_auth_token,
+                main_module.verify_firebase_id_token_for_exchange,
+                main_module.initialize_firebase_auth_app_for_exchange,
+                main_module.get_firebase_auth_app_for_exchange,
+            )
+        )
+
+        for forbidden_logging_marker in ("print(", "logger.", "logging."):
+            with self.subTest(forbidden_logging_marker=forbidden_logging_marker):
+                self.assertNotIn(forbidden_logging_marker, source)
 
     def install_firebase_fakes(
         self,
@@ -489,16 +594,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         body = response.json()
-        self.assertEqual(
-            {
-                "access_token",
-                "token_type",
-                "auth_method",
-                "user_id",
-                "expires_at",
-            },
-            set(body.keys()),
-        )
+        self.assert_firebase_exchange_response_is_session_only(body)
         self.assertEqual("Bearer", body["token_type"])
         self.assertEqual("firebase", body["auth_method"])
         self.assertNotIn(self.firebase_id_token, str(body))
@@ -661,8 +757,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
 
         self.assertEqual(200, exchange_response.status_code)
         exchange_body = exchange_response.json()
-        self.assertNotIn("entitlement", exchange_body)
-        self.assertNotIn("tier", exchange_body)
+        self.assert_firebase_exchange_response_is_session_only(exchange_body)
 
         entitlement_response = self.client.get(
             "/api/v1/subscriptions/entitlements",
@@ -686,6 +781,43 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertNotIn(raw_token, str(response.json()))
 
+    def test_error_responses_never_contain_raw_firebase_id_token(self):
+        cases = [
+            (
+                "raw-firebase-token-invalid-response",
+                main_module.invalid_firebase_id_token_exception(),
+                401,
+                main_module.ErrorCode.INVALID_FIREBASE_ID_TOKEN,
+            ),
+            (
+                "raw-firebase-token-unavailable-response",
+                main_module.firebase_auth_unavailable_exception(
+                    "Firebase Auth verifier is unavailable"
+                ),
+                503,
+                main_module.ErrorCode.AUTH_UNAVAILABLE,
+            ),
+            (
+                "raw-firebase-token-unverified-email-response",
+                self.firebase_identity(
+                    sign_in_provider="password",
+                    email_verified=False,
+                ),
+                403,
+                main_module.ErrorCode.EMAIL_VERIFICATION_REQUIRED,
+            ),
+        ]
+
+        for raw_token, verifier_result, status_code, code in cases:
+            with self.subTest(raw_token=raw_token):
+                self.verifier_results[raw_token] = verifier_result
+
+                response = self.exchange(raw_token)
+
+                self.assertEqual(status_code, response.status_code)
+                self.assertEqual(code, response.json()["code"])
+                self.assertNotIn(raw_token, str(response.json()))
+
     def fake_firebase_id_token_verifier(self, token: str):
         self.verifier_calls.append(token)
         result = self.verifier_results.get(token)
@@ -703,6 +835,34 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
 
     def bearer_headers(self, token: str):
         return {"Authorization": f"Bearer {token}"}
+
+    def assert_firebase_exchange_response_is_session_only(self, body):
+        self.assertEqual(
+            {
+                "access_token",
+                "token_type",
+                "auth_method",
+                "user_id",
+                "expires_at",
+            },
+            set(body.keys()),
+        )
+        for authority_field in (
+            "entitlement",
+            "entitlements",
+            "tier",
+            "subscription",
+            "subscriptions",
+            "billing",
+            "device",
+            "devices",
+            "liveFollow",
+            "LiveFollow",
+            "live_follow",
+            "profile",
+        ):
+            with self.subTest(authority_field=authority_field):
+                self.assertNotIn(authority_field, body)
 
     def firebase_identity(
         self,
