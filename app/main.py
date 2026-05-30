@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Mapping as MappingABC
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -38,6 +39,17 @@ except ImportError:
     google_requests = None
     google_id_token = None
     google_service_account = None
+
+try:
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth
+    from firebase_admin import credentials as firebase_credentials
+    from firebase_admin import exceptions as firebase_exceptions
+except ImportError:
+    firebase_admin = None
+    firebase_auth = None
+    firebase_credentials = None
+    firebase_exceptions = None
 
 try:
     from pydantic import model_validator
@@ -281,6 +293,7 @@ class ErrorCode:
     INVALID_RTDN_ENVELOPE = "invalid_rtdn_envelope"
     ENTITLEMENT_STATE_INVALID = "entitlement_state_invalid"
     INVALID_GOOGLE_ID_TOKEN = "invalid_google_id_token"
+    INVALID_FIREBASE_ID_TOKEN = "invalid_firebase_id_token"
     SESSION_NOT_FOUND = "session_not_found"
     MISSING_SESSION_TOKEN = "missing_session_token"
     SESSION_TOKEN_UNAVAILABLE = "session_token_unavailable"
@@ -364,6 +377,16 @@ class ResolvedBearerIdentity:
     provider_subject: str
     email: Optional[str] = None
     display_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ResolvedFirebaseIdentity:
+    firebase_uid: str
+    email: Optional[str]
+    email_verified: bool
+    display_name: Optional[str]
+    sign_in_provider: Optional[str]
+    provider_identities: dict[str, list[str]]
 
 
 @dataclass(frozen=True)
@@ -963,6 +986,213 @@ def verify_google_id_token_for_exchange(token: str) -> Optional[ResolvedBearerId
 
 
 GOOGLE_ID_TOKEN_VERIFIER = verify_google_id_token_for_exchange
+
+FIREBASE_AUTH_APP_NAME = "xcpro-firebase-auth"
+_FIREBASE_AUTH_APP = None
+_FIREBASE_AUTH_APP_CONFIG_KEY: Optional[tuple[str, Optional[str]]] = None
+_FIREBASE_AUTH_APP_LOCK = threading.Lock()
+
+
+def firebase_auth_unavailable_exception(detail: str) -> ApiHTTPException:
+    return ApiHTTPException(
+        status_code=503,
+        code=ErrorCode.AUTH_UNAVAILABLE,
+        detail=detail
+    )
+
+
+def invalid_firebase_id_token_exception(
+    status_code: int = 401,
+    detail: str = "invalid Firebase ID token"
+) -> ApiHTTPException:
+    return ApiHTTPException(
+        status_code=status_code,
+        code=ErrorCode.INVALID_FIREBASE_ID_TOKEN,
+        detail=detail
+    )
+
+
+def firebase_exception_matches(exc: Exception, module: Any, names: tuple[str, ...]) -> bool:
+    if module is None:
+        return False
+    for name in names:
+        exception_type = getattr(module, name, None)
+        if isinstance(exception_type, type) and isinstance(exc, exception_type):
+            return True
+    return False
+
+
+def is_firebase_auth_unavailable_exception(exc: Exception) -> bool:
+    if GoogleAuthError is not None and isinstance(exc, GoogleAuthError):
+        return True
+    return (
+        firebase_exception_matches(exc, firebase_auth, ("CertificateFetchError",)) or
+        firebase_exception_matches(
+            exc,
+            firebase_exceptions,
+            ("DeadlineExceededError", "InternalError", "UnavailableError")
+        )
+    )
+
+
+def initialize_firebase_auth_app_for_exchange(
+    project_id: str,
+    service_account_json_path: Optional[str]
+):
+    if firebase_admin is None or firebase_auth is None or firebase_credentials is None:
+        raise firebase_auth_unavailable_exception("Firebase Admin SDK is not installed")
+
+    global _FIREBASE_AUTH_APP
+    global _FIREBASE_AUTH_APP_CONFIG_KEY
+
+    config_key = (project_id, service_account_json_path)
+    with _FIREBASE_AUTH_APP_LOCK:
+        if _FIREBASE_AUTH_APP is not None and _FIREBASE_AUTH_APP_CONFIG_KEY == config_key:
+            return _FIREBASE_AUTH_APP
+
+        if _FIREBASE_AUTH_APP is not None:
+            try:
+                firebase_admin.delete_app(_FIREBASE_AUTH_APP)
+            except Exception:
+                pass
+            _FIREBASE_AUTH_APP = None
+            _FIREBASE_AUTH_APP_CONFIG_KEY = None
+
+        try:
+            if service_account_json_path:
+                credential = firebase_credentials.Certificate(service_account_json_path)
+            else:
+                credential = firebase_credentials.ApplicationDefault()
+            app_instance = firebase_admin.initialize_app(
+                credential,
+                {"projectId": project_id},
+                name=FIREBASE_AUTH_APP_NAME
+            )
+        except ValueError:
+            try:
+                app_instance = firebase_admin.get_app(FIREBASE_AUTH_APP_NAME)
+            except Exception as exc:
+                raise firebase_auth_unavailable_exception(
+                    "Firebase Auth verifier is unavailable"
+                ) from exc
+        except Exception as exc:
+            raise firebase_auth_unavailable_exception(
+                "Firebase Auth verifier is unavailable"
+            ) from exc
+
+        _FIREBASE_AUTH_APP = app_instance
+        _FIREBASE_AUTH_APP_CONFIG_KEY = config_key
+        return app_instance
+
+
+def get_firebase_auth_app_for_exchange():
+    project_id = PRIVATE_FOLLOW_RUNTIME_CONFIG.firebase_auth_project_id
+    if project_id is None:
+        raise firebase_auth_unavailable_exception(
+            "Firebase Auth project ID is not configured"
+        )
+
+    return initialize_firebase_auth_app_for_exchange(
+        project_id,
+        PRIVATE_FOLLOW_RUNTIME_CONFIG.firebase_auth_service_account_json_path
+    )
+
+
+def firebase_decoded_token_matches_project(
+    decoded_token: MappingABC,
+    project_id: str
+) -> bool:
+    audience = str(decoded_token.get("aud", "") or "").strip()
+    issuer = str(decoded_token.get("iss", "") or "").strip()
+    return (
+        audience == project_id and
+        issuer == f"https://securetoken.google.com/{project_id}"
+    )
+
+
+def extract_firebase_provider_identities(decoded_token: MappingABC) -> dict[str, list[str]]:
+    firebase_claim = decoded_token.get("firebase")
+    if not isinstance(firebase_claim, MappingABC):
+        return {}
+
+    raw_identities = firebase_claim.get("identities")
+    if not isinstance(raw_identities, MappingABC):
+        return {}
+
+    provider_identities: dict[str, list[str]] = {}
+    for raw_provider_id, raw_values in raw_identities.items():
+        provider_id = str(raw_provider_id or "").strip()
+        if not provider_id:
+            continue
+
+        if isinstance(raw_values, (list, tuple, set)):
+            values = [
+                str(raw_value or "").strip()
+                for raw_value in raw_values
+                if str(raw_value or "").strip()
+            ]
+        else:
+            value = str(raw_values or "").strip()
+            values = [value] if value else []
+
+        if values:
+            provider_identities[provider_id] = values
+
+    return provider_identities
+
+
+def extract_firebase_sign_in_provider(decoded_token: MappingABC) -> Optional[str]:
+    firebase_claim = decoded_token.get("firebase")
+    if not isinstance(firebase_claim, MappingABC):
+        return None
+    return str(firebase_claim.get("sign_in_provider") or "").strip() or None
+
+
+def verify_firebase_id_token_for_exchange(token: str) -> ResolvedFirebaseIdentity:
+    trimmed_token = (token or "").strip()
+    if not trimmed_token:
+        raise invalid_firebase_id_token_exception(
+            status_code=422,
+            detail="firebase_id_token is required"
+        )
+
+    project_id = PRIVATE_FOLLOW_RUNTIME_CONFIG.firebase_auth_project_id
+    app_instance = get_firebase_auth_app_for_exchange()
+
+    try:
+        decoded_token = firebase_auth.verify_id_token(
+            trimmed_token,
+            app=app_instance,
+            check_revoked=True
+        )
+    except Exception as exc:
+        if is_firebase_auth_unavailable_exception(exc):
+            raise firebase_auth_unavailable_exception(
+                "Firebase Auth verifier is unavailable"
+            ) from exc
+        raise invalid_firebase_id_token_exception() from exc
+
+    if not isinstance(decoded_token, MappingABC):
+        raise invalid_firebase_id_token_exception()
+
+    if project_id is None or not firebase_decoded_token_matches_project(decoded_token, project_id):
+        raise invalid_firebase_id_token_exception()
+
+    firebase_uid = str(decoded_token.get("uid") or "").strip()
+    if not firebase_uid:
+        raise invalid_firebase_id_token_exception()
+
+    return ResolvedFirebaseIdentity(
+        firebase_uid=firebase_uid,
+        email=str(decoded_token.get("email") or "").strip() or None,
+        email_verified=decoded_token.get("email_verified") is True,
+        display_name=str(decoded_token.get("name") or "").strip() or None,
+        sign_in_provider=extract_firebase_sign_in_provider(decoded_token),
+        provider_identities=extract_firebase_provider_identities(decoded_token)
+    )
+
+
+FIREBASE_ID_TOKEN_VERIFIER = verify_firebase_id_token_for_exchange
 
 
 def reject_monotonic_position_fields(payload: Any) -> Any:
