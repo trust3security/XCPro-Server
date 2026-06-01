@@ -514,6 +514,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
 
     def test_required_endpoint_model_and_error_symbols_are_available(self):
         self.assertTrue(hasattr(main_module, "FirebaseAuthExchangeRequest"))
+        self.assertTrue(hasattr(main_module, "build_auth_recovery_required_detail"))
         self.assertEqual(
             "email_verification_required",
             main_module.ErrorCode.EMAIL_VERIFICATION_REQUIRED,
@@ -646,9 +647,9 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
                 db,
                 body["user_id"],
             )
-            self.assertNotIn(
-                "authProviderEmailVerified",
-                support_snapshot["accountOwner"],
+            self.assertIs(
+                support_snapshot["accountOwner"]["authProviderEmailVerified"],
+                True,
             )
         finally:
             db.close()
@@ -794,12 +795,12 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         self.assertNotEqual(legacy_user_id, response.json()["user_id"])
 
     def test_verified_email_with_non_matching_google_subject_requires_recovery(self):
-        self.seed_legacy_google_user(
+        legacy_user_id = self.seed_legacy_google_user(
             provider_subject="google-provider-subject-1",
             email="pilot@example.com",
         )
         self.verifier_results[self.firebase_id_token] = self.firebase_identity(
-            email="pilot@example.com",
+            email=" pilot@example.com ",
             email_verified=True,
             provider_identities={
                 "email": ["pilot@example.com"],
@@ -810,10 +811,45 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         response = self.exchange(self.firebase_id_token)
 
         self.assertEqual(409, response.status_code)
+        body = response.json()
         self.assertEqual(
             main_module.ErrorCode.AUTH_RECOVERY_REQUIRED,
-            response.json()["code"],
+            body["code"],
         )
+        detail = body["detail"]
+        self.assertEqual(
+            {
+                "message",
+                "reason",
+                "provider",
+                "providerEmail",
+                "conflictProvider",
+                "conflictProviderEmail",
+                "conflictProviderEmailVerified",
+            },
+            set(detail.keys()),
+        )
+        self.assertEqual("account recovery is required", detail["message"])
+        self.assertEqual("verified_email_conflict", detail["reason"])
+        self.assertEqual("firebase", detail["provider"])
+        self.assertEqual("pilot@example.com", detail["providerEmail"])
+        self.assertEqual("google", detail["conflictProvider"])
+        self.assertEqual("pilot@example.com", detail["conflictProviderEmail"])
+        self.assertIsNone(detail["conflictProviderEmailVerified"])
+        body_text = str(body)
+        for forbidden_value in (
+            self.firebase_id_token,
+            "Bearer",
+            legacy_user_id,
+            "google-provider-subject-1",
+            "Legacy Google Pilot",
+            "billing",
+            "entitlement",
+            "LiveFollow",
+            "purchase",
+        ):
+            with self.subTest(forbidden_value=forbidden_value):
+                self.assertNotIn(forbidden_value, body_text)
         db = self.session_local()
         try:
             self.assertEqual(1, db.query(main_module.User).count())
@@ -826,9 +862,52 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_recovery_required_detail_matches_conflicting_email_verified_state(self):
+        cases = (
+            ("nullable", None),
+            ("verified", True),
+            ("unverified", False),
+        )
+        for case_name, expected_verified in cases:
+            with self.subTest(case_name=case_name):
+                token = f"{case_name}-conflict-token"
+                email = f"{case_name}@example.com"
+                self.seed_legacy_google_user(
+                    provider_subject=f"google-provider-subject-{case_name}",
+                    email=email,
+                    email_verified=expected_verified,
+                )
+                self.verifier_results[token] = self.firebase_identity(
+                    firebase_uid=f"firebase-uid-{case_name}",
+                    email=email,
+                    email_verified=True,
+                    provider_identities={
+                        "email": [email],
+                        "google.com": [f"different-google-subject-{case_name}"],
+                    },
+                )
+
+                response = self.exchange(token)
+
+                self.assertEqual(409, response.status_code)
+                body = response.json()
+                self.assertEqual(
+                    main_module.ErrorCode.AUTH_RECOVERY_REQUIRED,
+                    body["code"],
+                )
+                detail = body["detail"]
+                self.assertEqual(email, detail["providerEmail"])
+                self.assertEqual("google", detail["conflictProvider"])
+                self.assertEqual(email, detail["conflictProviderEmail"])
+                self.assertIs(
+                    detail["conflictProviderEmailVerified"],
+                    expected_verified,
+                )
+
     def test_non_identity_state_cannot_authorize_email_conflict_linking(self):
+        google_provider_subject = "google-provider-subject-1"
         legacy_user_id = self.seed_legacy_google_user(
-            provider_subject="google-provider-subject-1",
+            provider_subject=google_provider_subject,
             email="pilot@example.com",
         )
         self.upsert_entitlement_snapshot(
@@ -854,13 +933,33 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         )
         object.__setattr__(
             firebase_identity,
+            "custom_claims",
+            {"tier": "SOARING", "subscription_state": "ACTIVE"},
+        )
+        object.__setattr__(
+            firebase_identity,
             "local_state",
             {"last_user_id": legacy_user_id, "account_link": "google"},
         )
         object.__setattr__(
             firebase_identity,
+            "android_local_state",
+            {"last_user_id": legacy_user_id, "linked_provider": "google"},
+        )
+        object.__setattr__(
+            firebase_identity,
             "billing_state",
             {"accountSubject": legacy_user_id, "tier": "SOARING"},
+        )
+        object.__setattr__(
+            firebase_identity,
+            "entitlement_state",
+            {"accountSubject": legacy_user_id, "tier": "SOARING"},
+        )
+        object.__setattr__(
+            firebase_identity,
+            "live_follow_state",
+            {"enabled": True, "viewer": legacy_user_id},
         )
         object.__setattr__(
             firebase_identity,
@@ -872,10 +971,29 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         response = self.exchange(self.firebase_id_token)
 
         self.assertEqual(409, response.status_code)
+        body = response.json()
         self.assertEqual(
             main_module.ErrorCode.AUTH_RECOVERY_REQUIRED,
-            response.json()["code"],
+            body["code"],
         )
+        body_text = str(body)
+        for forbidden_value in (
+            self.firebase_id_token,
+            "fixture-purchase-token-never-authority",
+            legacy_user_id,
+            google_provider_subject,
+            "SOARING",
+            "ANNUAL",
+            "xcpro_soaring",
+            "billing_state",
+            "entitlement_state",
+            "purchase_state",
+            "LiveFollow",
+            "live_follow_state",
+            "android_local_state",
+        ):
+            with self.subTest(forbidden_value=forbidden_value):
+                self.assertNotIn(forbidden_value, body_text)
         db = self.session_local()
         try:
             self.assertEqual(1, db.query(main_module.User).count())
@@ -1261,11 +1379,17 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             provider_identities=provider_identities,
         )
 
-    def seed_legacy_google_user(self, provider_subject: str, email: str) -> str:
+    def seed_legacy_google_user(
+        self,
+        provider_subject: str,
+        email: str,
+        email_verified: bool | None = None,
+    ) -> str:
         identity = main_module.ResolvedBearerIdentity(
             provider="google",
             provider_subject=provider_subject,
             email=email,
+            email_verified=email_verified,
             display_name="Legacy Google Pilot",
         )
         db = self.session_local()

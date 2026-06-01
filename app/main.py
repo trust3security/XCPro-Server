@@ -3287,6 +3287,21 @@ def find_verified_email_non_firebase_conflict(
     )
 
 
+def build_auth_recovery_required_detail(
+    firebase_identity: ResolvedFirebaseIdentity,
+    conflict_identity: AuthIdentity
+) -> dict[str, Any]:
+    return {
+        "message": "account recovery is required",
+        "reason": "verified_email_conflict",
+        "provider": "firebase",
+        "providerEmail": trim_to_none(firebase_identity.email),
+        "conflictProvider": conflict_identity.provider,
+        "conflictProviderEmail": trim_to_none(conflict_identity.provider_email),
+        "conflictProviderEmailVerified": conflict_identity.provider_email_verified,
+    }
+
+
 def ensure_current_user_record_for_firebase_identity(
     db,
     firebase_identity: ResolvedFirebaseIdentity
@@ -3315,14 +3330,20 @@ def ensure_current_user_record_for_firebase_identity(
             )
             return ensure_current_user_record_for_identity(db, bearer_identity)
 
-    if (
-        firebase_identity.email_verified and
-        find_verified_email_non_firebase_conflict(db, firebase_identity.email) is not None
-    ):
+    verified_email_conflict = None
+    if firebase_identity.email_verified:
+        verified_email_conflict = find_verified_email_non_firebase_conflict(
+            db,
+            firebase_identity.email
+        )
+    if verified_email_conflict is not None:
         raise ApiHTTPException(
             status_code=409,
             code=ErrorCode.AUTH_RECOVERY_REQUIRED,
-            detail="account recovery is required"
+            detail=build_auth_recovery_required_detail(
+                firebase_identity,
+                verified_email_conflict
+            )
         )
 
     return ensure_current_user_record_for_identity(db, bearer_identity)
