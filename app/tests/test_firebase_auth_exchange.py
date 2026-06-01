@@ -708,6 +708,15 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         self.assertEqual("firebase", bearer_identity.provider)
         self.assertEqual("firebase-uid-1", bearer_identity.provider_subject)
 
+        me_response = self.client.get(
+            "/api/v2/me",
+            headers=self.bearer_headers(body["access_token"]),
+        )
+        self.assertEqual(200, me_response.status_code)
+        me_body = me_response.json()
+        self.assertEqual(legacy_user_id, me_body["user_id"])
+        self.assertEqual("Legacy Google Pilot", me_body["display_name"])
+
         db = self.session_local()
         try:
             firebase_identity = (
@@ -741,7 +750,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertNotEqual(legacy_user_id, response.json()["user_id"])
 
-    def test_verified_email_only_conflict_requires_recovery_without_duplicate_user(self):
+    def test_verified_email_with_non_matching_google_subject_requires_recovery(self):
         self.seed_legacy_google_user(
             provider_subject="google-provider-subject-1",
             email="pilot@example.com",
@@ -749,8 +758,73 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         self.verifier_results[self.firebase_id_token] = self.firebase_identity(
             email="pilot@example.com",
             email_verified=True,
-            provider_identities={"email": ["pilot@example.com"]},
+            provider_identities={
+                "email": ["pilot@example.com"],
+                "google.com": ["different-google-subject"],
+            },
         )
+
+        response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.AUTH_RECOVERY_REQUIRED,
+            response.json()["code"],
+        )
+        db = self.session_local()
+        try:
+            self.assertEqual(1, db.query(main_module.User).count())
+            self.assertEqual(
+                0,
+                db.query(main_module.AuthIdentity)
+                .filter(main_module.AuthIdentity.provider == "firebase")
+                .count(),
+            )
+        finally:
+            db.close()
+
+    def test_non_identity_state_cannot_authorize_email_conflict_linking(self):
+        legacy_user_id = self.seed_legacy_google_user(
+            provider_subject="google-provider-subject-1",
+            email="pilot@example.com",
+        )
+        self.upsert_entitlement_snapshot(
+            user_id=legacy_user_id,
+            tier="SOARING",
+            billing_period="ANNUAL",
+            status="ACTIVE",
+            product_id="xcpro_soaring",
+            base_plan_id="annual",
+        )
+        firebase_identity = self.firebase_identity(
+            email="pilot@example.com",
+            email_verified=True,
+            provider_identities={
+                "email": ["pilot@example.com"],
+                "google.com": ["different-google-subject"],
+            },
+        )
+        object.__setattr__(
+            firebase_identity,
+            "customClaims",
+            {"entitlement": "SOARING", "paid": True, "LiveFollow": True},
+        )
+        object.__setattr__(
+            firebase_identity,
+            "local_state",
+            {"last_user_id": legacy_user_id, "account_link": "google"},
+        )
+        object.__setattr__(
+            firebase_identity,
+            "billing_state",
+            {"accountSubject": legacy_user_id, "tier": "SOARING"},
+        )
+        object.__setattr__(
+            firebase_identity,
+            "purchase_state",
+            {"purchaseToken": "fixture-purchase-token-never-authority"},
+        )
+        self.verifier_results[self.firebase_id_token] = firebase_identity
 
         response = self.exchange(self.firebase_id_token)
 

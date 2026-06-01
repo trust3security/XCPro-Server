@@ -1292,6 +1292,9 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(main_module.ErrorCode.ENTITLEMENT_STATE_INVALID, response.json()["code"])
 
     def test_google_auth_exchange_issues_server_bearer_that_works_on_me(self):
+        route_paths = {getattr(route, "path", None) for route in main_module.app.routes}
+        self.assertIn("/api/v2/auth/google/exchange", route_paths)
+
         exchange_response = self.client.post(
             "/api/v2/auth/google/exchange",
             json={"google_id_token": self.google_id_token}
