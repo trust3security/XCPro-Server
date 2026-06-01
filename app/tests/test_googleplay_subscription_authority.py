@@ -2084,9 +2084,16 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
                 self.assertEqual(expected_kind, result["lookup"]["kind"])
                 owner = result["snapshot"]["accountOwner"]
                 self.assertEqual(user_id, owner["userId"])
+                self.assertEqual("static", owner["authProvider"])
+                self.assertEqual("pilot-1", owner["authProviderSubject"])
+                self.assertEqual("pilot1@example.com", owner["authProviderEmail"])
                 self.assertIn("authProviderEmailVerified", owner)
                 self.assertIsNone(owner["authProviderEmailVerified"])
                 self.assertEqual("BASIC", result["snapshot"]["entitlement"]["tier"])
+                self.assertEqual(
+                    main_module.hash_purchase_token(purchase_token),
+                    result["snapshot"]["currentPurchase"]["purchaseTokenHash"],
+                )
                 self.assert_plaintext_absent(result, purchase_token)
                 self.assert_plaintext_absent(result, self.primary_bearer_token)
 
@@ -2339,6 +2346,10 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         counts = {
             "users": self.count_rows(main_module.User),
             "authIdentities": self.count_rows(main_module.AuthIdentity),
+            "followRequests": self.count_rows(main_module.FollowRequest),
+            "followEdges": self.count_rows(main_module.FollowEdge),
+            "favoriteFollows": self.count_rows(main_module.FavoriteFollow),
+            "relationshipCounters": self.count_rows(main_module.UserRelationshipCounter),
         }
         counts.update(self.billing_row_counts())
         return counts

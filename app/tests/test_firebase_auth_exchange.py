@@ -1,4 +1,5 @@
 import inspect
+import json
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -9,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
+from app.scripts import support_billing_snapshot as support_billing_snapshot_script
 
 
 class FakeFirebaseApp:
@@ -862,6 +864,225 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_recovery_required_detail_support_lookup_context_is_safe_and_read_only(self):
+        firebase_id_token = "firebase-id-token-conflict-repair"
+        google_id_token = "raw-google-id-token-conflict-repair"
+        bearer_token = "Bearer support-conflict-bearer-token"
+        raw_purchase_token = "support-conflict-raw-purchase-token"
+        password_material = "support-conflict-password-material"
+        secret_material = "support-conflict-secret-material"
+        conflict_provider_subject = "google-conflict-provider-subject"
+        conflict_email = "pilot@example.com"
+        legacy_user_id = self.seed_legacy_google_user(
+            provider_subject=conflict_provider_subject,
+            email=conflict_email,
+            email_verified=True,
+        )
+        self.upsert_entitlement_snapshot(
+            user_id=legacy_user_id,
+            tier="SOARING",
+            billing_period="MONTHLY",
+            status="ACTIVE",
+            product_id="xcpro_soaring",
+            base_plan_id="monthly",
+        )
+        purchase_token_hash = main_module.hash_purchase_token(raw_purchase_token)
+        now = self.clock.utcnow()
+        db = self.session_local()
+        try:
+            db.add(
+                main_module.BillingGooglePurchase(
+                    id="support-conflict-purchase",
+                    user_id=legacy_user_id,
+                    package_name=main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                    product_id="xcpro_soaring",
+                    base_plan_id="monthly",
+                    purchase_token_hash=purchase_token_hash,
+                    linked_purchase_token_hash=None,
+                    google_subscription_state="ACTIVE",
+                    xcpro_subscription_status="ACTIVE",
+                    acknowledgement_state="ACKNOWLEDGED",
+                    expiry_time_ms=1777777777000,
+                    auto_renewing=True,
+                    last_verified_at_ms=1777000000000,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.add(
+                main_module.BillingGoogleEvent(
+                    id="support-conflict-event",
+                    pubsub_message_id="support-conflict-message",
+                    event_type="SUBSCRIPTION_NOTIFICATION_2",
+                    package_name=main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                    product_id="xcpro_soaring",
+                    purchase_token_hash=purchase_token_hash,
+                    published_at=now,
+                    processed_at=now,
+                    processing_result="VERIFIED",
+                    audit_id="support-conflict-audit",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.add(
+                main_module.BillingAuditRecord(
+                    audit_id="support-conflict-audit",
+                    user_id=legacy_user_id,
+                    event_type="GOOGLE_PLAY_SYNC",
+                    redacted_subject=f"purchase_token_sha256:{purchase_token_hash[:12]}",
+                    purchase_token_hash=purchase_token_hash,
+                    result="VERIFIED",
+                    detail_json=json.dumps(
+                        {
+                            "packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                            "productId": "xcpro_soaring",
+                            "basePlanId": "monthly",
+                            "firebase_id_token": firebase_id_token,
+                            "google_id_token": google_id_token,
+                            "Authorization": bearer_token,
+                            "purchaseToken": raw_purchase_token,
+                            "password": password_material,
+                            "secret": secret_material,
+                        }
+                    ),
+                    created_at=now,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+        self.verifier_results[firebase_id_token] = self.firebase_identity(
+            email=f" {conflict_email} ",
+            email_verified=True,
+            provider_identities={
+                "email": [conflict_email],
+                "google.com": ["different-google-subject"],
+            },
+        )
+
+        response = self.exchange(firebase_id_token)
+
+        self.assertEqual(409, response.status_code)
+        body = response.json()
+        self.assertEqual(main_module.ErrorCode.AUTH_RECOVERY_REQUIRED, body["code"])
+        detail = body["detail"]
+        self.assertEqual("firebase", detail["provider"])
+        self.assertEqual(conflict_email, detail["providerEmail"])
+        self.assertEqual("google", detail["conflictProvider"])
+        self.assertEqual(conflict_email, detail["conflictProviderEmail"])
+        self.assertIs(True, detail["conflictProviderEmailVerified"])
+        for forbidden_key in (
+            "providerSubject",
+            "userId",
+            "conflictProviderSubject",
+            "conflictUserId",
+        ):
+            with self.subTest(forbidden_key=forbidden_key):
+                self.assertNotIn(forbidden_key, detail)
+        body_text = json.dumps(body, default=str)
+        for forbidden_value in (
+            firebase_id_token,
+            google_id_token,
+            bearer_token,
+            raw_purchase_token,
+            password_material,
+            secret_material,
+            legacy_user_id,
+            conflict_provider_subject,
+        ):
+            with self.subTest(forbidden_response_value=forbidden_value):
+                self.assertNotIn(forbidden_value, body_text)
+
+        before_counts = self.support_lookup_row_counts()
+        email_result = support_billing_snapshot_script.run(
+            support_billing_snapshot_script.parse_args(
+                ["--email", detail["providerEmail"]]
+            ),
+            session_factory=self.session_local,
+        )
+        self.assertEqual(before_counts, self.support_lookup_row_counts())
+
+        email_owner = email_result["snapshot"]["accountOwner"]
+        self.assertTrue(email_result["ok"])
+        self.assertEqual("email", email_result["lookup"]["kind"])
+        self.assertEqual(conflict_email, email_result["lookup"]["email"])
+        self.assertEqual(legacy_user_id, email_owner["userId"])
+        self.assertEqual("google", email_owner["authProvider"])
+        self.assertEqual(
+            conflict_provider_subject,
+            email_owner["authProviderSubject"],
+        )
+        self.assertEqual(conflict_email, email_owner["authProviderEmail"])
+        self.assertIs(True, email_owner["authProviderEmailVerified"])
+        self.assertEqual("SOARING", email_result["snapshot"]["entitlement"]["tier"])
+        self.assertEqual(
+            purchase_token_hash,
+            email_result["snapshot"]["currentPurchase"]["purchaseTokenHash"],
+        )
+        self.assertEqual(
+            purchase_token_hash,
+            email_result["snapshot"]["latestGoogleEvent"]["purchaseTokenHash"],
+        )
+        self.assertEqual(
+            purchase_token_hash,
+            email_result["snapshot"]["latestAudit"]["purchaseTokenHash"],
+        )
+
+        provider_subject_result = support_billing_snapshot_script.run(
+            support_billing_snapshot_script.parse_args(
+                [
+                    "--provider",
+                    detail["conflictProvider"],
+                    "--provider-subject",
+                    email_owner["authProviderSubject"],
+                ]
+            ),
+            session_factory=self.session_local,
+        )
+
+        self.assertEqual(before_counts, self.support_lookup_row_counts())
+        self.assertTrue(provider_subject_result["ok"])
+        self.assertEqual(
+            "providerSubject",
+            provider_subject_result["lookup"]["kind"],
+        )
+        self.assertEqual(
+            detail["conflictProvider"],
+            provider_subject_result["lookup"]["provider"],
+        )
+        self.assertEqual(
+            conflict_provider_subject,
+            provider_subject_result["lookup"]["providerSubject"],
+        )
+        self.assertEqual(
+            email_result["snapshot"]["accountOwner"],
+            provider_subject_result["snapshot"]["accountOwner"],
+        )
+        self.assertEqual(
+            email_result["snapshot"]["entitlement"],
+            provider_subject_result["snapshot"]["entitlement"],
+        )
+        self.assertEqual(
+            email_result["snapshot"]["currentPurchase"],
+            provider_subject_result["snapshot"]["currentPurchase"],
+        )
+
+        support_text = json.dumps(
+            [email_result, provider_subject_result],
+            default=str,
+        )
+        for forbidden_value in (
+            firebase_id_token,
+            google_id_token,
+            bearer_token,
+            raw_purchase_token,
+            password_material,
+            secret_material,
+        ):
+            with self.subTest(forbidden_support_value=forbidden_value):
+                self.assertNotIn(forbidden_value, support_text)
+
     def test_recovery_required_detail_matches_conflicting_email_verified_state(self):
         cases = (
             ("nullable", None),
@@ -1271,6 +1492,27 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
 
     def bearer_headers(self, token: str):
         return {"Authorization": f"Bearer {token}"}
+
+    def count_rows(self, model) -> int:
+        db = self.session_local()
+        try:
+            return db.query(model).count()
+        finally:
+            db.close()
+
+    def support_lookup_row_counts(self) -> dict[str, int]:
+        return {
+            "users": self.count_rows(main_module.User),
+            "authIdentities": self.count_rows(main_module.AuthIdentity),
+            "entitlements": self.count_rows(main_module.AccountEntitlementSnapshot),
+            "purchases": self.count_rows(main_module.BillingGooglePurchase),
+            "events": self.count_rows(main_module.BillingGoogleEvent),
+            "audits": self.count_rows(main_module.BillingAuditRecord),
+            "followRequests": self.count_rows(main_module.FollowRequest),
+            "followEdges": self.count_rows(main_module.FollowEdge),
+            "favoriteFollows": self.count_rows(main_module.FavoriteFollow),
+            "relationshipCounters": self.count_rows(main_module.UserRelationshipCounter),
+        }
 
     def upsert_entitlement_snapshot(
         self,
