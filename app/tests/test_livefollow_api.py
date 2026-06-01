@@ -1353,6 +1353,7 @@ class LiveFollowApiTest(unittest.TestCase):
             )
             self.assertEqual(user_id, google_identity.user_id)
             self.assertEqual("google@example.com", google_identity.provider_email)
+            self.assertIsNone(google_identity.provider_email_verified)
             self.assertEqual(self.clock.utcnow(), google_identity.last_seen_at)
             self.assertEqual(self.clock.utcnow(), google_identity.updated_at)
         finally:

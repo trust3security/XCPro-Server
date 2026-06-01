@@ -640,20 +640,62 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             self.assertEqual(1, db.query(main_module.AuthIdentity).count())
             self.assertEqual(1, db.query(main_module.PilotProfile).count())
             self.assertEqual(1, db.query(main_module.PrivacySetting).count())
+            auth_identity = db.query(main_module.AuthIdentity).one()
+            self.assertIs(auth_identity.provider_email_verified, True)
+            support_snapshot = main_module.build_billing_support_snapshot(
+                db,
+                body["user_id"],
+            )
+            self.assertNotIn(
+                "authProviderEmailVerified",
+                support_snapshot["accountOwner"],
+            )
+        finally:
+            db.close()
+
+    def test_unverified_firebase_google_persists_unverified_email_state(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity(
+            email_verified=False,
+            sign_in_provider="google.com",
+        )
+
+        response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(200, response.status_code)
+        db = self.session_local()
+        try:
+            auth_identity = (
+                db.query(main_module.AuthIdentity)
+                .filter(main_module.AuthIdentity.provider == "firebase")
+                .one()
+            )
+            self.assertIs(auth_identity.provider_email_verified, False)
         finally:
             db.close()
 
     def test_existing_firebase_identity_reuses_user_and_updates_identity(self):
         self.verifier_results[self.firebase_id_token] = self.firebase_identity(
             email="first@example.com",
+            email_verified=False,
         )
         first_response = self.exchange(self.firebase_id_token)
         self.assertEqual(200, first_response.status_code)
         user_id = first_response.json()["user_id"]
+        db = self.session_local()
+        try:
+            auth_identity = (
+                db.query(main_module.AuthIdentity)
+                .filter(main_module.AuthIdentity.provider == "firebase")
+                .one()
+            )
+            self.assertIs(auth_identity.provider_email_verified, False)
+        finally:
+            db.close()
 
         self.clock.advance(minutes=5)
         self.verifier_results[self.firebase_id_token] = self.firebase_identity(
             email="updated@example.com",
+            email_verified=True,
         )
         second_response = self.exchange(self.firebase_id_token)
 
@@ -668,6 +710,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
                 .one()
             )
             self.assertEqual("updated@example.com", auth_identity.provider_email)
+            self.assertIs(auth_identity.provider_email_verified, True)
             self.assertEqual(self.clock.utcnow(), auth_identity.last_seen_at)
             self.assertEqual(self.clock.utcnow(), auth_identity.updated_at)
         finally:

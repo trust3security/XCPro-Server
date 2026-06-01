@@ -378,6 +378,7 @@ class ResolvedBearerIdentity:
     provider: str
     provider_subject: str
     email: Optional[str] = None
+    email_verified: Optional[bool] = None
     display_name: Optional[str] = None
 
 
@@ -1596,6 +1597,7 @@ class AuthIdentity(Base):
     provider = Column(String(40), nullable=False)
     provider_subject = Column(String(255), nullable=False)
     provider_email = Column(String(255), nullable=True)
+    provider_email_verified = Column(Boolean, nullable=True)
     created_at = Column(DateTime, nullable=False)
     updated_at = Column(DateTime, nullable=False)
     last_seen_at = Column(DateTime, nullable=False)
@@ -3118,6 +3120,7 @@ def ensure_current_user_record_for_identity(
             provider=identity.provider,
             provider_subject=identity.provider_subject,
             provider_email=trim_to_none(identity.email),
+            provider_email_verified=identity.email_verified,
             created_at=now,
             updated_at=now,
             last_seen_at=now
@@ -3192,6 +3195,8 @@ def ensure_current_user_record_for_identity(
 
     user.updated_at = now
     auth_identity.provider_email = trim_to_none(identity.email)
+    if identity.email_verified is not None:
+        auth_identity.provider_email_verified = identity.email_verified
     auth_identity.updated_at = now
     auth_identity.last_seen_at = now
     db.commit()
@@ -3213,6 +3218,7 @@ def build_firebase_bearer_identity(
         provider="firebase",
         provider_subject=identity.firebase_uid,
         email=identity.email,
+        email_verified=identity.email_verified,
         display_name=identity.display_name
     )
 
@@ -3253,6 +3259,7 @@ def create_auth_identity_for_user(
         provider=identity.provider,
         provider_subject=identity.provider_subject,
         provider_email=trim_to_none(identity.email),
+        provider_email_verified=identity.email_verified,
         created_at=now,
         updated_at=now,
         last_seen_at=now
