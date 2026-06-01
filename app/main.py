@@ -4478,6 +4478,9 @@ def build_billing_support_snapshot(db, user_id: str) -> dict[str, Any]:
             "authProviderEmail": (
                 auth_identity.provider_email if auth_identity is not None else None
             ),
+            "authProviderEmailVerified": (
+                auth_identity.provider_email_verified if auth_identity is not None else None
+            ),
         },
         "entitlement": build_support_entitlement_snapshot(entitlement),
         "currentPurchase": build_support_purchase_snapshot(current_purchase),

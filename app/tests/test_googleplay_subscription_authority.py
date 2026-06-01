@@ -1757,6 +1757,84 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_billing_support_snapshot_reports_auth_email_verification_state(self):
+        cases = (
+            {
+                "user_id": "support-firebase-verified-user",
+                "provider": "firebase",
+                "provider_subject": "firebase-verified-subject",
+                "email": "verified-firebase@example.com",
+                "email_verified": True,
+            },
+            {
+                "user_id": "support-firebase-unverified-user",
+                "provider": "firebase",
+                "provider_subject": "firebase-unverified-subject",
+                "email": "unverified-firebase@example.com",
+                "email_verified": False,
+            },
+            {
+                "user_id": "support-legacy-unknown-user",
+                "provider": "static",
+                "provider_subject": "legacy-unknown-subject",
+                "email": "legacy-unknown@example.com",
+                "email_verified": None,
+            },
+        )
+        now = self.clock.utcnow()
+        db = self.session_local()
+        try:
+            for case in cases:
+                db.add(
+                    main_module.User(
+                        id=case["user_id"],
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    main_module.AuthIdentity(
+                        id=f'{case["user_id"]}-identity',
+                        user_id=case["user_id"],
+                        provider=case["provider"],
+                        provider_subject=case["provider_subject"],
+                        provider_email=case["email"],
+                        provider_email_verified=case["email_verified"],
+                        created_at=now,
+                        updated_at=now,
+                        last_seen_at=now,
+                    )
+                )
+            db.commit()
+        finally:
+            db.close()
+        before_counts = self.support_snapshot_row_counts()
+
+        db = self.session_local()
+        try:
+            for case in cases:
+                with self.subTest(user_id=case["user_id"]):
+                    snapshot = main_module.build_billing_support_snapshot(
+                        db,
+                        case["user_id"],
+                    )
+                    owner = snapshot["accountOwner"]
+
+                    self.assertEqual(case["user_id"], owner["userId"])
+                    self.assertTrue(owner["exists"])
+                    self.assertEqual(case["provider"], owner["authProvider"])
+                    self.assertEqual(case["provider_subject"], owner["authProviderSubject"])
+                    self.assertEqual(case["email"], owner["authProviderEmail"])
+                    self.assertIn("authProviderEmailVerified", owner)
+                    self.assertIs(
+                        case["email_verified"],
+                        owner["authProviderEmailVerified"],
+                    )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.support_snapshot_row_counts())
+
     def test_billing_support_snapshot_reports_active_basic_without_mutation_or_raw_token(self):
         purchase_token = "support-active-basic-token"
         self.verifier.set_result(
@@ -1985,7 +2063,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             user_id = self.primary_user_id(db)
         finally:
             db.close()
-        before_counts = self.billing_row_counts()
+        before_counts = self.support_snapshot_row_counts()
 
         for argv, expected_kind in (
             (["--user-id", user_id], "userId"),
@@ -2001,12 +2079,16 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
                     session_factory=self.session_local,
                 )
 
-                self.assertEqual(before_counts, self.billing_row_counts())
+                self.assertEqual(before_counts, self.support_snapshot_row_counts())
                 self.assertTrue(result["ok"])
                 self.assertEqual(expected_kind, result["lookup"]["kind"])
-                self.assertEqual(user_id, result["snapshot"]["accountOwner"]["userId"])
+                owner = result["snapshot"]["accountOwner"]
+                self.assertEqual(user_id, owner["userId"])
+                self.assertIn("authProviderEmailVerified", owner)
+                self.assertIsNone(owner["authProviderEmailVerified"])
                 self.assertEqual("BASIC", result["snapshot"]["entitlement"]["tier"])
                 self.assert_plaintext_absent(result, purchase_token)
+                self.assert_plaintext_absent(result, self.primary_bearer_token)
 
     def test_support_billing_snapshot_cli_resolves_by_purchase_token_hash(self):
         purchase_token = "support-cli-token-hash-token"
@@ -2018,7 +2100,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             headers=self.package_headers(),
         )
         self.assertEqual(200, sync.status_code)
-        before_counts = self.billing_row_counts()
+        before_counts = self.support_snapshot_row_counts()
 
         result = support_billing_snapshot_script.run(
             support_billing_snapshot_script.parse_args(
@@ -2027,15 +2109,21 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             session_factory=self.session_local,
         )
 
-        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual(before_counts, self.support_snapshot_row_counts())
         self.assertTrue(result["ok"])
         self.assertEqual("purchaseTokenHash", result["lookup"]["kind"])
         self.assertEqual(purchase_token_hash, result["lookup"]["purchaseTokenHash"])
+        self.assertIn(
+            "authProviderEmailVerified",
+            result["snapshot"]["accountOwner"],
+        )
+        self.assertIsNone(result["snapshot"]["accountOwner"]["authProviderEmailVerified"])
         self.assertEqual(
             purchase_token_hash,
             result["snapshot"]["currentPurchase"]["purchaseTokenHash"],
         )
         self.assert_plaintext_absent(result, purchase_token)
+        self.assert_plaintext_absent(result, self.primary_bearer_token)
 
     def test_support_billing_snapshot_cli_rejects_raw_purchase_token_without_mutation(self):
         purchase_token = "support-cli-raw-token-rejected"
@@ -2046,7 +2134,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             headers=self.package_headers(),
         )
         self.assertEqual(200, sync.status_code)
-        before_counts = self.billing_row_counts()
+        before_counts = self.support_snapshot_row_counts()
 
         with self.assertRaises(support_billing_snapshot_script.SupportBillingSnapshotScriptError):
             support_billing_snapshot_script.run(
@@ -2056,7 +2144,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
                 session_factory=self.session_local,
             )
 
-        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual(before_counts, self.support_snapshot_row_counts())
 
     def package_headers(
         self,
@@ -2246,6 +2334,14 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             "events": self.count_rows(main_module.BillingGoogleEvent),
             "audits": self.count_rows(main_module.BillingAuditRecord),
         }
+
+    def support_snapshot_row_counts(self) -> dict[str, int]:
+        counts = {
+            "users": self.count_rows(main_module.User),
+            "authIdentities": self.count_rows(main_module.AuthIdentity),
+        }
+        counts.update(self.billing_row_counts())
+        return counts
 
     def assert_plaintext_absent(self, value, plaintext: str):
         self.assertNotIn(plaintext, json.dumps(value, default=str))
