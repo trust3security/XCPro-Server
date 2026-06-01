@@ -1323,6 +1323,85 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual("Google Pilot", me_body["display_name"])
         self.assertEqual("searchable", me_body["privacy"]["discoverability"])
 
+    def test_legacy_google_auth_exchange_reuses_identity_without_duplicate_account(self):
+        first_response = self.client.post(
+            "/api/v2/auth/google/exchange",
+            json={"google_id_token": self.google_id_token}
+        )
+        self.assertEqual(200, first_response.status_code)
+        user_id = first_response.json()["user_id"]
+
+        self.clock.advance(minutes=5)
+        second_response = self.client.post(
+            "/api/v2/auth/google/exchange",
+            json={"google_id_token": self.google_id_token}
+        )
+
+        self.assertEqual(200, second_response.status_code)
+        self.assertEqual(user_id, second_response.json()["user_id"])
+        db = self.session_local()
+        try:
+            self.assertEqual(1, db.query(main_module.User).count())
+            self.assertEqual(1, db.query(main_module.AuthIdentity).count())
+            google_identity = (
+                db.query(main_module.AuthIdentity)
+                .filter(
+                    main_module.AuthIdentity.provider == "google",
+                    main_module.AuthIdentity.provider_subject == "google-user-1",
+                )
+                .one()
+            )
+            self.assertEqual(user_id, google_identity.user_id)
+            self.assertEqual("google@example.com", google_identity.provider_email)
+            self.assertEqual(self.clock.utcnow(), google_identity.last_seen_at)
+            self.assertEqual(self.clock.utcnow(), google_identity.updated_at)
+        finally:
+            db.close()
+
+    def test_legacy_google_auth_exchange_does_not_return_persist_or_log_raw_token(self):
+        exchange_response = self.client.post(
+            "/api/v2/auth/google/exchange",
+            json={"google_id_token": self.google_id_token}
+        )
+
+        self.assertEqual(200, exchange_response.status_code)
+        self.assertNotIn(self.google_id_token, str(exchange_response.json()))
+        db = self.session_local()
+        try:
+            google_identity = (
+                db.query(main_module.AuthIdentity)
+                .filter(main_module.AuthIdentity.provider == "google")
+                .one()
+            )
+            self.assertNotIn(self.google_id_token, google_identity.provider_subject)
+            self.assertNotIn(
+                self.google_id_token,
+                google_identity.provider_email or ""
+            )
+        finally:
+            db.close()
+
+        raw_invalid_token = "raw-google-token-never-returned"
+        invalid_response = self.client.post(
+            "/api/v2/auth/google/exchange",
+            json={"google_id_token": raw_invalid_token}
+        )
+
+        self.assertEqual(401, invalid_response.status_code)
+        self.assertNotIn(raw_invalid_token, str(invalid_response.json()))
+
+        source = "\n".join(
+            python_inspect.getsource(target)
+            for target in (
+                main_module.exchange_google_auth_token,
+                main_module.verify_google_id_token_for_exchange,
+                main_module.build_google_auth_exchange_response,
+            )
+        )
+        for forbidden_logging_marker in ("print(", "logger.", "logging."):
+            with self.subTest(forbidden_logging_marker=forbidden_logging_marker):
+                self.assertNotIn(forbidden_logging_marker, source)
+
     def test_google_auth_exchange_rejects_invalid_google_token(self):
         response = self.client.post(
             "/api/v2/auth/google/exchange",
