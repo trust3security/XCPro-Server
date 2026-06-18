@@ -1,6 +1,7 @@
 # PureTrack Backend Proxy Contract
 
-Status: reviewed contract; status/connect/disconnect implemented locally.
+Status: reviewed contract; status/connect/disconnect implemented locally;
+Insert publishing contract planned for local implementation.
 Date: 2026-06-18
 
 ## Purpose
@@ -13,7 +14,9 @@ raw Traffic API rows in the APK.
 Local commit `4b7064a Add PureTrack backend proxy endpoints` implements and
 tests the Android-facing status/connect/disconnect routes described here.
 Production deployment/live-server parity, the real PureTrack provider adapter,
-traffic proxy routes, and Insert publishing routes remain separate future work.
+traffic proxy routes, and Insert publishing runtime rollout remain separate
+future work. The Android-facing Insert route contract below is frozen for local
+server implementation before Android publishing code consumes it.
 
 Verified current anchors:
 
@@ -27,6 +30,9 @@ Verified current anchors:
 - `app/main.py` still returns coarse `providerStates.pureTrack` values inside
   entitlement response builders; dedicated PureTrack settings state comes from
   `/api/v1/puretrack/status`.
+- Android outbound publishing will call only the XCPro backend
+  `POST /api/v1/puretrack/insert` route. The backend injects the server-only
+  PureTrack Insert key into the upstream PureTrack request.
 
 ## Ownership
 
@@ -38,16 +44,20 @@ XCPro backend owns:
 - PureTrack Traffic API calls, bbox validation, filtering, rate limiting,
   compact-row parsing, and redaction in later traffic phases.
 - Redacted Android-visible PureTrack status projection.
+- Server-only PureTrack Insert key configuration and upstream Insert calls.
 
 Android owns only:
 
 - XCPro account Bearer token presentation to XCPro backend.
 - User-entered PureTrack email/password submission for a connect command.
 - Rendering redacted PureTrack status and errors returned by XCPro backend.
+- Durable outbound publish queue records, retry state, and queue deletion
+  decisions based on server `acceptedClientPointIds`.
 
 Android must never store or receive:
 
 - PureTrack app key.
+- PureTrack Insert key.
 - PureTrack access token, refresh token, Bearer token, cookie, or session key.
 - PureTrack password after the connect request completes.
 - Raw compact Traffic API rows.
@@ -59,6 +69,7 @@ Server implementation must use these environment keys:
 
 ```dotenv
 XCPRO_PURETRACK_APP_KEY=
+XCPRO_PURETRACK_INSERT_KEY=
 XCPRO_PURETRACK_API_BASE_URL=https://puretrack.io
 XCPRO_PURETRACK_TIMEOUT_SECONDS=10
 ```
@@ -69,8 +80,15 @@ Rules:
   Pro provider access are required before `trafficApiAllowed` can be true.
   Android/server domain models represent the PureTrack provider-capable state as
   `PREMIUM` to avoid conflating it with XCPro `PlanTier.PRO`.
-- `XCPRO_PURETRACK_APP_KEY` must not be emitted in responses, logs, audit
-  detail, support snapshots, test failure messages, or Android fixtures.
+- `XCPRO_PURETRACK_INSERT_KEY` is required before `insertApiConfigured` can be
+  true and before `POST /api/v1/puretrack/insert` can publish upstream.
+- Outbound Insert publishing requires verified XCPro `PlanTier.PRO` entitlement
+  plus server Insert-key configuration. A PureTrack Pro provider account is not
+  required for outbound publishing unless a later product decision updates this
+  contract and Android billing policy together.
+- `XCPRO_PURETRACK_APP_KEY` and `XCPRO_PURETRACK_INSERT_KEY` must not be
+  emitted in responses, logs, audit detail, support snapshots, test failure
+  messages, or Android fixtures.
 - `XCPRO_PURETRACK_API_BASE_URL` is server-only configuration.
 - `XCPRO_PURETRACK_TIMEOUT_SECONDS` controls backend-to-PureTrack requests.
 
@@ -98,6 +116,7 @@ Rules:
 GET  /api/v1/puretrack/status
 POST /api/v1/puretrack/connect
 POST /api/v1/puretrack/disconnect
+POST /api/v1/puretrack/insert
 ```
 
 No Android production route may call PureTrack directly. These routes are
@@ -133,7 +152,7 @@ Fields:
   state allow production inbound PureTrack traffic proxy calls. Android must
   consume this field and must not infer PureTrack provider entitlement locally.
 - `insertApiConfigured`: true only when server-side Insert publishing
-  configuration is present. Insert publishing remains a separate future flow.
+  configuration is present through `XCPRO_PURETRACK_INSERT_KEY`.
 - `userAccess`: PureTrack provider access only; one of `UNKNOWN`, `NONE`,
   `FREE`, `PREMIUM`, `ERROR`. `PREMIUM` represents a PureTrack Pro-capable
   provider account and is not the XCPro `PlanTier.PRO` entitlement value.
@@ -281,6 +300,139 @@ Behavior:
   relationships, or Android local profile data.
 - Does not call PureTrack Insert publishing or traffic overlay routes.
 
+## Insert Publish Route
+
+```http
+POST /api/v1/puretrack/insert
+Content-Type: application/json
+```
+
+Request body: `PureTrackInsertPublishRequest`.
+
+```json
+{
+  "clientBatchId": "batch-20260618-0001",
+  "trackers": [
+    {
+      "deviceID": "d7ry390",
+      "type": 1,
+      "rego": "ZK-ABC",
+      "label": "XCPro",
+      "points": [
+        {
+          "clientPointId": "queue-row-1",
+          "ts": 1713563621,
+          "lat": -41.2334745,
+          "lng": 174.348365,
+          "alt": 345.1,
+          "speed": 25.0,
+          "course": 270.0,
+          "vspeed": 5.3
+        }
+      ]
+    }
+  ]
+}
+```
+
+`PureTrackInsertPublishRequest` validation:
+
+- `clientBatchId`: required non-blank string, maximum 128 characters. It is a
+  client queue/drain correlation id only and is not a secret.
+- `trackers`: required non-empty array, maximum 16 tracker objects.
+- Each tracker object:
+  - `deviceID`: required non-blank string, maximum 64 characters. This is the
+    Android-selected aircraft PureTrack Device ID; the server must not generate
+    a fallback Device ID.
+  - `type`: optional integer PureTrack type id. Android P1A freezes the
+    supported mappings as sailplane/glider `1`, paraglider `7`, and hang glider
+    `6`, matching PureTrack's published type list at contract freeze time.
+  - `rego`: optional non-blank string, maximum 32 characters. Use only when
+    Android identity policy has an aircraft registration value.
+  - `label`: optional non-blank string, maximum 64 characters. Use only a
+    display label; do not include credentials or raw account emails.
+  - `points`: required non-empty array, maximum 256 point objects.
+- Each point object:
+  - `clientPointId`: required non-blank string, maximum 128 characters. Android
+    queue deletion is keyed only by ids returned in `acceptedClientPointIds`.
+  - `ts`: required Unix epoch seconds from the GPS/fix timestamp.
+  - `lat`: required finite decimal latitude in `[-90, 90]`.
+  - `lng`: required finite decimal longitude in `[-180, 180]`.
+  - `alt`: optional finite altitude in meters.
+  - `speed`: optional finite ground speed in meters per second.
+  - `course`: optional finite course in degrees in `[0, 360]`.
+  - `vspeed`: optional finite vertical speed in meters per second.
+- Request models must reject unknown fields at every level.
+- Android must not send the upstream PureTrack `key` field, PureTrack provider
+  tokens, Bearer tokens, passwords, raw provider payloads, or direct PureTrack
+  URLs.
+
+The backend maps each tracker to the upstream PureTrack Insert shape by adding
+the server-only `XCPRO_PURETRACK_INSERT_KEY` as `key` and forwarding only the
+validated fields above. The backend may combine multiple Android trackers in a
+single upstream array request. The backend does not persist queued publish
+points; Android remains the durable queue owner.
+
+Success response: `200 PureTrackInsertPublishResponse`.
+
+```json
+{
+  "result": "ACCEPTED",
+  "acceptedClientPointIds": ["queue-row-1"],
+  "serverReceivedPointCount": 1,
+  "providerInsertedPointCount": 1,
+  "retryAfterMs": null,
+  "auditId": "redacted-audit-id"
+}
+```
+
+`result` values:
+
+- `ACCEPTED`: upstream PureTrack reported all received points inserted. The
+  response returns every accepted client point id in `acceptedClientPointIds`.
+- `PARTIAL_RETRY`: upstream PureTrack reported fewer inserted points than
+  received, or returned an ambiguous partial result. Because upstream PureTrack
+  returns aggregate counts rather than per-point ids, the server returns an
+  empty `acceptedClientPointIds`; Android must retain the batch for retry.
+- `RETRYABLE_FAILURE`: upstream PureTrack timed out, returned 429/5xx, or the
+  backend hit a retryable provider/network failure. The response returns an
+  empty `acceptedClientPointIds`; Android must retain the batch and respect
+  `retryAfterMs` when present.
+- `REJECTED`: the backend or upstream response determined the whole batch is
+  non-retryable after validation. The response returns an empty
+  `acceptedClientPointIds`; Android must not delete queued records unless a
+  later queue-drain phase explicitly defines a non-retryable drop policy.
+
+Queue-drain semantics:
+
+- Android deletes or marks sent only queue records whose `clientPointId` appears
+  in `acceptedClientPointIds`.
+- `acceptedClientPointIds` is all-or-none for the initial server
+  implementation: full upstream success returns all supplied point ids; partial
+  or failed upstream outcomes return none.
+- `serverReceivedPointCount` is the total number of validated request points.
+- `providerInsertedPointCount` is the upstream aggregate inserted count when
+  available; otherwise it is null.
+- `auditId` is a redacted backend support correlation id. It must not encode
+  the bearer token, account email, Device ID, location, Insert key, or provider
+  payload.
+- `retryAfterMs` is nullable and non-negative. If the route returns HTTP 429 or
+  another retryable HTTP error with a reliable retry delay, the HTTP
+  `Retry-After` header and JSON `retryAfterMs` must agree.
+
+Insert route behavior:
+
+- Requires the common XCPro Bearer token and package header.
+- Requires verified XCPro `PlanTier.PRO` entitlement for the authenticated
+  account.
+- Requires `XCPRO_PURETRACK_INSERT_KEY`; when absent, returns
+  `puretrack_insert_key_unconfigured`.
+- Does not require a connected PureTrack provider session or PureTrack Pro
+  provider account.
+- Does not mutate PureTrack connect/disconnect provider session state.
+- Does not read or write Android queue state, LiveFollow state, map/traffic
+  state, or profile identity state.
+
 ## Error Envelope
 
 All HTTP errors use the existing server envelope:
@@ -297,8 +449,14 @@ Required error codes:
 - `unauthenticated`: missing or invalid XCPro bearer token.
 - `invalid_package`: missing or invalid Android package context.
 - `validation_error`: malformed JSON or field validation failure.
+- `feature_access_denied`: authenticated account lacks verified XCPro PRO
+  access for outbound Insert publishing.
 - `puretrack_app_key_unconfigured`: server lacks
   `XCPRO_PURETRACK_APP_KEY`.
+- `puretrack_insert_key_unconfigured`: server lacks
+  `XCPRO_PURETRACK_INSERT_KEY`.
+- `puretrack_insert_rejected`: request was valid at the XCPro boundary but the
+  upstream provider rejected the whole Insert batch as non-retryable.
 - `puretrack_provider_unavailable`: PureTrack request failed, timed out, or
   returned retryable 5xx/429.
 - `puretrack_rate_limited`: backend or PureTrack rate limit applies.
@@ -345,15 +503,15 @@ account raw email, or raw provider payloads.
 
 ## Traffic API And Insert API Separation
 
-This contract covers status/connect/disconnect only.
-
 Future inbound PureTrack overlay/aircraft traffic must use backend/proxy
 routes and must return normalized XCPro DTOs. Android must not parse or store
 raw compact PureTrack Traffic API rows.
 
-Future outbound Insert publishing is a separate flow. Insert publishing must
-consume the selected aircraft PureTrack Device ID from Android-side identity
-policy but must not be implemented through status/connect/disconnect routes.
+Outbound Insert publishing is a separate flow from status/connect/disconnect
+and traffic proxy routes. It must consume the selected aircraft PureTrack Device
+ID from Android-side identity policy and use only
+`POST /api/v1/puretrack/insert`; it must not be implemented through
+status/connect/disconnect routes.
 
 ## Redaction Rules
 
@@ -362,9 +520,12 @@ state, test fixtures, and exception detail:
 
 - Android `Authorization` header.
 - `XCPRO_PURETRACK_APP_KEY`.
+- `XCPRO_PURETRACK_INSERT_KEY`.
 - PureTrack password.
 - PureTrack access token, refresh token, Bearer token, cookie, or session key.
 - Raw PureTrack provider responses.
+- Raw PureTrack Insert provider responses.
+- Raw location point payloads and queued publish batches in support snapshots.
 - Raw compact Traffic API rows.
 - Direct PureTrack request URLs when query parameters could contain sensitive
   account, location, bbox, or filtering context.
@@ -387,8 +548,11 @@ Recommended server phases:
    route implementation with fake provider adapter tests.
 3. Planned: add real PureTrack provider adapter behind server-only
    configuration.
-4. Planned: add later traffic proxy and Insert publishing contracts as separate
-   phases.
+4. Planned next locally: implement `POST /api/v1/puretrack/insert` using the
+   contract above, fake-provider tests, server-only Insert key configuration,
+   and redaction/ack semantics.
+5. Planned later: add traffic proxy contracts and production deployment parity
+   as separate phases.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the
