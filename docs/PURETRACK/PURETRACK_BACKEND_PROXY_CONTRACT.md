@@ -62,7 +62,9 @@ XCPRO_PURETRACK_TIMEOUT_SECONDS=10
 Rules:
 
 - `XCPRO_PURETRACK_APP_KEY`, XCPro `PlanTier.PRO` entitlement, and PureTrack
-  Premium provider access are required before `trafficApiAllowed` can be true.
+  Pro provider access are required before `trafficApiAllowed` can be true.
+  Android/server domain models represent the PureTrack provider-capable state as
+  `PREMIUM` to avoid conflating it with XCPro `PlanTier.PRO`.
 - `XCPRO_PURETRACK_APP_KEY` must not be emitted in responses, logs, audit
   detail, support snapshots, test failure messages, or Android fixtures.
 - `XCPRO_PURETRACK_API_BASE_URL` is server-only configuration.
@@ -129,8 +131,8 @@ Fields:
 - `insertApiConfigured`: true only when server-side Insert publishing
   configuration is present. Insert publishing remains a separate future flow.
 - `userAccess`: PureTrack provider access only; one of `UNKNOWN`, `NONE`,
-  `FREE`, `PREMIUM`, `ERROR`. This is not the XCPro `PlanTier.PRO`
-  entitlement value.
+  `FREE`, `PREMIUM`, `ERROR`. `PREMIUM` represents a PureTrack Pro-capable
+  provider account and is not the XCPro `PlanTier.PRO` entitlement value.
 - `verifiedAtMs`: server wall-clock epoch milliseconds for last provider state
   verification, or null.
 - `validUntilMs`: server wall-clock epoch milliseconds for known provider
