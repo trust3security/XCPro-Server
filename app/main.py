@@ -312,6 +312,7 @@ class ErrorCode:
     ENTITLEMENT_STATE_INVALID = "entitlement_state_invalid"
     INVALID_GOOGLE_ID_TOKEN = "invalid_google_id_token"
     INVALID_FIREBASE_ID_TOKEN = "invalid_firebase_id_token"
+    UNSUPPORTED_FIREBASE_AUTH_PROVIDER = "unsupported_firebase_auth_provider"
     EMAIL_VERIFICATION_REQUIRED = "email_verification_required"
     AUTH_RECOVERY_REQUIRED = "auth_recovery_required"
     SESSION_NOT_FOUND = "session_not_found"
@@ -1108,8 +1109,13 @@ def verify_private_follow_bearer(token: str) -> Optional[ResolvedBearerIdentity]
     if not provider or not provider_subject:
         return None
 
-    email = str(payload.get("email", "")).strip() or None
-    display_name = str(payload.get("display_name", "")).strip() or None
+    def optional_string_claim(raw_value: Any) -> Optional[str]:
+        if not isinstance(raw_value, str):
+            return None
+        return raw_value.strip() or None
+
+    email = optional_string_claim(payload.get("email"))
+    display_name = optional_string_claim(payload.get("display_name"))
     return ResolvedBearerIdentity(
         provider=provider,
         provider_subject=provider_subject,
@@ -3436,6 +3442,29 @@ def ensure_current_user_record_for_identity(
 
 
 FIREBASE_EMAIL_PASSWORD_SIGN_IN_PROVIDERS = frozenset({"password", "email-password"})
+FIREBASE_GOOGLE_SIGN_IN_PROVIDER = "google.com"
+FIREBASE_PHONE_SIGN_IN_PROVIDER = "phone"
+
+
+def unsupported_firebase_auth_provider_exception(
+    sign_in_provider: Optional[str]
+) -> ApiHTTPException:
+    provider = str(sign_in_provider or "").strip() or "unknown"
+    return ApiHTTPException(
+        status_code=403,
+        code=ErrorCode.UNSUPPORTED_FIREBASE_AUTH_PROVIDER,
+        detail=f"Unsupported Firebase auth method: {provider}"
+    )
+
+
+def firebase_exchange_auth_method(identity: ResolvedFirebaseIdentity) -> str:
+    if identity.sign_in_provider in FIREBASE_EMAIL_PASSWORD_SIGN_IN_PROVIDERS:
+        return "email_password"
+    if identity.sign_in_provider == FIREBASE_GOOGLE_SIGN_IN_PROVIDER:
+        return "firebase_google"
+    if identity.sign_in_provider == FIREBASE_PHONE_SIGN_IN_PROVIDER:
+        return "phone"
+    raise unsupported_firebase_auth_provider_exception(identity.sign_in_provider)
 
 
 def build_firebase_bearer_identity(
@@ -3627,13 +3656,14 @@ def build_google_auth_exchange_response(
 def build_firebase_auth_exchange_response(
     db,
     current_user: CurrentUserRecord,
-    access_token: str
+    access_token: str,
+    firebase_identity: ResolvedFirebaseIdentity
 ) -> dict[str, Any]:
     expires_at = utcnow() + timedelta(seconds=PRIVATE_FOLLOW_BEARER_TTL_SECONDS)
     return {
         "access_token": access_token,
         "token_type": "Bearer",
-        "auth_method": "firebase",
+        "auth_method": firebase_exchange_auth_method(firebase_identity),
         "user_id": current_user.user.id,
         "expires_at": to_iso_utc(expires_at),
         "profile": build_me_response(db, current_user),
@@ -8204,6 +8234,7 @@ def exchange_firebase_auth_token(
             detail="email verification is required"
         )
 
+    firebase_exchange_auth_method(firebase_identity)
     validate_entitlement_package_name(package_name)
     bearer_identity = build_firebase_bearer_identity(firebase_identity)
     db = SessionLocal()
@@ -8213,7 +8244,12 @@ def exchange_firebase_auth_token(
             firebase_identity
         )
         access_token = issue_private_follow_bearer(bearer_identity)
-        return build_firebase_auth_exchange_response(db, current_user, access_token)
+        return build_firebase_auth_exchange_response(
+            db,
+            current_user,
+            access_token,
+            firebase_identity
+        )
     finally:
         db.close()
 

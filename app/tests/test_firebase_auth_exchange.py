@@ -525,6 +525,10 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
             "auth_recovery_required",
             main_module.ErrorCode.AUTH_RECOVERY_REQUIRED,
         )
+        self.assertEqual(
+            "unsupported_firebase_auth_provider",
+            main_module.ErrorCode.UNSUPPORTED_FIREBASE_AUTH_PROVIDER,
+        )
         route_paths = {getattr(route, "path", None) for route in main_module.app.routes}
         self.assertIn("/api/v2/auth/firebase/exchange", route_paths)
 
@@ -605,7 +609,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         body = response.json()
         self.assert_firebase_exchange_response_has_bootstrap(body)
         self.assertEqual("Bearer", body["token_type"])
-        self.assertEqual("firebase", body["auth_method"])
+        self.assertEqual("email_password", body["auth_method"])
         self.assertNotIn(self.firebase_id_token, str(body))
         self.assertEqual(body["user_id"], body["profile"]["user_id"])
         self.assertEqual("Firebase Pilot", body["profile"]["display_name"])
@@ -656,6 +660,182 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_verified_email_password_alias_returns_email_password_auth_method(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity(
+            sign_in_provider="email-password",
+            email_verified=True,
+        )
+
+        response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("email_password", response.json()["auth_method"])
+
+    def test_phone_provider_creates_account_defaults_and_usable_bearer(self):
+        phone_number = "+15555550100"
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity(
+            sign_in_provider="phone",
+            email=None,
+            email_verified=False,
+            display_name="Phone Pilot",
+            provider_identities={"phone": [phone_number]},
+        )
+
+        response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assert_firebase_exchange_response_has_bootstrap(body)
+        self.assertEqual("Bearer", body["token_type"])
+        self.assertEqual("phone", body["auth_method"])
+        self.assertNotIn(self.firebase_id_token, str(body))
+        self.assertNotIn(phone_number, str(body))
+        self.assertEqual(body["user_id"], body["profile"]["user_id"])
+        self.assertEqual("Phone Pilot", body["profile"]["display_name"])
+        self.assertEqual("searchable", body["profile"]["privacy"]["discoverability"])
+        self.assertEqual(body["user_id"], body["entitlement"]["accountSubject"])
+        self.assertEqual("FREE", body["entitlement"]["tier"])
+        self.assertEqual("FREE_CANONICAL", body["entitlement"]["verificationState"])
+
+        bearer_identity = main_module.verify_private_follow_bearer(body["access_token"])
+        self.assertEqual("firebase", bearer_identity.provider)
+        self.assertEqual("firebase-uid-1", bearer_identity.provider_subject)
+
+        me_response = self.client.get(
+            "/api/v2/me",
+            headers=self.bearer_headers(body["access_token"]),
+        )
+        self.assertEqual(200, me_response.status_code)
+        self.assertEqual(body["user_id"], me_response.json()["user_id"])
+
+        db = self.session_local()
+        try:
+            self.assertEqual(1, db.query(main_module.User).count())
+            self.assertEqual(1, db.query(main_module.AuthIdentity).count())
+            self.assertEqual(1, db.query(main_module.PilotProfile).count())
+            self.assertEqual(1, db.query(main_module.PrivacySetting).count())
+            auth_identity = db.query(main_module.AuthIdentity).one()
+            self.assertEqual("firebase", auth_identity.provider)
+            self.assertEqual("firebase-uid-1", auth_identity.provider_subject)
+            self.assertIsNone(auth_identity.provider_email)
+            self.assertIs(auth_identity.provider_email_verified, False)
+            support_snapshot = main_module.build_billing_support_snapshot(
+                db,
+                body["user_id"],
+            )
+            self.assertNotIn(phone_number, json.dumps(support_snapshot, default=str))
+        finally:
+            db.close()
+
+    def test_existing_phone_identity_reuses_user_and_updates_last_seen(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity(
+            sign_in_provider="phone",
+            email=None,
+            email_verified=False,
+            display_name=None,
+            provider_identities={"phone": ["+15555550101"]},
+        )
+        first_response = self.exchange(self.firebase_id_token)
+        self.assertEqual(200, first_response.status_code)
+        user_id = first_response.json()["user_id"]
+
+        db = self.session_local()
+        try:
+            auth_identity = db.query(main_module.AuthIdentity).one()
+            first_seen_at = auth_identity.last_seen_at
+            self.assertEqual(self.clock.utcnow(), first_seen_at)
+        finally:
+            db.close()
+
+        self.clock.advance(minutes=5)
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity(
+            sign_in_provider="phone",
+            email=None,
+            email_verified=False,
+            display_name="Ignored Updated Phone Name",
+            provider_identities={"phone": ["+15555550102"]},
+        )
+
+        second_response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(200, second_response.status_code)
+        self.assertEqual("phone", second_response.json()["auth_method"])
+        self.assertEqual(user_id, second_response.json()["user_id"])
+        db = self.session_local()
+        try:
+            auth_identity = db.query(main_module.AuthIdentity).one()
+            self.assertEqual(self.clock.utcnow(), auth_identity.last_seen_at)
+            self.assertGreater(auth_identity.last_seen_at, first_seen_at)
+            self.assertIsNone(auth_identity.provider_email)
+            self.assertIs(auth_identity.provider_email_verified, False)
+            self.assertEqual(1, db.query(main_module.User).count())
+            self.assertEqual(1, db.query(main_module.AuthIdentity).count())
+        finally:
+            db.close()
+
+    def test_phone_provider_without_email_or_display_name_leaves_profile_incomplete(self):
+        self.verifier_results[self.firebase_id_token] = self.firebase_identity(
+            sign_in_provider="phone",
+            email=None,
+            email_verified=False,
+            display_name=None,
+            provider_identities={"phone": ["+15555550103"]},
+        )
+
+        response = self.exchange(self.firebase_id_token)
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual("phone", body["auth_method"])
+        self.assertIsNone(body["profile"]["handle"])
+        self.assertIsNone(body["profile"]["display_name"])
+        self.assertIsNone(body["profile"]["comp_number"])
+        db = self.session_local()
+        try:
+            profile = db.query(main_module.PilotProfile).one()
+            self.assertIsNone(profile.handle)
+            self.assertIsNone(profile.display_name)
+            self.assertIsNone(profile.comp_number)
+        finally:
+            db.close()
+
+    def test_unsupported_and_missing_firebase_providers_are_rejected_without_mutation(self):
+        cases = (
+            ("github.com", "github.com"),
+            (None, "unknown"),
+            (" ", "unknown"),
+        )
+        for raw_provider, expected_provider in cases:
+            with self.subTest(raw_provider=raw_provider):
+                token = f"unsupported-{expected_provider}-token"
+                self.verifier_results[token] = self.firebase_identity(
+                    firebase_uid=f"firebase-{expected_provider}",
+                    sign_in_provider=raw_provider,
+                    provider_identities={},
+                )
+
+                response = self.exchange(token)
+
+                self.assertEqual(403, response.status_code)
+                body = response.json()
+                self.assertEqual(
+                    main_module.ErrorCode.UNSUPPORTED_FIREBASE_AUTH_PROVIDER,
+                    body["code"],
+                )
+                self.assertEqual(
+                    f"Unsupported Firebase auth method: {expected_provider}",
+                    body["detail"],
+                )
+                self.assertNotIn(token, str(body))
+                db = self.session_local()
+                try:
+                    self.assertEqual(0, db.query(main_module.User).count())
+                    self.assertEqual(0, db.query(main_module.AuthIdentity).count())
+                    self.assertEqual(0, db.query(main_module.PilotProfile).count())
+                    self.assertEqual(0, db.query(main_module.PrivacySetting).count())
+                finally:
+                    db.close()
+
     def test_unverified_firebase_google_persists_unverified_email_state(self):
         self.verifier_results[self.firebase_id_token] = self.firebase_identity(
             email_verified=False,
@@ -665,6 +845,7 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         response = self.exchange(self.firebase_id_token)
 
         self.assertEqual(200, response.status_code)
+        self.assertEqual("firebase_google", response.json()["auth_method"])
         db = self.session_local()
         try:
             auth_identity = (

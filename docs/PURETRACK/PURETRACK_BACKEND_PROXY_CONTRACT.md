@@ -1,6 +1,6 @@
 # PureTrack Backend Proxy Contract
 
-Status: reviewed contract for Android P3A0, implementation pending.
+Status: reviewed contract; status/connect/disconnect implemented locally.
 Date: 2026-06-18
 
 ## Purpose
@@ -10,9 +10,10 @@ PureTrack account/provider state. It exists to unblock Android-side contract
 and DTO work without putting PureTrack credentials, app keys, Bearer tokens, or
 raw Traffic API rows in the APK.
 
-The current server implementation does not yet provide these routes. Current
-code only exposes placeholder PureTrack provider state inside entitlement
-readback.
+Local commit `4b7064a Add PureTrack backend proxy endpoints` implements and
+tests the Android-facing status/connect/disconnect routes described here.
+Production deployment/live-server parity, the real PureTrack provider adapter,
+traffic proxy routes, and Insert publishing routes remain separate future work.
 
 Verified current anchors:
 
@@ -21,8 +22,11 @@ Verified current anchors:
   `resolve_bearer_identity(...)`.
 - `app/main.py` validates Android package context with
   `X-XCPro-Package-Name` on entitlement/auth flows.
-- `app/main.py` currently returns `providerStates.pureTrack` placeholders from
-  entitlement response builders.
+- `app/main.py` exposes `/api/v1/puretrack/status`,
+  `/api/v1/puretrack/connect`, and `/api/v1/puretrack/disconnect`.
+- `app/main.py` still returns coarse `providerStates.pureTrack` values inside
+  entitlement response builders; dedicated PureTrack settings state comes from
+  `/api/v1/puretrack/status`.
 
 ## Ownership
 
@@ -377,12 +381,16 @@ raw PureTrack payloads.
 
 Recommended server phases:
 
-1. Add config/error/model skeleton and tests without external PureTrack calls.
-2. Add status/connect/disconnect route implementation with fake provider
-   adapter tests.
-3. Add real PureTrack provider adapter behind server-only configuration.
-4. Add later traffic proxy and Insert publishing contracts as separate phases.
+1. Complete/current locally: add config/error/model skeleton and tests without
+   external PureTrack calls.
+2. Complete/current locally in commit `4b7064a`: add status/connect/disconnect
+   route implementation with fake provider adapter tests.
+3. Planned: add real PureTrack provider adapter behind server-only
+   configuration.
+4. Planned: add later traffic proxy and Insert publishing contracts as separate
+   phases.
 
-Android may start P3A1 after this contract is synced into the Android PureTrack
-IP. Android must still not implement a production HTTP adapter until the server
-routes exist and are tested.
+Android P3A1 is complete. Android P3B1 may implement the production HTTP
+adapter against these XCPro backend status/connect/disconnect routes after the
+Android PureTrack IP records the local server evidence. Live server deployment
+parity remains a separate deployment/release concern.
