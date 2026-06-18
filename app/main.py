@@ -4,7 +4,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictStr
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
@@ -123,6 +123,24 @@ DENIED_ENTITLEMENT_HARD_REFRESH_AFTER_MS = 3_600_000
 PAID_CONTINUITY_STALE_AFTER_MS = 21_600_000
 PAID_CONTINUITY_HARD_REFRESH_AFTER_MS = 259_200_000
 PLAN_TIER_VALUES = frozenset({"FREE", "BASIC", "SOARING", "XC", "PRO"})
+PURETRACK_USER_ACCESS_VALUES = frozenset({"UNKNOWN", "NONE", "FREE", "PREMIUM", "ERROR"})
+PURETRACK_PROVIDER_ACCESS_UNKNOWN = "UNKNOWN"
+PURETRACK_PROVIDER_ACCESS_NONE = "NONE"
+PURETRACK_PROVIDER_ACCESS_FREE = "FREE"
+PURETRACK_PROVIDER_ACCESS_PREMIUM = "PREMIUM"
+PURETRACK_PROVIDER_ACCESS_ERROR = "ERROR"
+PURETRACK_CONNECT_RESULT_CONNECTED = "CONNECTED"
+PURETRACK_CONNECT_RESULT_AUTH_REJECTED = "AUTH_REJECTED"
+PURETRACK_CONNECT_RESULT_APP_KEY_UNCONFIGURED = "APP_KEY_UNCONFIGURED"
+PURETRACK_CONNECT_RESULT_PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+PURETRACK_CONNECT_RESULT_RATE_LIMITED = "RATE_LIMITED"
+PURETRACK_CONNECT_RESULT_ERROR = "ERROR"
+PURETRACK_DISCONNECT_RESULT_DISCONNECTED = "DISCONNECTED"
+PURETRACK_DISCONNECT_RESULT_NOT_CONNECTED = "NOT_CONNECTED"
+PURETRACK_DISCONNECT_RESULT_ERROR = "ERROR"
+PURETRACK_PROVIDER_STATUS_CACHE_MS = 3_600_000
+PURETRACK_DEFAULT_API_BASE_URL = "https://puretrack.io"
+PURETRACK_DEFAULT_TIMEOUT_SECONDS = 10.0
 BILLING_PERIOD_VALUES = frozenset({"NONE", "MONTHLY", "ANNUAL"})
 ENTITLEMENT_SOURCE_VALUES = frozenset({"NONE", "GOOGLE_PLAY"})
 SUBSCRIPTION_STATUS_VALUES = frozenset({
@@ -343,6 +361,10 @@ class ErrorCode:
     BLOCKED_RELATIONSHIP = "blocked_relationship"
     INVALID_PUSH_TOKEN = "invalid_push_token"
     PUSH_TOKEN_ENCRYPTION_UNAVAILABLE = "push_token_encryption_unavailable"
+    PURETRACK_APP_KEY_UNCONFIGURED = "puretrack_app_key_unconfigured"
+    PURETRACK_PROVIDER_UNAVAILABLE = "puretrack_provider_unavailable"
+    PURETRACK_RATE_LIMITED = "puretrack_rate_limited"
+    PURETRACK_STATE_INVALID = "puretrack_state_invalid"
 
 
 POSITION_MONOTONIC_FIELD_NAMES = frozenset({
@@ -421,6 +443,22 @@ class GooglePlayRuntimeConfig:
 class FcmRuntimeConfig:
     project_id: Optional[str]
     service_account_json_path: Optional[str]
+
+
+@dataclass(frozen=True)
+class PureTrackRuntimeConfig:
+    app_key: Optional[str]
+    api_base_url: str
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class PureTrackProviderLoginResult:
+    result: str
+    user_access: str = PURETRACK_PROVIDER_ACCESS_UNKNOWN
+    provider_session_secret: Optional[str] = None
+    retry_after_ms: Optional[int] = None
+    error_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -745,6 +783,31 @@ def load_fcm_runtime_config(
     )
 
 
+def normalize_puretrack_api_base_url(raw_value: Optional[str]) -> str:
+    normalized = (raw_value or "").strip() or PURETRACK_DEFAULT_API_BASE_URL
+    return normalized.rstrip("/")
+
+
+def load_puretrack_runtime_config(
+    env: Optional[dict[str, str]] = None
+) -> PureTrackRuntimeConfig:
+    resolved_env = os.environ if env is None else env
+    return PureTrackRuntimeConfig(
+        app_key=load_optional_trimmed_env_value(
+            resolved_env,
+            "XCPRO_PURETRACK_APP_KEY"
+        ),
+        api_base_url=normalize_puretrack_api_base_url(
+            resolved_env.get("XCPRO_PURETRACK_API_BASE_URL")
+        ),
+        timeout_seconds=parse_non_negative_float_env(
+            "XCPRO_PURETRACK_TIMEOUT_SECONDS",
+            resolved_env.get("XCPRO_PURETRACK_TIMEOUT_SECONDS"),
+            PURETRACK_DEFAULT_TIMEOUT_SECONDS
+        ),
+    )
+
+
 def collect_private_follow_runtime_safety_errors(
     config: PrivateFollowRuntimeConfig
 ) -> list[str]:
@@ -856,10 +919,115 @@ PUSH_TOKEN_ENCRYPTION_SECRET = PRIVATE_FOLLOW_RUNTIME_CONFIG.push_token_encrypti
 PRIVATE_FOLLOW_BEARER_TTL_SECONDS = PRIVATE_FOLLOW_RUNTIME_CONFIG.private_follow_bearer_ttl_seconds
 GOOGLE_PLAY_RUNTIME_CONFIG = load_google_play_runtime_config()
 FCM_RUNTIME_CONFIG = load_fcm_runtime_config()
+PURETRACK_RUNTIME_CONFIG = load_puretrack_runtime_config()
 GOOGLE_PLAY_RTDN_INGEST_TOKEN = GOOGLE_PLAY_RUNTIME_CONFIG.rtdn_test_ingest_token
 GOOGLE_PLAY_RTDN_ALLOW_TEST_HEADER_AUTH = (
     GOOGLE_PLAY_RUNTIME_CONFIG.allow_test_rtdn_header_auth
 )
+
+
+def parse_retry_after_ms(raw_value: Optional[str]) -> Optional[int]:
+    if raw_value is None:
+        return None
+    seconds = raw_value.strip().split(".", 1)[0]
+    parsed = int(seconds) if seconds.isdigit() else None
+    if parsed is None:
+        return None
+    return parsed * 1000
+
+
+class HttpPureTrackProviderClient:
+    def login(
+        self,
+        email: str,
+        password: str,
+        config: PureTrackRuntimeConfig
+    ) -> PureTrackProviderLoginResult:
+        app_key = trim_to_none(config.app_key)
+        if app_key is None:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_APP_KEY_UNCONFIGURED,
+                user_access=PURETRACK_PROVIDER_ACCESS_UNKNOWN,
+                error_code=ErrorCode.PURETRACK_APP_KEY_UNCONFIGURED,
+            )
+
+        try:
+            response = httpx.post(
+                f"{config.api_base_url}/api/login",
+                data={
+                    "key": app_key,
+                    "email": email,
+                    "password": password,
+                },
+                headers={"Accept": "application/json"},
+                timeout=config.timeout_seconds,
+            )
+        except httpx.TimeoutException:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_PROVIDER_UNAVAILABLE,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+        except httpx.HTTPError:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_PROVIDER_UNAVAILABLE,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+
+        if response.status_code == 429:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_RATE_LIMITED,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                retry_after_ms=parse_retry_after_ms(response.headers.get("Retry-After")),
+                error_code=ErrorCode.PURETRACK_RATE_LIMITED,
+            )
+        if response.status_code in {401, 403}:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_AUTH_REJECTED,
+                user_access=PURETRACK_PROVIDER_ACCESS_NONE,
+                error_code="auth_rejected",
+            )
+        if 500 <= response.status_code <= 599:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_PROVIDER_UNAVAILABLE,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+        if response.status_code != 200:
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_ERROR,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                error_code="provider_error",
+            )
+
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("PureTrack login response must be a JSON object")
+            provider_session_secret = str(payload.get("access_" + "token", "")).strip()
+            provider_is_premium = payload["pro"]
+            if not provider_session_secret or not isinstance(provider_is_premium, bool):
+                raise ValueError("PureTrack login response is missing required fields")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return PureTrackProviderLoginResult(
+                result=PURETRACK_CONNECT_RESULT_ERROR,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                error_code="malformed_provider_response",
+            )
+
+        return PureTrackProviderLoginResult(
+            result=PURETRACK_CONNECT_RESULT_CONNECTED,
+            user_access=(
+                PURETRACK_PROVIDER_ACCESS_PREMIUM
+                if provider_is_premium
+                else PURETRACK_PROVIDER_ACCESS_FREE
+            ),
+            provider_session_secret=provider_session_secret,
+        )
+
+
+PURETRACK_PROVIDER_CLIENT = HttpPureTrackProviderClient()
 
 
 def base64url_encode(raw_bytes: bytes) -> str:
@@ -1674,6 +1842,28 @@ class AccountEntitlementSnapshot(Base):
     updated_at = Column(DateTime, nullable=False)
 
 
+class PureTrackProviderSession(Base):
+    __tablename__ = "puretrack_provider_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "user_access IN ('UNKNOWN', 'NONE', 'FREE', 'PREMIUM', 'ERROR')",
+            name="ck_puretrack_provider_sessions_user_access",
+        ),
+    )
+
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    provider_session_hash = Column(String(64), nullable=True, index=True)
+    user_access = Column(String(24), nullable=False)
+    account_label = Column(String(320), nullable=True)
+    verified_at_ms = Column(BigInteger, nullable=True)
+    valid_until_ms = Column(BigInteger, nullable=True)
+    error_code = Column(String(80), nullable=True)
+    retry_after_ms = Column(BigInteger, nullable=True)
+    audit_id = Column(String(80), nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
 class BillingGooglePurchase(Base):
     __tablename__ = "billing_google_purchases"
     __table_args__ = (
@@ -2024,6 +2214,43 @@ class GooglePlayRestoreRequest(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+class PureTrackConnectRequest(BaseModel):
+    email: StrictStr = Field(min_length=1, max_length=320)
+    password: StrictStr = Field(min_length=1, max_length=1024)
+
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackDisconnectRequest(BaseModel):
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackStatusResponse(BaseModel):
+    connected: bool
+    appKeyConfigured: bool
+    trafficApiAllowed: bool
+    insertApiConfigured: bool
+    userAccess: str
+    verifiedAtMs: Optional[int] = None
+    validUntilMs: Optional[int] = None
+    accountLabel: Optional[str] = None
+    errorCode: Optional[str] = None
+    retryAfterMs: Optional[int] = None
+    auditId: Optional[str] = None
+
+
+class PureTrackConnectResponse(BaseModel):
+    result: str
+    status: PureTrackStatusResponse
+
+
+class PureTrackDisconnectResponse(BaseModel):
+    result: str
+    status: PureTrackStatusResponse
 
 
 class GooglePlaySyncResponse(BaseModel):
@@ -3617,6 +3844,300 @@ def build_entitlement_response(db, current_user: CurrentUserRecord) -> dict[str,
     if snapshot is None:
         return build_canonical_free_entitlement_response(current_user)
     return build_stored_entitlement_response(current_user, snapshot)
+
+
+def validate_puretrack_connect_request(request: PureTrackConnectRequest) -> tuple[str, str]:
+    email = trim_to_none(request.email)
+    if email is None:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail="email is required"
+        )
+    return email, request.password
+
+
+def puretrack_app_key_configured(
+    config: Optional[PureTrackRuntimeConfig] = None
+) -> bool:
+    resolved_config = config or PURETRACK_RUNTIME_CONFIG
+    return trim_to_none(resolved_config.app_key) is not None
+
+
+def puretrack_audit_id() -> str:
+    return f"pt_{uuid.uuid4().hex}"
+
+
+def redact_puretrack_account_label(email: str) -> str:
+    normalized = email.strip()
+    local, separator, domain = normalized.partition("@")
+    if not separator or not domain:
+        return "***"
+    first_char = local[:1] or "*"
+    return f"{first_char}***@{domain.lower()}"
+
+
+def load_puretrack_provider_session(db, user_id: str) -> Optional[PureTrackProviderSession]:
+    return (
+        db.query(PureTrackProviderSession)
+        .filter(PureTrackProviderSession.user_id == user_id)
+        .first()
+    )
+
+
+def puretrack_session_connected(
+    session: Optional[PureTrackProviderSession],
+    now_ms: int
+) -> bool:
+    if session is None:
+        return False
+    if not session.provider_session_hash:
+        return False
+    if session.user_access not in {
+        PURETRACK_PROVIDER_ACCESS_FREE,
+        PURETRACK_PROVIDER_ACCESS_PREMIUM,
+    }:
+        return False
+    if session.valid_until_ms is not None and session.valid_until_ms < now_ms:
+        return False
+    return True
+
+
+def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
+    snapshot = (
+        db.query(AccountEntitlementSnapshot)
+        .filter(AccountEntitlementSnapshot.user_id == user_id)
+        .first()
+    )
+    if snapshot is None:
+        return False
+    try:
+        values = require_stored_entitlement_contract(snapshot)
+    except ApiHTTPException as exc:
+        if exc.code == ErrorCode.ENTITLEMENT_STATE_INVALID:
+            return False
+        raise
+    return (
+        values["tier"] == "PRO"
+        and values["status"] in PAID_CONTINUITY_STATUSES
+        and values["verificationState"] == "VERIFIED"
+    )
+
+
+def build_puretrack_status_payload(
+    db,
+    current_user: CurrentUserRecord,
+    connected: Optional[bool] = None,
+    user_access: Optional[str] = None,
+    account_label: Optional[str] = None,
+    verified_at_ms: Optional[int] = None,
+    valid_until_ms: Optional[int] = None,
+    error_code: Optional[str] = None,
+    retry_after_ms: Optional[int] = None,
+    audit_id: Optional[str] = None,
+) -> dict[str, Any]:
+    now_ms = to_epoch_ms(utcnow())
+    session = load_puretrack_provider_session(db, current_user.user.id)
+    session_is_connected = puretrack_session_connected(session, now_ms)
+    resolved_connected = session_is_connected if connected is None else connected
+    resolved_user_access = (
+        user_access
+        if user_access is not None
+        else (session.user_access if session is not None else PURETRACK_PROVIDER_ACCESS_UNKNOWN)
+    )
+    resolved_verified_at_ms = (
+        verified_at_ms
+        if verified_at_ms is not None
+        else (session.verified_at_ms if session is not None else None)
+    )
+    resolved_valid_until_ms = (
+        valid_until_ms
+        if valid_until_ms is not None
+        else (session.valid_until_ms if session is not None else None)
+    )
+    resolved_account_label = (
+        account_label
+        if account_label is not None
+        else (
+            session.account_label
+            if session is not None and resolved_connected
+            else None
+        )
+    )
+    resolved_error_code = (
+        error_code
+        if error_code is not None
+        else (session.error_code if session is not None else None)
+    )
+    resolved_retry_after_ms = (
+        retry_after_ms
+        if retry_after_ms is not None
+        else (session.retry_after_ms if session is not None else None)
+    )
+    resolved_audit_id = (
+        audit_id
+        if audit_id is not None
+        else (session.audit_id if session is not None else None)
+    )
+    app_key_configured = puretrack_app_key_configured()
+    traffic_api_allowed = (
+        app_key_configured
+        and resolved_connected
+        and resolved_user_access == PURETRACK_PROVIDER_ACCESS_PREMIUM
+        and account_has_verified_xcpro_pro_entitlement(db, current_user.user.id)
+    )
+    return {
+        "connected": resolved_connected,
+        "appKeyConfigured": app_key_configured,
+        "trafficApiAllowed": traffic_api_allowed,
+        "insertApiConfigured": False,
+        "userAccess": resolved_user_access,
+        "verifiedAtMs": resolved_verified_at_ms,
+        "validUntilMs": resolved_valid_until_ms,
+        "accountLabel": resolved_account_label,
+        "errorCode": resolved_error_code,
+        "retryAfterMs": resolved_retry_after_ms,
+        "auditId": resolved_audit_id,
+    }
+
+
+def save_puretrack_connected_session(
+    db,
+    current_user: CurrentUserRecord,
+    provider_result: PureTrackProviderLoginResult,
+    email: str,
+    audit_id: str,
+) -> None:
+    if provider_result.provider_session_secret is None:
+        raise ApiHTTPException(
+            status_code=500,
+            code=ErrorCode.PURETRACK_STATE_INVALID,
+            detail="PureTrack provider session state is invalid"
+        )
+    now = utcnow()
+    now_ms = to_epoch_ms(now)
+    session = load_puretrack_provider_session(db, current_user.user.id)
+    if session is None:
+        session = PureTrackProviderSession(
+            user_id=current_user.user.id,
+            created_at=now,
+            updated_at=now,
+            user_access=provider_result.user_access,
+        )
+        db.add(session)
+    session.provider_session_hash = hash_token(provider_result.provider_session_secret)
+    session.user_access = provider_result.user_access
+    session.account_label = redact_puretrack_account_label(email)
+    session.verified_at_ms = now_ms
+    session.valid_until_ms = now_ms + PURETRACK_PROVIDER_STATUS_CACHE_MS
+    session.error_code = None
+    session.retry_after_ms = None
+    session.audit_id = audit_id
+    session.updated_at = now
+
+
+def clear_puretrack_provider_session(db, user_id: str) -> bool:
+    session = load_puretrack_provider_session(db, user_id)
+    if session is None:
+        return False
+    db.delete(session)
+    return True
+
+
+def puretrack_failure_user_access(result: PureTrackProviderLoginResult) -> str:
+    if result.user_access in PURETRACK_USER_ACCESS_VALUES:
+        return result.user_access
+    return PURETRACK_PROVIDER_ACCESS_ERROR
+
+
+def connect_puretrack_account(
+    db,
+    current_user: CurrentUserRecord,
+    request: PureTrackConnectRequest,
+) -> dict[str, Any]:
+    email, password = validate_puretrack_connect_request(request)
+    audit_id = puretrack_audit_id()
+    if not puretrack_app_key_configured():
+        status = build_puretrack_status_payload(
+            db,
+            current_user,
+            connected=False,
+            user_access=PURETRACK_PROVIDER_ACCESS_UNKNOWN,
+            account_label=None,
+            error_code=ErrorCode.PURETRACK_APP_KEY_UNCONFIGURED,
+            audit_id=audit_id,
+        )
+        return {
+            "result": PURETRACK_CONNECT_RESULT_APP_KEY_UNCONFIGURED,
+            "status": status,
+        }
+
+    provider_result = PURETRACK_PROVIDER_CLIENT.login(
+        email=email,
+        password=password,
+        config=PURETRACK_RUNTIME_CONFIG,
+    )
+    if provider_result.result == PURETRACK_CONNECT_RESULT_CONNECTED:
+        save_puretrack_connected_session(
+            db=db,
+            current_user=current_user,
+            provider_result=provider_result,
+            email=email,
+            audit_id=audit_id,
+        )
+        db.flush()
+        return {
+            "result": PURETRACK_CONNECT_RESULT_CONNECTED,
+            "status": build_puretrack_status_payload(db, current_user, audit_id=audit_id),
+        }
+
+    if provider_result.result == PURETRACK_CONNECT_RESULT_AUTH_REJECTED:
+        clear_puretrack_provider_session(db, current_user.user.id)
+        db.flush()
+
+    status = build_puretrack_status_payload(
+        db,
+        current_user,
+        connected=False,
+        user_access=puretrack_failure_user_access(provider_result),
+        account_label=None,
+        error_code=provider_result.error_code,
+        retry_after_ms=provider_result.retry_after_ms,
+        audit_id=audit_id,
+    )
+    return {
+        "result": provider_result.result,
+        "status": status,
+    }
+
+
+def disconnect_puretrack_account(
+    db,
+    current_user: CurrentUserRecord,
+) -> dict[str, Any]:
+    audit_id = puretrack_audit_id()
+    disconnected = clear_puretrack_provider_session(db, current_user.user.id)
+    db.flush()
+    status = build_puretrack_status_payload(
+        db,
+        current_user,
+        connected=False,
+        user_access=PURETRACK_PROVIDER_ACCESS_NONE,
+        account_label=None,
+        verified_at_ms=to_epoch_ms(utcnow()),
+        valid_until_ms=None,
+        error_code=None,
+        retry_after_ms=None,
+        audit_id=audit_id,
+    )
+    return {
+        "result": (
+            PURETRACK_DISCONNECT_RESULT_DISCONNECTED
+            if disconnected
+            else PURETRACK_DISCONNECT_RESULT_NOT_CONNECTED
+        ),
+        "status": status,
+    }
 
 
 def build_free_livefollow_following_limit() -> LiveFollowFollowingLimit:
@@ -7756,6 +8277,54 @@ def get_subscription_entitlements(
         current_user = ensure_current_user_record(db, authorization)
         validate_entitlement_package_name(package_name)
         return build_entitlement_response(db, current_user)
+    finally:
+        db.close()
+
+
+@app.get("/api/v1/puretrack/status", response_model=PureTrackStatusResponse)
+def get_puretrack_status(
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        validate_entitlement_package_name(package_name)
+        return build_puretrack_status_payload(db, current_user)
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/puretrack/connect", response_model=PureTrackConnectResponse)
+def connect_puretrack(
+    request: PureTrackConnectRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        validate_entitlement_package_name(package_name)
+        response = connect_puretrack_account(db, current_user, request)
+        db.commit()
+        return response
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/puretrack/disconnect", response_model=PureTrackDisconnectResponse)
+def disconnect_puretrack(
+    request: PureTrackDisconnectRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        validate_entitlement_package_name(package_name)
+        response = disconnect_puretrack_account(db, current_user)
+        db.commit()
+        return response
     finally:
         db.close()
 
