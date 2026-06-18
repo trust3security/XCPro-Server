@@ -1,7 +1,7 @@
 # PureTrack Backend Proxy Contract
 
-Status: reviewed contract; status/connect/disconnect implemented locally;
-Insert publishing contract planned for local implementation.
+Status: reviewed contract; status/connect/disconnect and Insert publishing
+implemented locally.
 Date: 2026-06-18
 
 ## Purpose
@@ -13,10 +13,10 @@ raw Traffic API rows in the APK.
 
 Local commit `4b7064a Add PureTrack backend proxy endpoints` implements and
 tests the Android-facing status/connect/disconnect routes described here.
-Production deployment/live-server parity, the real PureTrack provider adapter,
-traffic proxy routes, and Insert publishing runtime rollout remain separate
-future work. The Android-facing Insert route contract below is frozen for local
-server implementation before Android publishing code consumes it.
+Production deployment/live-server parity, traffic proxy routes, Android queue
+drain wiring, and foreground publishing runtime rollout remain separate future
+work. The Android-facing Insert route contract below is implemented locally for
+Android publishing code to consume through the XCPro backend only.
 
 Verified current anchors:
 
@@ -27,6 +27,9 @@ Verified current anchors:
   `X-XCPro-Package-Name` on entitlement/auth flows.
 - `app/main.py` exposes `/api/v1/puretrack/status`,
   `/api/v1/puretrack/connect`, and `/api/v1/puretrack/disconnect`.
+- `app/main.py` exposes `POST /api/v1/puretrack/insert`; tests verify bearer
+  and package validation, verified XCPro PRO access, server-only Insert key
+  configuration, ack semantics, retry delay propagation, and redaction.
 - `app/main.py` still returns coarse `providerStates.pureTrack` values inside
   entitlement response builders; dedicated PureTrack settings state comes from
   `/api/v1/puretrack/status`.
@@ -548,9 +551,9 @@ Recommended server phases:
    route implementation with fake provider adapter tests.
 3. Planned: add real PureTrack provider adapter behind server-only
    configuration.
-4. Planned next locally: implement `POST /api/v1/puretrack/insert` using the
-   contract above, fake-provider tests, server-only Insert key configuration,
-   and redaction/ack semantics.
+4. Complete/current locally: implement `POST /api/v1/puretrack/insert` using
+   the contract above, fake-provider tests, server-only Insert key
+   configuration, and redaction/ack semantics.
 5. Planned later: add traffic proxy contracts and production deployment parity
    as separate phases.
 

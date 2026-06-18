@@ -138,6 +138,10 @@ PURETRACK_CONNECT_RESULT_ERROR = "ERROR"
 PURETRACK_DISCONNECT_RESULT_DISCONNECTED = "DISCONNECTED"
 PURETRACK_DISCONNECT_RESULT_NOT_CONNECTED = "NOT_CONNECTED"
 PURETRACK_DISCONNECT_RESULT_ERROR = "ERROR"
+PURETRACK_INSERT_RESULT_ACCEPTED = "ACCEPTED"
+PURETRACK_INSERT_RESULT_PARTIAL_RETRY = "PARTIAL_RETRY"
+PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE = "RETRYABLE_FAILURE"
+PURETRACK_INSERT_RESULT_REJECTED = "REJECTED"
 PURETRACK_PROVIDER_STATUS_CACHE_MS = 3_600_000
 PURETRACK_DEFAULT_API_BASE_URL = "https://puretrack.io"
 PURETRACK_DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -363,9 +367,12 @@ class ErrorCode:
     INVALID_PUSH_TOKEN = "invalid_push_token"
     PUSH_TOKEN_ENCRYPTION_UNAVAILABLE = "push_token_encryption_unavailable"
     PURETRACK_APP_KEY_UNCONFIGURED = "puretrack_app_key_unconfigured"
+    PURETRACK_INSERT_KEY_UNCONFIGURED = "puretrack_insert_key_unconfigured"
+    PURETRACK_INSERT_REJECTED = "puretrack_insert_rejected"
     PURETRACK_PROVIDER_UNAVAILABLE = "puretrack_provider_unavailable"
     PURETRACK_RATE_LIMITED = "puretrack_rate_limited"
     PURETRACK_STATE_INVALID = "puretrack_state_invalid"
+    FEATURE_ACCESS_DENIED = "feature_access_denied"
 
 
 POSITION_MONOTONIC_FIELD_NAMES = frozenset({
@@ -451,6 +458,7 @@ class PureTrackRuntimeConfig:
     app_key: Optional[str]
     api_base_url: str
     timeout_seconds: float
+    insert_key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -458,6 +466,14 @@ class PureTrackProviderLoginResult:
     result: str
     user_access: str = PURETRACK_PROVIDER_ACCESS_UNKNOWN
     provider_session_secret: Optional[str] = None
+    retry_after_ms: Optional[int] = None
+    error_code: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PureTrackInsertProviderResult:
+    result: str
+    provider_inserted_point_count: Optional[int] = None
     retry_after_ms: Optional[int] = None
     error_code: Optional[str] = None
 
@@ -806,6 +822,10 @@ def load_puretrack_runtime_config(
             resolved_env.get("XCPRO_PURETRACK_TIMEOUT_SECONDS"),
             PURETRACK_DEFAULT_TIMEOUT_SECONDS
         ),
+        insert_key=load_optional_trimmed_env_value(
+            resolved_env,
+            "XCPRO_PURETRACK_INSERT_KEY"
+        ),
     )
 
 
@@ -937,6 +957,15 @@ def parse_retry_after_ms(raw_value: Optional[str]) -> Optional[int]:
     return parsed * 1000
 
 
+def coerce_non_negative_int(raw_value: Any, field_name: str) -> int:
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    value = int(raw_value)
+    if value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
 class HttpPureTrackProviderClient:
     def login(
         self,
@@ -1029,6 +1058,92 @@ class HttpPureTrackProviderClient:
 
 
 PURETRACK_PROVIDER_CLIENT = HttpPureTrackProviderClient()
+
+
+class HttpPureTrackInsertClient:
+    def publish(
+        self,
+        trackers: list[dict[str, Any]],
+        config: PureTrackRuntimeConfig,
+    ) -> PureTrackInsertProviderResult:
+        insert_key = trim_to_none(config.insert_key)
+        if insert_key is None:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+                error_code=ErrorCode.PURETRACK_INSERT_KEY_UNCONFIGURED,
+            )
+
+        upstream_trackers = []
+        for tracker in trackers:
+            upstream_tracker = dict(tracker)
+            upstream_tracker["key"] = insert_key
+            upstream_trackers.append(upstream_tracker)
+
+        try:
+            response = httpx.post(
+                f"{config.api_base_url}/api/insert",
+                json=upstream_trackers,
+                headers={"Accept": "application/json"},
+                timeout=config.timeout_seconds,
+            )
+        except httpx.TimeoutException:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+        except httpx.HTTPError:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+
+        if response.status_code == 429:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+                retry_after_ms=parse_retry_after_ms(response.headers.get("Retry-After")),
+                error_code=ErrorCode.PURETRACK_RATE_LIMITED,
+            )
+        if 500 <= response.status_code <= 599:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+        if response.status_code != 200:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_REJECTED,
+                error_code=ErrorCode.PURETRACK_INSERT_REJECTED,
+            )
+
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("PureTrack insert response must be a JSON object")
+            received_count = coerce_non_negative_int(
+                payload.get("total_points_recieved", payload.get("total_points_received")),
+                "total_points_recieved"
+            )
+            inserted_count = coerce_non_negative_int(
+                payload.get("total_points_inserted"),
+                "total_points_inserted"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+
+        if inserted_count == received_count:
+            return PureTrackInsertProviderResult(
+                result=PURETRACK_INSERT_RESULT_ACCEPTED,
+                provider_inserted_point_count=inserted_count,
+            )
+        return PureTrackInsertProviderResult(
+            result=PURETRACK_INSERT_RESULT_PARTIAL_RETRY,
+            provider_inserted_point_count=inserted_count,
+        )
+
+
+PURETRACK_INSERT_CLIENT = HttpPureTrackInsertClient()
 
 
 def base64url_encode(raw_bytes: bytes) -> str:
@@ -2235,6 +2350,39 @@ class PureTrackDisconnectRequest(BaseModel):
         extra = "forbid"
 
 
+class PureTrackInsertPointRequest(BaseModel):
+    clientPointId: StrictStr = Field(min_length=1, max_length=128)
+    ts: int
+    lat: float
+    lng: float
+    alt: Optional[float] = None
+    speed: Optional[float] = None
+    course: Optional[float] = None
+    vspeed: Optional[float] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackInsertTrackerRequest(BaseModel):
+    deviceID: StrictStr = Field(min_length=1, max_length=64)
+    points: list[PureTrackInsertPointRequest] = Field(min_items=1, max_items=256)
+    type: Optional[int] = None
+    rego: Optional[StrictStr] = Field(default=None, max_length=32)
+    label: Optional[StrictStr] = Field(default=None, max_length=64)
+
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackInsertPublishRequest(BaseModel):
+    clientBatchId: StrictStr = Field(min_length=1, max_length=128)
+    trackers: list[PureTrackInsertTrackerRequest] = Field(min_items=1, max_items=16)
+
+    class Config:
+        extra = "forbid"
+
+
 class PureTrackStatusResponse(BaseModel):
     connected: bool
     appKeyConfigured: bool
@@ -2257,6 +2405,15 @@ class PureTrackConnectResponse(BaseModel):
 class PureTrackDisconnectResponse(BaseModel):
     result: str
     status: PureTrackStatusResponse
+
+
+class PureTrackInsertPublishResponse(BaseModel):
+    result: str
+    acceptedClientPointIds: list[str]
+    serverReceivedPointCount: int
+    providerInsertedPointCount: Optional[int] = None
+    retryAfterMs: Optional[int] = None
+    auditId: str
 
 
 class GooglePlaySyncResponse(BaseModel):
@@ -3894,6 +4051,13 @@ def puretrack_app_key_configured(
     return trim_to_none(resolved_config.app_key) is not None
 
 
+def puretrack_insert_key_configured(
+    config: Optional[PureTrackRuntimeConfig] = None
+) -> bool:
+    resolved_config = config or PURETRACK_RUNTIME_CONFIG
+    return trim_to_none(resolved_config.insert_key) is not None
+
+
 def puretrack_audit_id() -> str:
     return f"pt_{uuid.uuid4().hex}"
 
@@ -3954,6 +4118,151 @@ def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
     )
 
 
+def require_puretrack_non_blank(raw_value: Optional[str], field_name: str) -> str:
+    value = trim_to_none(raw_value)
+    if value is None:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"{field_name} is required"
+        )
+    return value
+
+
+def optional_puretrack_text(raw_value: Optional[str], field_name: str) -> Optional[str]:
+    if raw_value is None:
+        return None
+    value = trim_to_none(raw_value)
+    if value is None:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"{field_name} must not be blank"
+        )
+    return value
+
+
+def require_puretrack_finite_number(
+    value: float,
+    field_name: str,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    if not math.isfinite(value):
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"{field_name} must be finite"
+        )
+    if minimum is not None and value < minimum:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"{field_name} out of range"
+        )
+    if maximum is not None and value > maximum:
+        raise ApiHTTPException(
+            status_code=422,
+            code=ErrorCode.VALIDATION_ERROR,
+            detail=f"{field_name} out of range"
+        )
+    return value
+
+
+def optional_puretrack_finite_number(
+    value: Optional[float],
+    field_name: str,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> Optional[float]:
+    if value is None:
+        return None
+    return require_puretrack_finite_number(value, field_name, minimum, maximum)
+
+
+def validate_puretrack_insert_request(
+    request: PureTrackInsertPublishRequest,
+) -> tuple[list[dict[str, Any]], list[str], int]:
+    require_puretrack_non_blank(request.clientBatchId, "clientBatchId")
+    trackers: list[dict[str, Any]] = []
+    client_point_ids: list[str] = []
+    for tracker_index, tracker in enumerate(request.trackers):
+        tracker_prefix = f"trackers[{tracker_index}]"
+        mapped_tracker: dict[str, Any] = {
+            "deviceID": require_puretrack_non_blank(
+                tracker.deviceID,
+                f"{tracker_prefix}.deviceID"
+            )
+        }
+        if tracker.type is not None:
+            if isinstance(tracker.type, bool) or tracker.type < 0:
+                raise ApiHTTPException(
+                    status_code=422,
+                    code=ErrorCode.VALIDATION_ERROR,
+                    detail=f"{tracker_prefix}.type out of range"
+                )
+            mapped_tracker["type"] = tracker.type
+        rego = optional_puretrack_text(tracker.rego, f"{tracker_prefix}.rego")
+        if rego is not None:
+            mapped_tracker["rego"] = rego
+        label = optional_puretrack_text(tracker.label, f"{tracker_prefix}.label")
+        if label is not None:
+            mapped_tracker["label"] = label
+
+        points = []
+        for point_index, point in enumerate(tracker.points):
+            point_prefix = f"{tracker_prefix}.points[{point_index}]"
+            client_point_id = require_puretrack_non_blank(
+                point.clientPointId,
+                f"{point_prefix}.clientPointId"
+            )
+            if isinstance(point.ts, bool) or point.ts < 0:
+                raise ApiHTTPException(
+                    status_code=422,
+                    code=ErrorCode.VALIDATION_ERROR,
+                    detail=f"{point_prefix}.ts out of range"
+                )
+            mapped_point: dict[str, Any] = {
+                "ts": point.ts,
+                "lat": require_puretrack_finite_number(
+                    point.lat,
+                    f"{point_prefix}.lat",
+                    -90.0,
+                    90.0,
+                ),
+                "lng": require_puretrack_finite_number(
+                    point.lng,
+                    f"{point_prefix}.lng",
+                    -180.0,
+                    180.0,
+                ),
+            }
+            for field_name, field_value in (
+                ("alt", point.alt),
+                ("speed", point.speed),
+                ("vspeed", point.vspeed),
+            ):
+                resolved = optional_puretrack_finite_number(
+                    field_value,
+                    f"{point_prefix}.{field_name}"
+                )
+                if resolved is not None:
+                    mapped_point[field_name] = resolved
+            course = optional_puretrack_finite_number(
+                point.course,
+                f"{point_prefix}.course",
+                0.0,
+                360.0,
+            )
+            if course is not None:
+                mapped_point["course"] = course
+            points.append(mapped_point)
+            client_point_ids.append(client_point_id)
+        mapped_tracker["points"] = points
+        trackers.append(mapped_tracker)
+    return trackers, client_point_ids, len(client_point_ids)
+
+
 def build_puretrack_status_payload(
     db,
     current_user: CurrentUserRecord,
@@ -4010,6 +4319,7 @@ def build_puretrack_status_payload(
         else (session.audit_id if session is not None else None)
     )
     app_key_configured = puretrack_app_key_configured()
+    insert_key_configured = puretrack_insert_key_configured()
     traffic_api_allowed = (
         app_key_configured
         and resolved_connected
@@ -4020,7 +4330,7 @@ def build_puretrack_status_payload(
         "connected": resolved_connected,
         "appKeyConfigured": app_key_configured,
         "trafficApiAllowed": traffic_api_allowed,
-        "insertApiConfigured": False,
+        "insertApiConfigured": insert_key_configured,
         "userAccess": resolved_user_access,
         "verifiedAtMs": resolved_verified_at_ms,
         "validUntilMs": resolved_valid_until_ms,
@@ -4028,6 +4338,45 @@ def build_puretrack_status_payload(
         "errorCode": resolved_error_code,
         "retryAfterMs": resolved_retry_after_ms,
         "auditId": resolved_audit_id,
+    }
+
+
+def publish_puretrack_insert_batch(
+    db,
+    current_user: CurrentUserRecord,
+    request: PureTrackInsertPublishRequest,
+) -> dict[str, Any]:
+    audit_id = puretrack_audit_id()
+    if not puretrack_insert_key_configured():
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_INSERT_KEY_UNCONFIGURED,
+            detail="PureTrack Insert publishing is not configured"
+        )
+    if not account_has_verified_xcpro_pro_entitlement(db, current_user.user.id):
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.FEATURE_ACCESS_DENIED,
+            detail="PureTrack Insert publishing requires XCPro PRO access"
+        )
+
+    trackers, client_point_ids, point_count = validate_puretrack_insert_request(request)
+    provider_result = PURETRACK_INSERT_CLIENT.publish(
+        trackers=trackers,
+        config=PURETRACK_RUNTIME_CONFIG,
+    )
+    accepted_point_ids = (
+        client_point_ids
+        if provider_result.result == PURETRACK_INSERT_RESULT_ACCEPTED
+        else []
+    )
+    return {
+        "result": provider_result.result,
+        "acceptedClientPointIds": accepted_point_ids,
+        "serverReceivedPointCount": point_count,
+        "providerInsertedPointCount": provider_result.provider_inserted_point_count,
+        "retryAfterMs": provider_result.retry_after_ms,
+        "auditId": audit_id,
     }
 
 
@@ -8361,6 +8710,21 @@ def disconnect_puretrack(
         response = disconnect_puretrack_account(db, current_user)
         db.commit()
         return response
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/puretrack/insert", response_model=PureTrackInsertPublishResponse)
+def insert_puretrack_points(
+    request: PureTrackInsertPublishRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        validate_entitlement_package_name(package_name)
+        return publish_puretrack_insert_batch(db, current_user, request)
     finally:
         db.close()
 

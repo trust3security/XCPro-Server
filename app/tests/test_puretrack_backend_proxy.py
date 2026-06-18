@@ -41,6 +41,26 @@ class FakePureTrackProviderClient:
         return self.result
 
 
+class FakePureTrackInsertClient:
+    def __init__(self):
+        self.result = main_module.PureTrackInsertProviderResult(
+            result=main_module.PURETRACK_INSERT_RESULT_ACCEPTED,
+            provider_inserted_point_count=2,
+        )
+        self.calls = []
+
+    def publish(
+        self,
+        trackers: list[dict],
+        config: main_module.PureTrackRuntimeConfig,
+    ) -> main_module.PureTrackInsertProviderResult:
+        self.calls.append({
+            "trackers": trackers,
+            "hasInsertKey": config.insert_key is not None,
+        })
+        return self.result
+
+
 class PureTrackBackendProxyTest(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine(
@@ -57,6 +77,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.original_static_bearer_tokens = main_module.STATIC_BEARER_TOKENS
         self.original_puretrack_runtime_config = main_module.PURETRACK_RUNTIME_CONFIG
         self.original_puretrack_provider_client = main_module.PURETRACK_PROVIDER_CLIENT
+        self.original_puretrack_insert_client = main_module.PURETRACK_INSERT_CLIENT
 
         self.clock = MutableClock(datetime(2026, 6, 18, 8, 0, 0))
         self.primary_bearer = "puretrack-xcpro-bearer-1"
@@ -82,6 +103,8 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         )
         self.provider = FakePureTrackProviderClient()
         main_module.PURETRACK_PROVIDER_CLIENT = self.provider
+        self.insert_client = FakePureTrackInsertClient()
+        main_module.PURETRACK_INSERT_CLIENT = self.insert_client
         self.client = TestClient(main_module.app)
 
     def tearDown(self):
@@ -92,6 +115,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         main_module.STATIC_BEARER_TOKENS = self.original_static_bearer_tokens
         main_module.PURETRACK_RUNTIME_CONFIG = self.original_puretrack_runtime_config
         main_module.PURETRACK_PROVIDER_CLIENT = self.original_puretrack_provider_client
+        main_module.PURETRACK_INSERT_CLIENT = self.original_puretrack_insert_client
         main_module.Base.metadata.drop_all(bind=self.engine)
         self.engine.dispose()
 
@@ -112,6 +136,18 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             "puretrack_state_invalid",
             main_module.ErrorCode.PURETRACK_STATE_INVALID,
         )
+        self.assertEqual(
+            "puretrack_insert_key_unconfigured",
+            main_module.ErrorCode.PURETRACK_INSERT_KEY_UNCONFIGURED,
+        )
+        self.assertEqual(
+            "puretrack_insert_rejected",
+            main_module.ErrorCode.PURETRACK_INSERT_REJECTED,
+        )
+        self.assertEqual(
+            "feature_access_denied",
+            main_module.ErrorCode.FEATURE_ACCESS_DENIED,
+        )
         methods_by_path = {
             getattr(route, "path", None): getattr(route, "methods", set())
             for route in main_module.app.routes
@@ -119,6 +155,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertIn("GET", methods_by_path["/api/v1/puretrack/status"])
         self.assertIn("POST", methods_by_path["/api/v1/puretrack/connect"])
         self.assertIn("POST", methods_by_path["/api/v1/puretrack/disconnect"])
+        self.assertIn("POST", methods_by_path["/api/v1/puretrack/insert"])
 
     def test_env_config_loader_uses_contract_defaults_and_values(self):
         default_config = main_module.load_puretrack_runtime_config({})
@@ -128,10 +165,12 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
         configured = main_module.load_puretrack_runtime_config({
             "XCPRO_PURETRACK_APP_KEY": " app-key-value ",
+            "XCPRO_PURETRACK_INSERT_KEY": " insert-key-value ",
             "XCPRO_PURETRACK_API_BASE_URL": "https://puretrack.test/",
             "XCPRO_PURETRACK_TIMEOUT_SECONDS": "3.5",
         })
         self.assertEqual("app-key-value", configured.app_key)
+        self.assertEqual("insert-key-value", configured.insert_key)
         self.assertEqual("https://puretrack.test", configured.api_base_url)
         self.assertEqual(3.5, configured.timeout_seconds)
 
@@ -203,6 +242,17 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertIsNone(body["errorCode"])
         self.assertIsNone(body["retryAfterMs"])
         self.assertIsNone(body["auditId"])
+
+    def test_status_reports_insert_api_configured_from_server_key(self):
+        self.enable_insert_key()
+
+        response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIs(True, response.json()["insertApiConfigured"])
 
     def test_connect_rejects_invalid_request_shapes(self):
         cases = (
@@ -458,6 +508,195 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertEqual(422, response.status_code)
         self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, response.json()["code"])
 
+    def test_insert_requires_valid_xcpro_bearer_and_package(self):
+        self.enable_insert_key()
+        self.upsert_entitlement_snapshot(tier="PRO")
+
+        missing_auth = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(include_auth=False),
+        )
+        invalid_auth = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(token="unknown-bearer"),
+        )
+        invalid_package = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(package_name="com.example.other"),
+        )
+
+        self.assertEqual(401, missing_auth.status_code)
+        self.assertEqual(main_module.ErrorCode.UNAUTHENTICATED, missing_auth.json()["code"])
+        self.assertEqual(401, invalid_auth.status_code)
+        self.assertEqual(main_module.ErrorCode.UNAUTHENTICATED, invalid_auth.json()["code"])
+        self.assertEqual(400, invalid_package.status_code)
+        self.assertEqual(main_module.ErrorCode.INVALID_PACKAGE, invalid_package.json()["code"])
+        self.assertEqual([], self.insert_client.calls)
+
+    def test_insert_requires_server_insert_key_before_provider_call(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+
+        response = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_INSERT_KEY_UNCONFIGURED,
+            response.json()["code"],
+        )
+        self.assertEqual([], self.insert_client.calls)
+
+    def test_insert_requires_verified_xcpro_pro_entitlement(self):
+        self.enable_insert_key()
+        self.upsert_entitlement_snapshot(tier="XC")
+
+        response = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(main_module.ErrorCode.FEATURE_ACCESS_DENIED, response.json()["code"])
+        self.assertEqual([], self.insert_client.calls)
+
+    def test_insert_rejects_invalid_request_shapes_before_provider_call(self):
+        self.enable_insert_key()
+        self.upsert_entitlement_snapshot(tier="PRO")
+        valid_tracker = self.insert_payload()["trackers"][0]
+        valid_point = valid_tracker["points"][0]
+        cases = (
+            {},
+            {"clientBatchId": "batch-1", "trackers": []},
+            {"clientBatchId": "batch-1", "trackers": [dict(valid_tracker, deviceID="   ")]},
+            {
+                "clientBatchId": "batch-1",
+                "trackers": [
+                    dict(valid_tracker, points=[dict(valid_point, lat=91.0)])
+                ],
+            },
+            {
+                "clientBatchId": "batch-1",
+                "trackers": [
+                    dict(valid_tracker, points=[dict(valid_point, course=361.0)])
+                ],
+            },
+            dict(self.insert_payload(), key="android-must-not-send-key"),
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    "/api/v1/puretrack/insert",
+                    json=payload,
+                    headers=self.headers(),
+                )
+
+                self.assertEqual(422, response.status_code)
+                self.assertEqual(
+                    main_module.ErrorCode.VALIDATION_ERROR,
+                    response.json()["code"],
+                )
+        self.assertEqual([], self.insert_client.calls)
+
+    def test_insert_success_accepts_all_client_point_ids_and_redacts(self):
+        self.enable_insert_key()
+        self.upsert_entitlement_snapshot(tier="PRO")
+
+        response = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual(main_module.PURETRACK_INSERT_RESULT_ACCEPTED, body["result"])
+        self.assertEqual(["point-1", "point-2"], body["acceptedClientPointIds"])
+        self.assertEqual(2, body["serverReceivedPointCount"])
+        self.assertEqual(2, body["providerInsertedPointCount"])
+        self.assertIsNone(body["retryAfterMs"])
+        self.assertTrue(body["auditId"].startswith("pt_"))
+        self.assertEqual(1, len(self.insert_client.calls))
+        call = self.insert_client.calls[0]
+        self.assertIs(True, call["hasInsertKey"])
+        self.assertNotIn("key", call["trackers"][0])
+        self.assertEqual("d7ry390", call["trackers"][0]["deviceID"])
+        self.assertEqual(1, call["trackers"][0]["type"])
+        self.assertEqual("ZK-ABC", call["trackers"][0]["rego"])
+        self.assertEqual("XCPro", call["trackers"][0]["label"])
+        self.assertEqual([
+            {
+                "ts": 1713563621,
+                "lat": -41.2334745,
+                "lng": 174.348365,
+                "alt": 345.1,
+                "speed": 25.0,
+                "vspeed": 5.3,
+                "course": 270.0,
+            },
+            {
+                "ts": 1713563624,
+                "lat": -41.1634343,
+                "lng": 174.36545,
+            },
+        ], call["trackers"][0]["points"])
+        serialized = json.dumps(body, sort_keys=True)
+        self.assertNotIn("server-side-insert-key", serialized)
+        self.assertNotIn(self.primary_bearer, serialized)
+        self.assertNotIn("pilot@example.com", serialized)
+
+    def test_insert_partial_retry_keeps_all_client_points_queued(self):
+        self.enable_insert_key()
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.insert_client.result = main_module.PureTrackInsertProviderResult(
+            result=main_module.PURETRACK_INSERT_RESULT_PARTIAL_RETRY,
+            provider_inserted_point_count=1,
+        )
+
+        response = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual(main_module.PURETRACK_INSERT_RESULT_PARTIAL_RETRY, body["result"])
+        self.assertEqual([], body["acceptedClientPointIds"])
+        self.assertEqual(2, body["serverReceivedPointCount"])
+        self.assertEqual(1, body["providerInsertedPointCount"])
+
+    def test_insert_retryable_failure_returns_retry_after_without_secrets(self):
+        self.enable_insert_key()
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.insert_client.result = main_module.PureTrackInsertProviderResult(
+            result=main_module.PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE,
+            retry_after_ms=7000,
+            error_code=main_module.ErrorCode.PURETRACK_RATE_LIMITED,
+        )
+
+        response = self.client.post(
+            "/api/v1/puretrack/insert",
+            json=self.insert_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual(main_module.PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE, body["result"])
+        self.assertEqual([], body["acceptedClientPointIds"])
+        self.assertEqual(7000, body["retryAfterMs"])
+        serialized = json.dumps(body, sort_keys=True)
+        self.assertNotIn("server-side-insert-key", serialized)
+        self.assertNotIn(self.primary_bearer, serialized)
+        self.assertNotIn("raw provider", serialized)
+
     def headers(
         self,
         token: str | None = None,
@@ -553,6 +792,46 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             db.commit()
         finally:
             db.close()
+
+    def enable_insert_key(self):
+        main_module.PURETRACK_RUNTIME_CONFIG = main_module.PureTrackRuntimeConfig(
+            app_key="server-side-app-key",
+            api_base_url="https://puretrack.example",
+            timeout_seconds=2.0,
+            insert_key="server-side-insert-key",
+        )
+
+    @staticmethod
+    def insert_payload() -> dict:
+        return {
+            "clientBatchId": "batch-20260618-0001",
+            "trackers": [
+                {
+                    "deviceID": "d7ry390",
+                    "type": 1,
+                    "rego": "ZK-ABC",
+                    "label": "XCPro",
+                    "points": [
+                        {
+                            "clientPointId": "point-1",
+                            "ts": 1713563621,
+                            "lat": -41.2334745,
+                            "lng": 174.348365,
+                            "alt": 345.1,
+                            "speed": 25.0,
+                            "course": 270.0,
+                            "vspeed": 5.3,
+                        },
+                        {
+                            "clientPointId": "point-2",
+                            "ts": 1713563624,
+                            "lat": -41.1634343,
+                            "lng": 174.36545,
+                        },
+                    ],
+                }
+            ],
+        }
 
     def assert_no_secret_leakage(self, body: dict, password: str):
         serialized = json.dumps(body, sort_keys=True)
