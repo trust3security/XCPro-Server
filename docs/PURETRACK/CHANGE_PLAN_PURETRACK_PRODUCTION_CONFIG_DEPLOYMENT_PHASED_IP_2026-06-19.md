@@ -122,8 +122,8 @@ XCPro production policy remains:
 | --- | --- | --- |
 | P0A | Evidence Freeze And Config Gap Record | complete / current |
 | P0B | Compose And Example Env Wiring | complete / current |
-| P0C | Production Secret Installation And API Recreate | planned / next executable |
-| P0D | Live PureTrack Login Smoke And Evidence Closeout | planned after P0C |
+| P0C | Production Secret Installation And API Recreate | complete / current |
+| P0D | Live PureTrack Login Smoke And Evidence Closeout | planned / next executable |
 | P0E | Contingency Sanitized Diagnostics If Smoke Still Fails | blocked unless P0D fails |
 
 ## P0A - Evidence Freeze And Config Gap Record
@@ -279,7 +279,7 @@ P0C without explicit user direction and real secret handling confirmation.
 
 ## P0C - Production Secret Installation And API Recreate
 
-Status: planned / next executable.
+Status: complete / current.
 
 ### Objective
 
@@ -365,9 +365,43 @@ Expected:
 - `401` unauthenticated without an XCPro bearer token.
 - No raw secrets in logs.
 
+### Evidence
+
+Completed on 2026-06-19:
+
+- Production config backup created at
+  `/root/backups/xcpro-puretrack-p0c-2026-06-19-050817`.
+- Production `/opt/xcpro/docker-compose.yml` now projects the PureTrack runtime
+  env keys into the `api` service.
+- Production `/opt/xcpro/.env` now contains the live PureTrack app key and a
+  server-generated provider-session encryption secret. Values were not printed
+  in logs, docs, shell output, or commit messages.
+- `docker compose config` returned `COMPOSE_CONFIG_OK`.
+- Only the API container was recreated with
+  `docker compose up -d --no-deps --force-recreate api`.
+- Running API container presence check:
+  - `XCPRO_PURETRACK_APP_KEY` reports `SET`.
+  - `XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET` reports `SET`.
+  - `XCPRO_PURETRACK_API_BASE_URL` reports `SET`.
+  - `XCPRO_PURETRACK_TIMEOUT_SECONDS` reports `SET`.
+  - `XCPRO_PURETRACK_INSERT_KEY` reports `MISSING`.
+- `XCPRO_PURETRACK_INSERT_KEY` reporting `MISSING` is acceptable for the
+  login/connect fix because outbound Insert publishing is not being validated
+  in P0C.
+- Immediate public status curl during container startup returned `502`; after
+  Gunicorn workers started, public root returned `200` and unauthenticated
+  `https://api.xcpro.com.au/api/v1/puretrack/status` returned `401`.
+- Recent API logs checked after recreate:
+  - `NO_APP_KEY_LOG_HIT`
+  - `NO_PROVIDER_SECRET_LOG_HIT`
+
+Next phase: P0D - Live PureTrack Login Smoke And Evidence Closeout. Do not move
+to contingency diagnostics unless the live phone smoke still reports backend
+unavailable after this production config fix.
+
 ## P0D - Live PureTrack Login Smoke And Evidence Closeout
 
-Status: planned after P0C.
+Status: planned / next executable.
 
 ### Objective
 
