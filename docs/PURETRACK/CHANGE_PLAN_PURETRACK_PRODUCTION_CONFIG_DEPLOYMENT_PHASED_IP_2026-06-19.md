@@ -1,6 +1,6 @@
 # PureTrack Production Config Deployment Phased IP
 
-Status: planned / current
+Status: complete / current
 Date: 2026-06-19
 Repo: `C:\Users\Asus\AndroidStudioProjects\XCPro_Server`
 Branch observed: `main`
@@ -93,16 +93,14 @@ XCPro production policy remains:
 
 ## Unresolved Decisions
 
-- Real production `XCPRO_PURETRACK_APP_KEY` value must be supplied out of band
-  before live PureTrack Traffic login/connect can succeed.
 - Real production `XCPRO_PURETRACK_INSERT_KEY` value is required before live
   outbound Insert publishing can be enabled. It is not required to fix the
   PureTrack login/connect "backend unavailable" symptom.
-- Production provider-session encryption secret value must be generated or
-  supplied on the server, outside Git.
-- Whether the production server should be updated manually from the local
-  working tree or through a pushed repository revision remains a deployment
-  operation decision.
+- Production PureTrack login/connect is fixed, but live traffic remains gated
+  by the authenticated user's XCPro entitlement state. The smoke account's live
+  server entitlement is `PRO` / `EXPIRED` / `VERIFIED`, so
+  `trafficApiAllowed=false` is expected until XCPro entitlement is renewed or
+  refreshed from a valid active Google Play purchase.
 
 ## Out Of Scope
 
@@ -123,8 +121,8 @@ XCPro production policy remains:
 | P0A | Evidence Freeze And Config Gap Record | complete / current |
 | P0B | Compose And Example Env Wiring | complete / current |
 | P0C | Production Secret Installation And API Recreate | complete / current |
-| P0D | Live PureTrack Login Smoke And Evidence Closeout | planned / next executable |
-| P0E | Contingency Sanitized Diagnostics If Smoke Still Fails | blocked unless P0D fails |
+| P0D | Live PureTrack Login Smoke And Evidence Closeout | complete / current |
+| P0E | Contingency Sanitized Diagnostics If Smoke Still Fails | blocked / not needed |
 
 ## P0A - Evidence Freeze And Config Gap Record
 
@@ -401,7 +399,7 @@ unavailable after this production config fix.
 
 ## P0D - Live PureTrack Login Smoke And Evidence Closeout
 
-Status: planned / next executable.
+Status: complete / current.
 
 ### Objective
 
@@ -446,9 +444,43 @@ Expected outcomes:
 If all valid cases still report backend unavailable, do not guess. Stop and
 move to P0E.
 
+### Evidence
+
+- Connected-phone smoke used the installed Android debug app against production
+  XCPro_Server.
+- After entering valid PureTrack credentials on the phone, the PureTrack
+  settings screen no longer reported "PureTrack backend unavailable" and no
+  longer reported credential rejection.
+- The UI showed a connected account label for the redacted PureTrack account.
+- Production sanitized API logs showed `POST /api/v1/puretrack/connect` and
+  `GET /api/v1/puretrack/status` returning `200` during smoke; unauthenticated
+  status probes still returned `401`.
+- Production DB inspection for the smoke account showed:
+  - PureTrack provider `user_access=PREMIUM`.
+  - Provider session hash present.
+  - Provider error code absent.
+  - XCPro entitlement snapshot `tier=PRO`, `status=EXPIRED`,
+    `verification_state=VERIFIED`.
+  - `account_has_verified_xcpro_pro_entitlement(...)` returned `False`.
+- Recent billing audit records for the same account show Google Play
+  subscription notifications on 2026-06-02 with `subscriptionStatus=EXPIRED`
+  and `result=REVOKED_OR_EXPIRED`. Earlier records showed active status before
+  the expiry events.
+- Therefore the original backend-config failure is fixed. The remaining live
+  traffic denial is the expected XCPro entitlement gate, not a PureTrack
+  provider-login failure.
+- No raw PureTrack app key, insert key, password, provider token, provider
+  session material, or XCPro bearer token was recorded in this IP.
+
+Next phase: none in this production config IP. P0E remains blocked because P0D
+did not fail. Any work to renew, restore, or manually correct XCPro
+subscription entitlement belongs to a separate account-entitlement
+investigation/repair plan, not this PureTrack production-config fix.
+
 ## P0E - Contingency Sanitized Diagnostics If Smoke Still Fails
 
-Status: blocked unless P0D fails after P0C verifies required env is `SET`.
+Status: blocked / not needed. P0D passed after P0C verified required env is
+`SET`.
 
 ### Objective
 
