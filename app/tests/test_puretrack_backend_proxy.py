@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -156,6 +157,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertIn("POST", methods_by_path["/api/v1/puretrack/connect"])
         self.assertIn("POST", methods_by_path["/api/v1/puretrack/disconnect"])
         self.assertIn("POST", methods_by_path["/api/v1/puretrack/insert"])
+        self.assertNotIn("/api/v1/puretrack/traffic", methods_by_path)
 
     def test_env_config_loader_uses_contract_defaults_and_values(self):
         default_config = main_module.load_puretrack_runtime_config({})
@@ -697,6 +699,282 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertNotIn(self.primary_bearer, serialized)
         self.assertNotIn("raw provider", serialized)
 
+    def test_traffic_request_models_reject_unknown_fields(self):
+        payload = self.traffic_payload()
+        cases = (
+            dict(payload, unexpected=True),
+            dict(payload, bbox=dict(payload["bbox"], unexpected=True)),
+            dict(payload, filters=dict(payload["filters"], s=["Y-ZK-MZE"])),
+            dict(payload, filters=dict(payload["filters"], i=1)),
+            dict(payload, providerUrl="https://puretrack.io/api/traffic"),
+        )
+
+        for invalid_payload in cases:
+            with self.subTest(payload=invalid_payload):
+                with self.assertRaises(ValidationError):
+                    self.parse_model(
+                        main_module.PureTrackTrafficRequest,
+                        invalid_payload,
+                    )
+
+    def test_traffic_bbox_validation_rejects_invalid_and_too_large_bounds(self):
+        valid_request = self.parse_model(
+            main_module.PureTrackTrafficRequest,
+            self.traffic_payload(),
+        )
+        bbox, filters = main_module.validate_puretrack_traffic_request(valid_request)
+
+        self.assertEqual(-37.49503, bbox.north)
+        self.assertEqual(main_module.PURETRACK_TRAFFIC_DEFAULT_CATEGORY, filters.category)
+        valid_bbox = self.model_dump(valid_request.bbox)
+        invalid_bboxes = (
+            dict(valid_bbox, north=-38.0, south=-37.0),
+            dict(valid_bbox, east=174.0, west=175.0),
+            dict(valid_bbox, north=91.0),
+            {"north": 1.0, "east": 4.0, "south": 0.9, "west": 0.0},
+            {"north": 5.0, "east": 1.0, "south": 1.0, "west": 0.0},
+        )
+        for invalid_bbox in invalid_bboxes:
+            with self.subTest(bbox=invalid_bbox):
+                request = self.parse_model(
+                    main_module.PureTrackTrafficRequest,
+                    dict(self.traffic_payload(), bbox=invalid_bbox),
+                )
+                with self.assertRaises(main_module.ApiHTTPException) as raised:
+                    main_module.validate_puretrack_traffic_request(request)
+                self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, raised.exception.code)
+
+        original_diagonal = main_module.PURETRACK_TRAFFIC_MAX_BBOX_DIAGONAL_METERS
+        try:
+            main_module.PURETRACK_TRAFFIC_MAX_BBOX_DIAGONAL_METERS = 1000.0
+            request = self.parse_model(
+                main_module.PureTrackTrafficRequest,
+                dict(self.traffic_payload(), bbox={
+                    "north": 0.02,
+                    "east": 0.02,
+                    "south": 0.0,
+                    "west": 0.0,
+                }),
+            )
+            with self.assertRaises(main_module.ApiHTTPException) as raised:
+                main_module.validate_puretrack_traffic_request(request)
+            self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, raised.exception.code)
+        finally:
+            main_module.PURETRACK_TRAFFIC_MAX_BBOX_DIAGONAL_METERS = original_diagonal
+
+    def test_traffic_filter_validation_rejects_invalid_values_and_provider_key_filters(self):
+        valid_filters = main_module.validate_puretrack_traffic_filters(
+            self.parse_model(
+                main_module.PureTrackTrafficFilters,
+                {
+                    "category": "air",
+                    "objectTypeIds": [1, 2, 6, 7],
+                    "sourceTypeIds": [0, 7, 12, 16],
+                    "maxAgeSeconds": 300,
+                },
+            )
+        )
+        self.assertEqual("air", valid_filters.category)
+        self.assertEqual([1, 2, 6, 7], valid_filters.objectTypeIds)
+
+        invalid_filter_payloads = (
+            {"category": "space"},
+            {"objectTypeIds": [1, 1]},
+            {"objectTypeIds": [-1]},
+            {"sourceTypeIds": [1000]},
+            {"maxAgeSeconds": 29},
+            {"maxAgeSeconds": 901},
+        )
+        for payload in invalid_filter_payloads:
+            with self.subTest(payload=payload):
+                filters = self.parse_model(main_module.PureTrackTrafficFilters, payload)
+                with self.assertRaises(main_module.ApiHTTPException) as raised:
+                    main_module.validate_puretrack_traffic_filters(filters)
+                self.assertEqual(main_module.ErrorCode.VALIDATION_ERROR, raised.exception.code)
+
+        for payload in ({"objectTypeIds": [True]}, {"s": ["Y-ZK-MZE"]}, {"isolate": True}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    self.parse_model(main_module.PureTrackTrafficFilters, payload)
+
+    def test_traffic_parser_maps_required_optional_fields_and_units(self):
+        row = (
+            "T1713592586,L-37.78174,G174.88159,A4685,P1006.7,C338,S144.05,"
+            "V-13.31,O56,DC828EA,U12,EZK-MZE,g43,mANZ118M,t4739.4,KY-ZK-MZE"
+        )
+        fields = main_module.parse_puretrack_compact_traffic_row(row)
+        self.assertEqual("1713592586", fields["T"])
+        target, redacted_count = main_module.map_puretrack_compact_row_to_traffic_target(row)
+
+        self.assertIsNotNone(target)
+        self.assertTrue(target["targetId"].startswith("pt_"))
+        self.assertNotIn("Y-ZK-MZE", target["targetId"])
+        self.assertEqual(1713592586000, target["lastSeenAtMs"])
+        self.assertEqual(-37.78174, target["latitudeDeg"])
+        self.assertEqual(174.88159, target["longitudeDeg"])
+        self.assertEqual(4685.0, target["altitudeGpsMeters"])
+        self.assertEqual(4739.4, target["altitudePressureMeters"])
+        self.assertEqual(338.0, target["courseDeg"])
+        self.assertEqual(144.05, target["groundSpeedMps"])
+        self.assertEqual(-13.31, target["verticalSpeedMps"])
+        self.assertEqual(56, target["objectTypeId"])
+        self.assertEqual("air", target["objectCategory"])
+        self.assertEqual(12, target["sourceTypeId"])
+        self.assertEqual("ADSBHub", target["sourceLabel"])
+        self.assertEqual("ZK-MZE", target["displayLabel"])
+        self.assertEqual("ZK-MZE", target["registration"])
+        self.assertEqual("ANZ118M", target["callsign"])
+        self.assertEqual(43.0, target["groundElevationMeters"])
+        self.assertGreaterEqual(redacted_count, 2)
+
+        minimal_target, _ = main_module.map_puretrack_compact_row_to_traffic_target(
+            "T1713592586,L-37.7,G174.8,K0-ABC123"
+        )
+        self.assertEqual(1713592586000, minimal_target["lastSeenAtMs"])
+        self.assertNotIn("altitudeGpsMeters", minimal_target)
+        self.assertNotIn("displayLabel", minimal_target)
+
+    def test_traffic_malformed_rows_drop_and_filters_apply(self):
+        valid_row = (
+            "T1713592586,L-37.78174,G174.88159,C338,S144.05,V-13.31,"
+            "O56,U12,EZK-MZE,mANZ118M,KY-ZK-MZE"
+        )
+        malformed_rows = [
+            valid_row,
+            "T1713592586,L-37.78174,G174.88159,O56,U12",
+            "T1713592586,Lnot-a-lat,G174.88159,O56,U12,KY-ZK-MZE",
+            "T1713592586,L-37.78174,G174.88159,C361,O56,U12,KY-ZK-MZE",
+            "",
+        ]
+
+        targets, dropped_count, redacted_count = main_module.map_puretrack_compact_rows_to_traffic_targets(
+            malformed_rows,
+            main_module.PureTrackTrafficFilters(category="air", sourceTypeIds=[12]),
+        )
+
+        self.assertEqual(1, len(targets))
+        self.assertEqual(4, dropped_count)
+        self.assertGreater(redacted_count, 0)
+
+        targets, dropped_count, _ = main_module.map_puretrack_compact_rows_to_traffic_targets(
+            [valid_row],
+            main_module.PureTrackTrafficFilters(category="air", sourceTypeIds=[7]),
+        )
+        self.assertEqual([], targets)
+        self.assertEqual(1, dropped_count)
+
+    def test_traffic_privacy_redaction_omits_sensitive_provider_fields(self):
+        row = (
+            "T1713592586,L-37.78174,G174.88159,A4685,C338,S144.05,V-13.31,"
+            "O56,U12,EZK-MZE,mANZ118M,MKing Air,cC828EA,KY-ZK-MZE,"
+            "DC828EA,Jtarget-123,RReceiver One,NRaw Pilot,uusername,p+6421123456,"
+            "jraw-target-key,kraw-inreach,lraw-spot,Fffvl-secret,^ognhex"
+        )
+        target, redacted_count = main_module.map_puretrack_compact_row_to_traffic_target(row)
+        response = main_module.PureTrackTrafficResponse(
+            result=main_module.PURETRACK_TRAFFIC_RESULT_OK,
+            targets=[target],
+            bbox=self.parse_model(main_module.PureTrackTrafficBbox, self.traffic_payload()["bbox"]),
+            filtersApplied=main_module.validate_puretrack_traffic_filters(None),
+            serverFetchedAtMs=self.now_ms(),
+            freshUntilMs=self.now_ms() + 5000,
+            providerRowCount=1,
+            droppedRowCount=0,
+            redactedFieldCount=redacted_count,
+            cacheStatus=main_module.PURETRACK_TRAFFIC_CACHE_MISS,
+            retryAfterMs=None,
+            auditId="pt_test_audit",
+        )
+        serialized = json.dumps(self.model_dump(response), sort_keys=True)
+
+        self.assertGreaterEqual(redacted_count, 10)
+        for forbidden in (
+            row,
+            "Receiver One",
+            "Raw Pilot",
+            "username",
+            "+6421123456",
+            "target-123",
+            "raw-target-key",
+            "raw-inreach",
+            "raw-spot",
+            "ffvl-secret",
+            "ognhex",
+            "puretrack.io",
+            "server-side-app-key",
+            self.primary_bearer,
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertIn("ZK-MZE", serialized)
+        self.assertIn("ANZ118M", serialized)
+
+        stealth_target, _ = main_module.map_puretrack_compact_row_to_traffic_target(
+            "T1713592586,L-37.78174,G174.88159,O56,U12,EZK-MZE,mANZ118M,H1,KY-ZK-MZE"
+        )
+        self.assertTrue(stealth_target["stealth"])
+        self.assertNotIn("displayLabel", stealth_target)
+        self.assertNotIn("registration", stealth_target)
+        self.assertNotIn("callsign", stealth_target)
+
+    def test_traffic_response_models_reject_raw_rows_and_provider_secrets(self):
+        target = {
+            "targetId": "pt_opaque",
+            "lastSeenAtMs": 1713592586000,
+            "latitudeDeg": -37.78174,
+            "longitudeDeg": 174.88159,
+        }
+        with self.assertRaises(ValidationError):
+            main_module.PureTrackTrafficTarget(
+                **dict(target, rawCompactRow="T1713592586,L-37.7,G174.8,KY-ZK-MZE")
+            )
+        with self.assertRaises(ValidationError):
+            main_module.PureTrackTrafficTarget(
+                **dict(target, providerUrl="https://puretrack.io/api/traffic")
+            )
+        with self.assertRaises(ValidationError):
+            main_module.PureTrackTrafficTarget(
+                **dict(target, displayLabel="https://puretrack.io/api/traffic")
+            )
+        with self.assertRaises(ValidationError):
+            main_module.PureTrackTrafficTarget(
+                **dict(target, targetId="Y-ZK-MZE")
+            )
+
+        response = main_module.PureTrackTrafficResponse(
+            result=main_module.PURETRACK_TRAFFIC_RESULT_OK,
+            targets=[main_module.PureTrackTrafficTarget(**target)],
+            bbox=self.parse_model(main_module.PureTrackTrafficBbox, self.traffic_payload()["bbox"]),
+            filtersApplied=main_module.validate_puretrack_traffic_filters(None),
+            serverFetchedAtMs=self.now_ms(),
+            freshUntilMs=self.now_ms() + 5000,
+            providerRowCount=1,
+            droppedRowCount=0,
+            redactedFieldCount=1,
+            cacheStatus=main_module.PURETRACK_TRAFFIC_CACHE_MISS,
+            retryAfterMs=None,
+            auditId="pt_test_audit",
+        )
+        serialized = json.dumps(self.model_dump(response), sort_keys=True)
+        self.assertNotIn("rawCompactRow", serialized)
+        self.assertNotIn("providerUrl", serialized)
+        self.assertNotIn("https://puretrack.io/api/traffic", serialized)
+
+        with self.assertRaises(ValidationError):
+            main_module.PureTrackTrafficResponse(
+                result=main_module.PURETRACK_TRAFFIC_RESULT_OK,
+                targets=[main_module.PureTrackTrafficTarget(**target)],
+                bbox=self.parse_model(main_module.PureTrackTrafficBbox, self.traffic_payload()["bbox"]),
+                filtersApplied=main_module.validate_puretrack_traffic_filters(None),
+                serverFetchedAtMs=self.now_ms(),
+                freshUntilMs=self.now_ms() + 5000,
+                providerRowCount=1,
+                droppedRowCount=0,
+                redactedFieldCount=1,
+                cacheStatus=main_module.PURETRACK_TRAFFIC_CACHE_MISS,
+                retryAfterMs=None,
+                auditId="pt_server-side-app-key",
+            )
+
     def headers(
         self,
         token: str | None = None,
@@ -832,6 +1110,36 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                 }
             ],
         }
+
+    @staticmethod
+    def traffic_payload() -> dict:
+        return {
+            "bbox": {
+                "north": -37.49503,
+                "east": 176.54678,
+                "south": -38.06575,
+                "west": 174.82046,
+            },
+            "filters": {
+                "category": "air",
+                "objectTypeIds": [1, 2, 6, 7],
+                "sourceTypeIds": [0, 7, 12, 16],
+                "maxAgeSeconds": 300,
+            },
+            "clientRequestId": "map-refresh-20260619-0001",
+        }
+
+    @staticmethod
+    def parse_model(model_cls, payload):
+        if hasattr(model_cls, "model_validate"):
+            return model_cls.model_validate(payload)
+        return model_cls.parse_obj(payload)
+
+    @staticmethod
+    def model_dump(model):
+        if hasattr(model, "model_dump"):
+            return model.model_dump()
+        return model.dict()
 
     def assert_no_secret_leakage(self, body: dict, password: str):
         serialized = json.dumps(body, sort_keys=True)

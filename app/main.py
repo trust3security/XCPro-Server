@@ -4,7 +4,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictStr
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
@@ -142,6 +142,192 @@ PURETRACK_INSERT_RESULT_ACCEPTED = "ACCEPTED"
 PURETRACK_INSERT_RESULT_PARTIAL_RETRY = "PARTIAL_RETRY"
 PURETRACK_INSERT_RESULT_RETRYABLE_FAILURE = "RETRYABLE_FAILURE"
 PURETRACK_INSERT_RESULT_REJECTED = "REJECTED"
+PURETRACK_TRAFFIC_RESULT_OK = "OK"
+PURETRACK_TRAFFIC_RESULT_EMPTY = "EMPTY"
+PURETRACK_TRAFFIC_RESULT_DEGRADED_CACHE = "DEGRADED_CACHE"
+PURETRACK_TRAFFIC_RESULT_PARTIAL = "PARTIAL"
+PURETRACK_TRAFFIC_CACHE_MISS = "MISS"
+PURETRACK_TRAFFIC_CACHE_HIT = "HIT"
+PURETRACK_TRAFFIC_CACHE_BYPASS = "BYPASS"
+PURETRACK_TRAFFIC_DEFAULT_CATEGORY = "air"
+PURETRACK_TRAFFIC_DEFAULT_MAX_AGE_SECONDS = 300
+PURETRACK_TRAFFIC_MIN_MAX_AGE_SECONDS = 30
+PURETRACK_TRAFFIC_MAX_MAX_AGE_SECONDS = 900
+PURETRACK_TRAFFIC_MAX_FILTER_IDS = 32
+PURETRACK_TRAFFIC_MIN_FILTER_ID = 0
+PURETRACK_TRAFFIC_MAX_FILTER_ID = 999
+PURETRACK_TRAFFIC_MAX_BBOX_WIDTH_METERS = 300_000.0
+PURETRACK_TRAFFIC_MAX_BBOX_HEIGHT_METERS = 300_000.0
+PURETRACK_TRAFFIC_MAX_BBOX_DIAGONAL_METERS = 425_000.0
+PURETRACK_TRAFFIC_EARTH_RADIUS_METERS = 6_371_000.0
+PURETRACK_TRAFFIC_ALLOWED_CATEGORIES = frozenset({"air", "ground", "other", "water"})
+PURETRACK_TRAFFIC_OBJECT_TYPE_CATEGORIES = {
+    0: "other",
+    1: "air",
+    2: "air",
+    3: "air",
+    4: "air",
+    5: "air",
+    6: "air",
+    7: "air",
+    8: "air",
+    9: "air",
+    10: "air",
+    11: "air",
+    12: "air",
+    13: "air",
+    15: "other",
+    16: "air",
+    17: "air",
+    18: "air",
+    19: "air",
+    20: "other",
+    21: "ground",
+    22: "ground",
+    23: "ground",
+    24: "ground",
+    25: "ground",
+    26: "ground",
+    27: "ground",
+    28: "ground",
+    29: "ground",
+    30: "ground",
+    31: "ground",
+    32: "ground",
+    33: "ground",
+    34: "ground",
+    35: "ground",
+    36: "water",
+    37: "water",
+    38: "water",
+    39: "water",
+    40: "water",
+    41: "water",
+    42: "water",
+    43: "water",
+    44: "water",
+    45: "water",
+    46: "water",
+    47: "ground",
+    48: "air",
+    49: "air",
+    50: "air",
+    51: "air",
+    52: "air",
+    53: "air",
+    54: "air",
+    55: "air",
+    56: "air",
+    57: "air",
+    58: "air",
+    59: "ground",
+    60: "water",
+    61: "water",
+    62: "water",
+    63: "other",
+    64: "ground",
+    65: "other",
+    66: "water",
+    67: "ground",
+    68: "ground",
+    69: "ground",
+    70: "ground",
+    71: "water",
+    72: "water",
+    73: "water",
+    74: "water",
+    75: "water",
+    76: "water",
+    77: "water",
+    78: "water",
+    79: "ground",
+    80: "ground",
+    81: "ground",
+    82: "air",
+}
+PURETRACK_TRAFFIC_SOURCE_LABELS = {
+    0: "OGN",
+    1: "SPOT",
+    2: "Particle",
+    3: "Overland",
+    4: "SPOT NZ",
+    5: "InReach NZ",
+    6: "BTraced",
+    7: "PureTrack API",
+    8: "MT600 GNZ",
+    9: "InReach",
+    10: "IGC File",
+    11: "Pi",
+    12: "ADSBHub",
+    13: "IGC Droid",
+    14: "SeeYou Navigator",
+    16: "PureTrack App",
+    17: "Teltonika",
+    18: "Cellular tracker",
+    19: "MT600",
+    20: "MT600-l",
+    21: "API",
+    22: "FR24",
+    23: "XContest",
+    24: "SkyLines",
+    25: "Flymaster",
+    26: "LiveGliding",
+    27: "ADSBExchange",
+    28: "adsb.lol",
+    29: "adsb.fi",
+    30: "SportsTrackLive",
+    31: "FFVL Tracking",
+    32: "Zoleo",
+    33: "Total Vario",
+    34: "Tracker App",
+    35: "OGN ICAO",
+    36: "XC Guide",
+    37: "Bircom",
+    38: "JimiIoT",
+    39: "XCMania",
+    40: "Traccar",
+    41: "SKYTRAXX",
+    42: "Gaggle",
+    43: "Wingman",
+    44: "Schar",
+    45: "airplanes.live",
+    46: "ADSB",
+    47: "XCglobe/FlyMe",
+    48: "NASA Balloons",
+    49: "XAlps",
+    50: "Naviter Omni",
+    51: "Garmin Watch",
+    52: "Ticatag",
+    53: "Naviter Oudie N",
+    54: "GPSLogger",
+    55: "ProteGear",
+    56: "SkySignals",
+    57: "GeoTracks",
+}
+PURETRACK_TRAFFIC_EXCLUDED_ROW_KEYS = frozenset({
+    "K",
+    "D",
+    "J",
+    "R",
+    "N",
+    "i",
+    "j",
+    "k",
+    "l",
+    "u",
+    "n",
+    "b",
+    "q",
+    "p",
+    "F",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "^",
+})
+PURETRACK_TRAFFIC_STEALTH_IDENTITY_KEYS = frozenset({"B", "E", "M", "c", "m"})
 PURETRACK_PROVIDER_STATUS_CACHE_MS = 3_600_000
 PURETRACK_DEFAULT_API_BASE_URL = "https://puretrack.io"
 PURETRACK_DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -2383,6 +2569,104 @@ class PureTrackInsertPublishRequest(BaseModel):
         extra = "forbid"
 
 
+class PureTrackTrafficBbox(BaseModel):
+    north: float
+    east: float
+    south: float
+    west: float
+
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackTrafficFilters(BaseModel):
+    category: Optional[StrictStr] = None
+    objectTypeIds: Optional[list[StrictInt]] = Field(default=None, max_items=32)
+    sourceTypeIds: Optional[list[StrictInt]] = Field(default=None, max_items=32)
+    maxAgeSeconds: Optional[StrictInt] = None
+
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackTrafficRequest(BaseModel):
+    bbox: PureTrackTrafficBbox
+    filters: Optional[PureTrackTrafficFilters] = None
+    clientRequestId: Optional[StrictStr] = Field(default=None, max_length=128)
+
+    class Config:
+        extra = "forbid"
+
+
+class PureTrackTrafficTarget(BaseModel):
+    targetId: str
+    lastSeenAtMs: int
+    latitudeDeg: float
+    longitudeDeg: float
+    altitudeGpsMeters: Optional[float] = None
+    altitudePressureMeters: Optional[float] = None
+    courseDeg: Optional[float] = None
+    groundSpeedMps: Optional[float] = None
+    verticalSpeedMps: Optional[float] = None
+    objectTypeId: Optional[int] = None
+    objectCategory: Optional[str] = None
+    sourceTypeId: Optional[int] = None
+    sourceLabel: Optional[str] = None
+    displayLabel: Optional[str] = None
+    registration: Optional[str] = None
+    callsign: Optional[str] = None
+    model: Optional[str] = None
+    colorHex: Optional[str] = None
+    groundElevationMeters: Optional[float] = None
+    thermalClimbRateMps: Optional[float] = None
+    signalQuality: Optional[float] = None
+    stealth: bool = False
+    noTracking: bool = False
+    onGround: bool = False
+    randomId: bool = False
+
+    class Config:
+        extra = "forbid"
+
+    if PYDANTIC_V2:
+        @model_validator(mode="before")
+        @classmethod
+        def validate_safe_payload(cls, payload: Any):
+            return reject_sensitive_puretrack_traffic_target_payload(payload)
+    else:
+        @root_validator(pre=True)
+        def validate_safe_payload(cls, payload):
+            return reject_sensitive_puretrack_traffic_target_payload(payload)
+
+
+class PureTrackTrafficResponse(BaseModel):
+    result: str
+    targets: list[PureTrackTrafficTarget]
+    bbox: PureTrackTrafficBbox
+    filtersApplied: PureTrackTrafficFilters
+    serverFetchedAtMs: int
+    freshUntilMs: int
+    providerRowCount: int
+    droppedRowCount: int
+    redactedFieldCount: int
+    cacheStatus: str
+    retryAfterMs: Optional[int] = None
+    auditId: str
+
+    class Config:
+        extra = "forbid"
+
+    if PYDANTIC_V2:
+        @model_validator(mode="before")
+        @classmethod
+        def validate_safe_payload(cls, payload: Any):
+            return reject_sensitive_puretrack_traffic_response_payload(payload)
+    else:
+        @root_validator(pre=True)
+        def validate_safe_payload(cls, payload):
+            return reject_sensitive_puretrack_traffic_response_payload(payload)
+
+
 class PureTrackStatusResponse(BaseModel):
     connected: bool
     appKeyConfigured: bool
@@ -4261,6 +4545,513 @@ def validate_puretrack_insert_request(
         mapped_tracker["points"] = points
         trackers.append(mapped_tracker)
     return trackers, client_point_ids, len(client_point_ids)
+
+
+def puretrack_validation_error(detail: str) -> ApiHTTPException:
+    return ApiHTTPException(
+        status_code=422,
+        code=ErrorCode.VALIDATION_ERROR,
+        detail=detail,
+    )
+
+
+def puretrack_traffic_distance_meters(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    haversine = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2.0) ** 2
+    )
+    return 2.0 * PURETRACK_TRAFFIC_EARTH_RADIUS_METERS * math.asin(
+        min(1.0, math.sqrt(haversine))
+    )
+
+
+def validate_puretrack_traffic_bbox(
+    bbox: PureTrackTrafficBbox,
+) -> PureTrackTrafficBbox:
+    north = require_puretrack_finite_number(bbox.north, "bbox.north", -90.0, 90.0)
+    south = require_puretrack_finite_number(bbox.south, "bbox.south", -90.0, 90.0)
+    east = require_puretrack_finite_number(bbox.east, "bbox.east", -180.0, 180.0)
+    west = require_puretrack_finite_number(bbox.west, "bbox.west", -180.0, 180.0)
+    if north <= south:
+        raise puretrack_validation_error("bbox.north must be greater than bbox.south")
+    if east <= west:
+        raise puretrack_validation_error(
+            "bbox.east must be greater than bbox.west; anti-meridian requests are not supported"
+        )
+    width_meters = puretrack_traffic_distance_meters(north, west, north, east)
+    height_meters = puretrack_traffic_distance_meters(north, west, south, west)
+    diagonal_meters = puretrack_traffic_distance_meters(north, west, south, east)
+    if width_meters > PURETRACK_TRAFFIC_MAX_BBOX_WIDTH_METERS:
+        raise puretrack_validation_error("bbox width exceeds PureTrack traffic limit")
+    if height_meters > PURETRACK_TRAFFIC_MAX_BBOX_HEIGHT_METERS:
+        raise puretrack_validation_error("bbox height exceeds PureTrack traffic limit")
+    if diagonal_meters > PURETRACK_TRAFFIC_MAX_BBOX_DIAGONAL_METERS:
+        raise puretrack_validation_error("bbox diagonal exceeds PureTrack traffic limit")
+    return PureTrackTrafficBbox(north=north, east=east, south=south, west=west)
+
+
+def validate_puretrack_traffic_id_filter(
+    values: Optional[list[int]],
+    field_name: str,
+) -> Optional[list[int]]:
+    if values is None:
+        return None
+    if len(values) > PURETRACK_TRAFFIC_MAX_FILTER_IDS:
+        raise puretrack_validation_error(f"{field_name} has too many entries")
+    unique_values: list[int] = []
+    seen_values: set[int] = set()
+    for value in values:
+        if isinstance(value, bool):
+            raise puretrack_validation_error(f"{field_name} values must be integers")
+        if (
+            value < PURETRACK_TRAFFIC_MIN_FILTER_ID
+            or value > PURETRACK_TRAFFIC_MAX_FILTER_ID
+        ):
+            raise puretrack_validation_error(f"{field_name} values out of range")
+        if value in seen_values:
+            raise puretrack_validation_error(f"{field_name} values must be unique")
+        seen_values.add(value)
+        unique_values.append(value)
+    return unique_values
+
+
+def validate_puretrack_traffic_filters(
+    filters: Optional[PureTrackTrafficFilters],
+) -> PureTrackTrafficFilters:
+    resolved_filters = filters or PureTrackTrafficFilters()
+    category = resolved_filters.category or PURETRACK_TRAFFIC_DEFAULT_CATEGORY
+    if category not in PURETRACK_TRAFFIC_ALLOWED_CATEGORIES:
+        raise puretrack_validation_error("filters.category is not supported")
+    object_type_ids = validate_puretrack_traffic_id_filter(
+        resolved_filters.objectTypeIds,
+        "filters.objectTypeIds",
+    )
+    source_type_ids = validate_puretrack_traffic_id_filter(
+        resolved_filters.sourceTypeIds,
+        "filters.sourceTypeIds",
+    )
+    max_age_seconds = (
+        resolved_filters.maxAgeSeconds
+        if resolved_filters.maxAgeSeconds is not None
+        else PURETRACK_TRAFFIC_DEFAULT_MAX_AGE_SECONDS
+    )
+    if isinstance(max_age_seconds, bool):
+        raise puretrack_validation_error("filters.maxAgeSeconds must be an integer")
+    if (
+        max_age_seconds < PURETRACK_TRAFFIC_MIN_MAX_AGE_SECONDS
+        or max_age_seconds > PURETRACK_TRAFFIC_MAX_MAX_AGE_SECONDS
+    ):
+        raise puretrack_validation_error("filters.maxAgeSeconds out of range")
+    return PureTrackTrafficFilters(
+        category=category,
+        objectTypeIds=object_type_ids,
+        sourceTypeIds=source_type_ids,
+        maxAgeSeconds=max_age_seconds,
+    )
+
+
+def validate_puretrack_traffic_request(
+    request: PureTrackTrafficRequest,
+) -> tuple[PureTrackTrafficBbox, PureTrackTrafficFilters]:
+    bbox = validate_puretrack_traffic_bbox(request.bbox)
+    filters = validate_puretrack_traffic_filters(request.filters)
+    if request.clientRequestId is not None:
+        optional_puretrack_text(request.clientRequestId, "clientRequestId")
+    return bbox, filters
+
+
+def parse_puretrack_compact_traffic_row(row: str) -> Optional[dict[str, str]]:
+    if not isinstance(row, str) or not row.strip():
+        return None
+    fields: dict[str, str] = {}
+    for raw_token in row.split(","):
+        token = raw_token.strip()
+        if not token:
+            return None
+        key = token[0]
+        value = token[1:].strip()
+        if not value and key not in {"!", "^"}:
+            return None
+        fields[key] = value or "1"
+    if any(not trim_to_none(fields.get(key)) for key in ("T", "L", "G", "K")):
+        return None
+    return fields
+
+
+def parse_puretrack_row_float(
+    fields: Mapping[str, str],
+    key: str,
+    field_name: str,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+    required: bool = False,
+) -> Optional[float]:
+    raw_value = trim_to_none(fields.get(key))
+    if raw_value is None:
+        if required:
+            raise ValueError(f"{field_name} is required")
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{field_name} must be finite")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field_name} out of range")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{field_name} out of range")
+    return value
+
+
+def parse_puretrack_row_int(
+    fields: Mapping[str, str],
+    key: str,
+    field_name: str,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+    required: bool = False,
+) -> Optional[int]:
+    raw_value = trim_to_none(fields.get(key))
+    if raw_value is None:
+        if required:
+            raise ValueError(f"{field_name} is required")
+        return None
+    try:
+        if re.search(r"[.eE]", raw_value):
+            numeric_value = float(raw_value)
+            if not numeric_value.is_integer():
+                raise ValueError
+            value = int(numeric_value)
+        else:
+            value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{field_name} out of range")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{field_name} out of range")
+    return value
+
+
+def parse_puretrack_row_bool(fields: Mapping[str, str], key: str) -> bool:
+    raw_value = trim_to_none(fields.get(key))
+    if raw_value is None:
+        return False
+    normalized = raw_value.lower()
+    return normalized in {"1", "true", "yes", "y"}
+
+
+def sanitize_puretrack_text(
+    raw_value: Optional[str],
+    max_length: int,
+    allow_spaces: bool = False,
+) -> Optional[str]:
+    value = trim_to_none(raw_value)
+    if value is None:
+        return None
+    if re.search(r"[\r\n\t]", value):
+        return None
+    lowered = value.lower()
+    if (
+        "@" in value
+        or "http://" in lowered
+        or "https://" in lowered
+        or "bearer" in lowered
+        or "token" in lowered
+        or "password" in lowered
+        or "key=" in lowered
+        or "access_" + "token" in lowered
+    ):
+        return None
+    if re.search(r"\+?\d[\d ()\-.]{6,}\d", value):
+        return None
+    if re.match(r"^[XYZ]-", value) or re.match(r"^\d+-[A-Za-z0-9_-]{3,}$", value):
+        return None
+    if allow_spaces:
+        if not re.match(r"^[A-Za-z0-9 ._/\-]{1,}$", value):
+            return None
+    elif not re.match(r"^[A-Za-z0-9._/\-]{1,}$", value):
+        return None
+    return value[:max_length]
+
+
+def sanitize_puretrack_color(raw_value: Optional[str]) -> Optional[str]:
+    value = trim_to_none(raw_value)
+    if value is None:
+        return None
+    normalized = value[1:] if value.startswith("#") else value
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", normalized):
+        return f"#{normalized.upper()}"
+    return None
+
+
+def puretrack_text_has_sensitive_value(raw_value: str) -> bool:
+    value = raw_value.strip()
+    lowered = value.lower()
+    return (
+        "@" in value
+        or "http://" in lowered
+        or "https://" in lowered
+        or "puretrack.io" in lowered
+        or "/api/" in lowered
+        or "bearer" in lowered
+        or "token" in lowered
+        or "password" in lowered
+        or "provider-session" in lowered
+        or "server-side-app-key" in lowered
+        or "server-side-insert-key" in lowered
+        or "access_" + "token" in lowered
+        or "key=" in lowered
+        or bool(re.search(r"\+?\d[\d ()\-.]{6,}\d", value))
+        or bool(re.match(r"^[XYZ]-", value))
+        or bool(re.match(r"^\d+-[A-Za-z0-9_-]{3,}$", value))
+    )
+
+
+def reject_sensitive_puretrack_visible_text(
+    payload: Mapping[str, Any],
+    field_name: str,
+    max_length: int,
+    allow_spaces: bool,
+) -> None:
+    raw_value = payload.get(field_name)
+    if raw_value is None:
+        return
+    if not isinstance(raw_value, str):
+        raise ValueError(f"{field_name} must be a string")
+    if len(raw_value) > max_length:
+        raise ValueError(f"{field_name} is too long")
+    if puretrack_text_has_sensitive_value(raw_value):
+        raise ValueError(f"{field_name} contains sensitive provider data")
+    if sanitize_puretrack_text(raw_value, max_length, allow_spaces) != raw_value:
+        raise ValueError(f"{field_name} contains unsupported characters")
+
+
+def reject_sensitive_puretrack_traffic_target_payload(payload: Any) -> Any:
+    if not isinstance(payload, MappingABC):
+        return payload
+    target_id = payload.get("targetId")
+    if not isinstance(target_id, str) or not target_id.startswith("pt_"):
+        raise ValueError("targetId must be an opaque PureTrack target id")
+    if puretrack_text_has_sensitive_value(target_id):
+        raise ValueError("targetId contains sensitive provider data")
+    reject_sensitive_puretrack_visible_text(payload, "sourceLabel", 64, True)
+    reject_sensitive_puretrack_visible_text(payload, "displayLabel", 48, False)
+    reject_sensitive_puretrack_visible_text(payload, "registration", 32, False)
+    reject_sensitive_puretrack_visible_text(payload, "callsign", 32, False)
+    reject_sensitive_puretrack_visible_text(payload, "model", 64, True)
+    color_hex = payload.get("colorHex")
+    if color_hex is not None and sanitize_puretrack_color(color_hex) != color_hex:
+        raise ValueError("colorHex must be #RRGGBB")
+    return payload
+
+
+def reject_sensitive_puretrack_traffic_response_payload(payload: Any) -> Any:
+    if not isinstance(payload, MappingABC):
+        return payload
+    result = payload.get("result")
+    if result not in {
+        PURETRACK_TRAFFIC_RESULT_OK,
+        PURETRACK_TRAFFIC_RESULT_EMPTY,
+        PURETRACK_TRAFFIC_RESULT_DEGRADED_CACHE,
+        PURETRACK_TRAFFIC_RESULT_PARTIAL,
+    }:
+        raise ValueError("result is not supported")
+    cache_status = payload.get("cacheStatus")
+    if cache_status not in {
+        PURETRACK_TRAFFIC_CACHE_MISS,
+        PURETRACK_TRAFFIC_CACHE_HIT,
+        PURETRACK_TRAFFIC_CACHE_BYPASS,
+    }:
+        raise ValueError("cacheStatus is not supported")
+    audit_id = payload.get("auditId")
+    if not isinstance(audit_id, str) or not audit_id.startswith("pt_"):
+        raise ValueError("auditId must be redacted")
+    if puretrack_text_has_sensitive_value(audit_id):
+        raise ValueError("auditId contains sensitive provider data")
+    for field_name in (
+        "serverFetchedAtMs",
+        "freshUntilMs",
+        "providerRowCount",
+        "droppedRowCount",
+        "redactedFieldCount",
+    ):
+        value = payload.get(field_name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{field_name} out of range")
+    retry_after_ms = payload.get("retryAfterMs")
+    if (
+        retry_after_ms is not None
+        and (
+            not isinstance(retry_after_ms, int)
+            or isinstance(retry_after_ms, bool)
+            or retry_after_ms < 0
+        )
+    ):
+        raise ValueError("retryAfterMs out of range")
+    if payload["freshUntilMs"] < payload["serverFetchedAtMs"]:
+        raise ValueError("freshUntilMs must not precede serverFetchedAtMs")
+    return payload
+
+
+def opaque_puretrack_target_id(raw_key: str) -> str:
+    digest = hashlib.sha256(f"puretrack-target:{raw_key}".encode("utf-8")).hexdigest()
+    return f"pt_{digest[:24]}"
+
+
+def select_puretrack_display_label(
+    registration: Optional[str],
+    callsign: Optional[str],
+    label: Optional[str],
+) -> Optional[str]:
+    return registration or callsign or sanitize_puretrack_text(label, 48, allow_spaces=False)
+
+
+def map_puretrack_traffic_fields_to_target(
+    fields: Mapping[str, str],
+) -> tuple[dict[str, Any], int]:
+    timestamp_seconds = parse_puretrack_row_int(
+        fields,
+        "T",
+        "T",
+        minimum=0,
+        required=True,
+    )
+    latitude = parse_puretrack_row_float(
+        fields,
+        "L",
+        "L",
+        minimum=-90.0,
+        maximum=90.0,
+        required=True,
+    )
+    longitude = parse_puretrack_row_float(
+        fields,
+        "G",
+        "G",
+        minimum=-180.0,
+        maximum=180.0,
+        required=True,
+    )
+    raw_key = require_puretrack_non_blank(fields.get("K"), "K")
+    object_type_id = parse_puretrack_row_int(
+        fields,
+        "O",
+        "O",
+        minimum=PURETRACK_TRAFFIC_MIN_FILTER_ID,
+        maximum=PURETRACK_TRAFFIC_MAX_FILTER_ID,
+    )
+    source_type_id = parse_puretrack_row_int(
+        fields,
+        "U",
+        "U",
+        minimum=PURETRACK_TRAFFIC_MIN_FILTER_ID,
+        maximum=PURETRACK_TRAFFIC_MAX_FILTER_ID,
+    )
+    stealth = parse_puretrack_row_bool(fields, "H")
+    no_tracking = parse_puretrack_row_bool(fields, "Q")
+    target: dict[str, Any] = {
+        "targetId": opaque_puretrack_target_id(raw_key),
+        "lastSeenAtMs": timestamp_seconds * 1000,
+        "latitudeDeg": latitude,
+        "longitudeDeg": longitude,
+        "altitudeGpsMeters": parse_puretrack_row_float(fields, "A", "A"),
+        "altitudePressureMeters": parse_puretrack_row_float(fields, "t", "t"),
+        "courseDeg": parse_puretrack_row_float(fields, "C", "C", 0.0, 360.0),
+        "groundSpeedMps": parse_puretrack_row_float(fields, "S", "S", 0.0),
+        "verticalSpeedMps": parse_puretrack_row_float(fields, "V", "V"),
+        "objectTypeId": object_type_id,
+        "objectCategory": (
+            PURETRACK_TRAFFIC_OBJECT_TYPE_CATEGORIES.get(object_type_id)
+            if object_type_id is not None
+            else None
+        ),
+        "sourceTypeId": source_type_id,
+        "sourceLabel": (
+            PURETRACK_TRAFFIC_SOURCE_LABELS.get(source_type_id)
+            if source_type_id is not None
+            else None
+        ),
+        "groundElevationMeters": parse_puretrack_row_float(fields, "g", "g"),
+        "thermalClimbRateMps": parse_puretrack_row_float(fields, "r", "r"),
+        "signalQuality": parse_puretrack_row_float(fields, "I", "I"),
+        "stealth": stealth,
+        "noTracking": no_tracking,
+        "onGround": parse_puretrack_row_bool(fields, "8"),
+        "randomId": parse_puretrack_row_bool(fields, "!"),
+    }
+    redacted_count = sum(1 for key in fields if key in PURETRACK_TRAFFIC_EXCLUDED_ROW_KEYS)
+    if stealth or no_tracking:
+        redacted_count += sum(1 for key in fields if key in PURETRACK_TRAFFIC_STEALTH_IDENTITY_KEYS)
+    else:
+        registration = sanitize_puretrack_text(fields.get("E"), 32)
+        callsign = sanitize_puretrack_text(fields.get("m"), 32)
+        model = sanitize_puretrack_text(fields.get("M"), 64, allow_spaces=True)
+        color_hex = sanitize_puretrack_color(fields.get("c"))
+        target["registration"] = registration
+        target["callsign"] = callsign
+        target["model"] = model
+        target["colorHex"] = color_hex
+        target["displayLabel"] = select_puretrack_display_label(
+            registration,
+            callsign,
+            fields.get("B"),
+        )
+    return {key: value for key, value in target.items() if value is not None}, redacted_count
+
+
+def map_puretrack_compact_row_to_traffic_target(
+    row: str,
+) -> tuple[Optional[dict[str, Any]], int]:
+    fields = parse_puretrack_compact_traffic_row(row)
+    if fields is None:
+        return None, 0
+    try:
+        return map_puretrack_traffic_fields_to_target(fields)
+    except (ApiHTTPException, ValueError):
+        return None, 0
+
+
+def puretrack_target_matches_filters(
+    target: Mapping[str, Any],
+    filters: PureTrackTrafficFilters,
+) -> bool:
+    if filters.objectTypeIds is not None and target.get("objectTypeId") not in filters.objectTypeIds:
+        return False
+    if filters.sourceTypeIds is not None and target.get("sourceTypeId") not in filters.sourceTypeIds:
+        return False
+    object_category = target.get("objectCategory")
+    if object_category is not None and filters.category is not None:
+        return object_category == filters.category
+    return True
+
+
+def map_puretrack_compact_rows_to_traffic_targets(
+    rows: list[str],
+    filters: Optional[PureTrackTrafficFilters] = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    resolved_filters = validate_puretrack_traffic_filters(filters)
+    targets: list[dict[str, Any]] = []
+    dropped_count = 0
+    redacted_count = 0
+    for row in rows:
+        target, row_redacted_count = map_puretrack_compact_row_to_traffic_target(row)
+        if target is None or not puretrack_target_matches_filters(target, resolved_filters):
+            dropped_count += 1
+            continue
+        targets.append(target)
+        redacted_count += row_redacted_count
+    return targets, dropped_count, redacted_count
 
 
 def build_puretrack_status_payload(
