@@ -121,8 +121,8 @@ XCPro production policy remains:
 | Phase | Title | Status |
 | --- | --- | --- |
 | P0A | Evidence Freeze And Config Gap Record | complete / current |
-| P0B | Compose And Example Env Wiring | planned / next executable |
-| P0C | Production Secret Installation And API Recreate | planned after P0B |
+| P0B | Compose And Example Env Wiring | complete / current |
+| P0C | Production Secret Installation And API Recreate | planned / next executable |
 | P0D | Live PureTrack Login Smoke And Evidence Closeout | planned after P0C |
 | P0E | Contingency Sanitized Diagnostics If Smoke Still Fails | blocked unless P0D fails |
 
@@ -167,7 +167,7 @@ Next phase: P0B.
 
 ## P0B - Compose And Example Env Wiring
 
-Status: planned / next executable.
+Status: complete / current.
 
 ### Objective
 
@@ -208,7 +208,10 @@ configuration into the API container without storing real secrets.
 - No XCPro login/Firebase changes.
 - No LiveFollow changes.
 - No direct PureTrack credentials in committed files.
-- No production SSH edits in this phase.
+- No production `/opt/xcpro`, `.env`, container, volume, secret, or Caddy edits
+  in this phase.
+- SSH is allowed only for non-mutating compose validation in a temporary
+  directory on a Docker-capable host when Docker/Compose is unavailable locally.
 
 ### Verification
 
@@ -227,6 +230,9 @@ Expected:
 - `docker compose config` succeeds locally or on a Docker-capable host. If
   Docker is unavailable locally, record the host where this exact compose config
   was verified.
+- If using a Docker-capable host, copy only the candidate `docker-compose.yml`
+  and `.env.example` to a temporary directory outside `/opt/xcpro`, run the
+  compose config command there, then delete the temporary directory.
 - The first `rg` may show placeholder/example keys only; any real-looking
   secret value is a blocker.
 - The second `rg` should show server-owned upstream PureTrack API use only.
@@ -234,15 +240,46 @@ Expected:
 
 ### Post-Review
 
-- Run a seam/ownership pass focused on deployment env boundaries.
-- Run architecture review if route logic, auth, entitlement, or provider
-  session behavior changes. For pure compose/docs/env-example changes, record a
-  no-code rationale.
+- Seam/ownership pass: PASS. Scope stayed to compose/env docs only.
+- Architecture review rationale: no route logic, auth, entitlement, provider
+  session behavior, Android code, or upstream PureTrack provider code changed,
+  so no code-level architecture review was required.
 - Commit only scoped P0B files after verification passes.
+
+### Evidence
+
+Completed on 2026-06-19:
+
+- `docker-compose.yml` now projects the PureTrack runtime env keys into the
+  `api` service:
+  - `XCPRO_PURETRACK_APP_KEY`
+  - `XCPRO_PURETRACK_INSERT_KEY`
+  - `XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET`
+  - `XCPRO_PURETRACK_API_BASE_URL`
+  - `XCPRO_PURETRACK_TIMEOUT_SECONDS`
+- `.env.example` now lists the same PureTrack keys with placeholder/default
+  values only.
+- Local Docker/Compose was unavailable, so compose verification was run on
+  `xcpro-prod` in a temporary directory under `/tmp`. Only candidate
+  `docker-compose.yml` and `.env.example` were copied. The command
+  `docker compose --env-file .env.example config` returned
+  `COMPOSE_CONFIG_OK`, and the temporary directory was deleted.
+- No production `/opt/xcpro`, `.env`, container, volume, secret, or Caddy config
+  was edited during P0B.
+- `git diff --check -- docker-compose.yml .env.example DEPLOY.md docs/PURETRACK`
+  passed with line-ending warnings only.
+- Secret assignment scan passed with no committed real-value hits:
+  `rg -n "XCPRO_PURETRACK_(APP_KEY|INSERT_KEY|PROVIDER_SESSION_ENCRYPTION_SECRET)=\\S+" .env.example docs docker-compose.yml`.
+- PureTrack URL ownership scan stayed in server-owned provider code/tests only:
+  `app/main.py` upstream calls and redaction tests in
+  `app/tests/test_puretrack_backend_proxy.py`.
+
+Next phase: P0C - Production Secret Installation And API Recreate. Do not start
+P0C without explicit user direction and real secret handling confirmation.
 
 ## P0C - Production Secret Installation And API Recreate
 
-Status: planned after P0B.
+Status: planned / next executable.
 
 ### Objective
 
@@ -456,7 +493,10 @@ Do not:
 - Change route logic, auth, Firebase, Google login, LiveFollow, FCM,
   subscriptions, database schema, Android code, or PureTrack provider logic.
 - Commit real secrets.
-- SSH into production or edit `/opt/xcpro` during P0B.
+- Edit production `/opt/xcpro`, `.env`, containers, volumes, secrets, or Caddy
+  config during P0B.
+- Use SSH during P0B except for non-mutating temp-dir compose validation when
+  Docker/Compose is unavailable locally.
 
 Verification:
 
@@ -470,7 +510,10 @@ rg -n "puretrack\\.io/api|api/login|api/traffic|api/insert" app -g "*.py"
 
 `docker compose config` must pass locally or on a Docker-capable host. If
 Docker is unavailable locally, record where this exact compose config was
-verified.
+verified. Host-based validation must copy only `docker-compose.yml` and
+`.env.example` to a temporary directory outside `/opt/xcpro`, run compose
+config there, and delete the temporary directory without mutating production
+config, containers, volumes, secrets, or Caddy.
 
 Post-review:
 
