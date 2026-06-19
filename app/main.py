@@ -160,6 +160,9 @@ PURETRACK_TRAFFIC_MAX_BBOX_WIDTH_METERS = 300_000.0
 PURETRACK_TRAFFIC_MAX_BBOX_HEIGHT_METERS = 300_000.0
 PURETRACK_TRAFFIC_MAX_BBOX_DIAGONAL_METERS = 425_000.0
 PURETRACK_TRAFFIC_EARTH_RADIUS_METERS = 6_371_000.0
+PURETRACK_TRAFFIC_CACHE_TTL_MS = 5_000
+PURETRACK_TRAFFIC_RATE_LIMIT_BURST = 3
+PURETRACK_TRAFFIC_RATE_LIMIT_PER_MINUTE = 12
 PURETRACK_TRAFFIC_ALLOWED_CATEGORIES = frozenset({"air", "ground", "other", "water"})
 PURETRACK_TRAFFIC_OBJECT_TYPE_CATEGORIES = {
     0: "other",
@@ -556,8 +559,11 @@ class ErrorCode:
     PURETRACK_APP_KEY_UNCONFIGURED = "puretrack_app_key_unconfigured"
     PURETRACK_INSERT_KEY_UNCONFIGURED = "puretrack_insert_key_unconfigured"
     PURETRACK_INSERT_REJECTED = "puretrack_insert_rejected"
+    PURETRACK_PROVIDER_NOT_CONNECTED = "puretrack_provider_not_connected"
+    PURETRACK_PROVIDER_ACCESS_DENIED = "puretrack_provider_access_denied"
     PURETRACK_PROVIDER_SESSION_UNAVAILABLE = "puretrack_provider_session_unavailable"
     PURETRACK_PROVIDER_UNAVAILABLE = "puretrack_provider_unavailable"
+    PURETRACK_TRAFFIC_REJECTED = "puretrack_traffic_rejected"
     PURETRACK_RATE_LIMITED = "puretrack_rate_limited"
     PURETRACK_STATE_INVALID = "puretrack_state_invalid"
     FEATURE_ACCESS_DENIED = "feature_access_denied"
@@ -663,6 +669,14 @@ class PureTrackProviderLoginResult:
 class PureTrackInsertProviderResult:
     result: str
     provider_inserted_point_count: Optional[int] = None
+    retry_after_ms: Optional[int] = None
+    error_code: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PureTrackTrafficProviderResult:
+    rows: Optional[list[str]] = None
+    provider_row_count: int = 0
     retry_after_ms: Optional[int] = None
     error_code: Optional[str] = None
 
@@ -1349,6 +1363,123 @@ class HttpPureTrackInsertClient:
 
 
 PURETRACK_INSERT_CLIENT = HttpPureTrackInsertClient()
+
+
+def puretrack_traffic_provider_failure_for_http_status(
+    status_code: int,
+    retry_after_ms: Optional[int] = None,
+) -> PureTrackTrafficProviderResult:
+    if status_code == 429:
+        return PureTrackTrafficProviderResult(
+            retry_after_ms=retry_after_ms,
+            error_code=ErrorCode.PURETRACK_RATE_LIMITED,
+        )
+    if status_code == 401:
+        return PureTrackTrafficProviderResult(
+            error_code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+        )
+    if status_code == 403:
+        return PureTrackTrafficProviderResult(
+            error_code=ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+        )
+    if status_code == 422:
+        return PureTrackTrafficProviderResult(
+            error_code=ErrorCode.PURETRACK_TRAFFIC_REJECTED,
+        )
+    if 500 <= status_code <= 599:
+        return PureTrackTrafficProviderResult(
+            error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+        )
+    return PureTrackTrafficProviderResult(
+        error_code=ErrorCode.PURETRACK_TRAFFIC_REJECTED,
+    )
+
+
+class HttpPureTrackTrafficClient:
+    def fetch(
+        self,
+        bbox: "PureTrackTrafficBbox",
+        filters: "PureTrackTrafficFilters",
+        provider_session_secret: str,
+        config: PureTrackRuntimeConfig,
+    ) -> PureTrackTrafficProviderResult:
+        app_key = trim_to_none(config.app_key)
+        if app_key is None:
+            return PureTrackTrafficProviderResult(
+                error_code=ErrorCode.PURETRACK_APP_KEY_UNCONFIGURED,
+            )
+
+        params: dict[str, Any] = {
+            "key": app_key,
+            "lat1": bbox.north,
+            "long1": bbox.east,
+            "lat2": bbox.south,
+            "long2": bbox.west,
+            "cat": filters.category,
+            "t": math.ceil(filters.maxAgeSeconds / 60.0),
+        }
+        if filters.objectTypeIds:
+            params["o"] = ",".join(str(value) for value in filters.objectTypeIds)
+
+        try:
+            response = httpx.post(
+                f"{config.api_base_url}/api/traffic",
+                data=params,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {provider_session_secret}",
+                },
+                timeout=config.timeout_seconds,
+            )
+        except httpx.TimeoutException:
+            return PureTrackTrafficProviderResult(
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+        except httpx.HTTPError:
+            return PureTrackTrafficProviderResult(
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+
+        if response.status_code != 200:
+            return puretrack_traffic_provider_failure_for_http_status(
+                response.status_code,
+                parse_retry_after_ms(response.headers.get("Retry-After")),
+            )
+
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("PureTrack traffic response must be a JSON object")
+            provider_http_code = coerce_non_negative_int(
+                payload.get("http_code", 200),
+                "http_code",
+            )
+            if payload.get("success") is not True or provider_http_code != 200:
+                return puretrack_traffic_provider_failure_for_http_status(
+                    provider_http_code,
+                    parse_retry_after_ms(response.headers.get("Retry-After")),
+                )
+            raw_rows = payload.get("data")
+            if not isinstance(raw_rows, list) or not all(
+                isinstance(row, str) for row in raw_rows
+            ):
+                raise ValueError("PureTrack traffic data must be a string array")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return PureTrackTrafficProviderResult(
+                error_code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+            )
+
+        return PureTrackTrafficProviderResult(
+            rows=raw_rows,
+            provider_row_count=len(raw_rows),
+        )
+
+
+PURETRACK_TRAFFIC_CLIENT = HttpPureTrackTrafficClient()
+_puretrack_traffic_cache: dict[str, dict[str, Any]] = {}
+_puretrack_traffic_cache_lock = threading.Lock()
+_puretrack_traffic_rate_limits: dict[str, tuple[float, int]] = {}
+_puretrack_traffic_rate_limit_lock = threading.Lock()
 
 
 def base64url_encode(raw_bytes: bytes) -> str:
@@ -4414,6 +4545,11 @@ def puretrack_audit_id() -> str:
     return f"pt_{uuid.uuid4().hex}"
 
 
+def puretrack_traffic_audit_id() -> str:
+    suffix = "".join(secrets.choice(string.ascii_lowercase) for _ in range(12))
+    return f"pt_traffic_{suffix}"
+
+
 def redact_puretrack_account_label(email: str) -> str:
     normalized = email.strip()
     local, separator, domain = normalized.partition("@")
@@ -5137,6 +5273,245 @@ def map_puretrack_compact_rows_to_traffic_targets(
         targets.append(target)
         redacted_count += row_redacted_count
     return targets, dropped_count, redacted_count
+
+
+def pydantic_model_to_dict(model: BaseModel) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def puretrack_retry_after_header(retry_after_ms: Optional[int]) -> dict[str, str]:
+    if retry_after_ms is None:
+        return {}
+    retry_after_seconds = max(0, math.ceil(retry_after_ms / 1000.0))
+    return {"Retry-After": str(retry_after_seconds)}
+
+
+def check_puretrack_traffic_rate_limit(user_id: str) -> Optional[int]:
+    now_ms = to_epoch_ms(utcnow())
+    refill_per_ms = PURETRACK_TRAFFIC_RATE_LIMIT_PER_MINUTE / 60_000.0
+    with _puretrack_traffic_rate_limit_lock:
+        tokens, updated_at_ms = _puretrack_traffic_rate_limits.get(
+            user_id,
+            (float(PURETRACK_TRAFFIC_RATE_LIMIT_BURST), now_ms),
+        )
+        elapsed_ms = max(0, now_ms - updated_at_ms)
+        tokens = min(
+            float(PURETRACK_TRAFFIC_RATE_LIMIT_BURST),
+            tokens + elapsed_ms * refill_per_ms,
+        )
+        if tokens >= 1.0:
+            _puretrack_traffic_rate_limits[user_id] = (tokens - 1.0, now_ms)
+            return None
+        retry_after_ms = max(1000, math.ceil((1.0 - tokens) / refill_per_ms))
+        _puretrack_traffic_rate_limits[user_id] = (tokens, now_ms)
+        return retry_after_ms
+
+
+def raise_puretrack_traffic_rate_limited(retry_after_ms: int) -> None:
+    raise ApiHTTPException(
+        status_code=429,
+        code=ErrorCode.PURETRACK_RATE_LIMITED,
+        detail="PureTrack traffic rate limit applies",
+        headers=puretrack_retry_after_header(retry_after_ms),
+    )
+
+
+def puretrack_traffic_cache_key(
+    user_id: str,
+    package_name: str,
+    bbox: PureTrackTrafficBbox,
+    filters: PureTrackTrafficFilters,
+) -> str:
+    payload = {
+        "userId": user_id,
+        "packageName": package_name,
+        "bbox": pydantic_model_to_dict(bbox),
+        "filters": pydantic_model_to_dict(filters),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def get_cached_puretrack_traffic_response(
+    cache_key: str,
+    now_ms: int,
+) -> Optional[dict[str, Any]]:
+    with _puretrack_traffic_cache_lock:
+        cached = _puretrack_traffic_cache.get(cache_key)
+        if cached is None:
+            return None
+        if cached["freshUntilMs"] < now_ms:
+            _puretrack_traffic_cache.pop(cache_key, None)
+            return None
+        response = dict(cached)
+        response["targets"] = list(cached["targets"])
+        response["cacheStatus"] = PURETRACK_TRAFFIC_CACHE_HIT
+        return response
+
+
+def set_cached_puretrack_traffic_response(
+    cache_key: str,
+    response: PureTrackTrafficResponse,
+) -> None:
+    cached = pydantic_model_to_dict(response)
+    cached["cacheStatus"] = PURETRACK_TRAFFIC_CACHE_MISS
+    with _puretrack_traffic_cache_lock:
+        _puretrack_traffic_cache[cache_key] = cached
+
+
+def require_puretrack_traffic_provider_session_secret(
+    db,
+    current_user: CurrentUserRecord,
+) -> str:
+    if not puretrack_app_key_configured():
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_APP_KEY_UNCONFIGURED,
+            detail="PureTrack Traffic API is not configured"
+        )
+    if not account_has_verified_xcpro_pro_entitlement(db, current_user.user.id):
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.FEATURE_ACCESS_DENIED,
+            detail="PureTrack traffic requires XCPro PRO access"
+        )
+
+    now_ms = to_epoch_ms(utcnow())
+    session = load_puretrack_provider_session(db, current_user.user.id)
+    if not puretrack_session_connected(session, now_ms):
+        raise ApiHTTPException(
+            status_code=409,
+            code=ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+            detail="PureTrack provider account is not connected"
+        )
+    if session.user_access != PURETRACK_PROVIDER_ACCESS_PREMIUM:
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+            detail="PureTrack Pro provider access is required"
+        )
+    if not session.provider_session_ciphertext:
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            detail="PureTrack provider session material is unavailable"
+        )
+    try:
+        provider_session_secret = decrypt_puretrack_provider_session_secret(
+            session.provider_session_ciphertext
+        )
+    except (ApiHTTPException, ValueError):
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            detail="PureTrack provider session material is unavailable"
+        )
+    if not provider_session_secret:
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            detail="PureTrack provider session material is unavailable"
+        )
+    return provider_session_secret
+
+
+def raise_puretrack_traffic_provider_error(
+    provider_result: PureTrackTrafficProviderResult,
+) -> None:
+    retry_after_ms = provider_result.retry_after_ms
+    if provider_result.error_code == ErrorCode.PURETRACK_RATE_LIMITED:
+        raise ApiHTTPException(
+            status_code=429,
+            code=ErrorCode.PURETRACK_RATE_LIMITED,
+            detail="PureTrack provider rate limit applies",
+            headers=puretrack_retry_after_header(retry_after_ms),
+        )
+    if provider_result.error_code == ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED:
+        raise ApiHTTPException(
+            status_code=403,
+            code=ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+            detail="PureTrack Pro provider access is required"
+        )
+    if provider_result.error_code == ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE:
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            detail="PureTrack provider session material is unavailable"
+        )
+    if provider_result.error_code == ErrorCode.PURETRACK_TRAFFIC_REJECTED:
+        raise ApiHTTPException(
+            status_code=502,
+            code=ErrorCode.PURETRACK_TRAFFIC_REJECTED,
+            detail="PureTrack rejected the traffic request"
+        )
+    raise ApiHTTPException(
+        status_code=503,
+        code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
+        detail="PureTrack provider is unavailable"
+    )
+
+
+def fetch_puretrack_traffic(
+    db,
+    current_user: CurrentUserRecord,
+    package_name: str,
+    request: PureTrackTrafficRequest,
+) -> PureTrackTrafficResponse:
+    bbox, filters = validate_puretrack_traffic_request(request)
+    provider_session_secret = require_puretrack_traffic_provider_session_secret(
+        db,
+        current_user,
+    )
+    retry_after_ms = check_puretrack_traffic_rate_limit(current_user.user.id)
+    if retry_after_ms is not None:
+        raise_puretrack_traffic_rate_limited(retry_after_ms)
+    now_ms = to_epoch_ms(utcnow())
+    cache_key = puretrack_traffic_cache_key(
+        current_user.user.id,
+        package_name,
+        bbox,
+        filters,
+    )
+    cached_response = get_cached_puretrack_traffic_response(cache_key, now_ms)
+    if cached_response is not None:
+        return PureTrackTrafficResponse(**cached_response)
+
+    provider_result = PURETRACK_TRAFFIC_CLIENT.fetch(
+        bbox=bbox,
+        filters=filters,
+        provider_session_secret=provider_session_secret,
+        config=PURETRACK_RUNTIME_CONFIG,
+    )
+    if provider_result.error_code is not None or provider_result.rows is None:
+        raise_puretrack_traffic_provider_error(provider_result)
+
+    targets, dropped_count, redacted_count = map_puretrack_compact_rows_to_traffic_targets(
+        provider_result.rows,
+        filters,
+    )
+    fetched_at_ms = to_epoch_ms(utcnow())
+    response = PureTrackTrafficResponse(
+        result=(
+            PURETRACK_TRAFFIC_RESULT_OK
+            if targets
+            else PURETRACK_TRAFFIC_RESULT_EMPTY
+        ),
+        targets=[PureTrackTrafficTarget(**target) for target in targets],
+        bbox=bbox,
+        filtersApplied=filters,
+        serverFetchedAtMs=fetched_at_ms,
+        freshUntilMs=fetched_at_ms + PURETRACK_TRAFFIC_CACHE_TTL_MS,
+        providerRowCount=provider_result.provider_row_count,
+        droppedRowCount=dropped_count,
+        redactedFieldCount=redacted_count,
+        cacheStatus=PURETRACK_TRAFFIC_CACHE_MISS,
+        retryAfterMs=None,
+        auditId=puretrack_traffic_audit_id(),
+    )
+    set_cached_puretrack_traffic_response(cache_key, response)
+    return response
 
 
 def build_puretrack_status_payload(
@@ -9633,6 +10008,26 @@ def insert_puretrack_points(
         current_user = ensure_current_user_record(db, authorization)
         validate_entitlement_package_name(package_name)
         return publish_puretrack_insert_batch(db, current_user, request)
+    finally:
+        db.close()
+
+
+@app.post("/api/v1/puretrack/traffic", response_model=PureTrackTrafficResponse)
+def get_puretrack_traffic(
+    request: PureTrackTrafficRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
+):
+    db = SessionLocal()
+    try:
+        current_user = ensure_current_user_record(db, authorization)
+        validated_package_name = validate_entitlement_package_name(package_name)
+        return fetch_puretrack_traffic(
+            db,
+            current_user,
+            validated_package_name,
+            request,
+        )
     finally:
         db.close()
 

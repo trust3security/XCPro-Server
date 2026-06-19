@@ -2,7 +2,7 @@
 
 Status: reviewed contract; status/connect/disconnect and Insert publishing
 implemented locally; P0B2A provider-session material/status gating implemented
-locally; inbound traffic overlay route specified for later implementation.
+locally; P0B2B inbound traffic overlay route implemented locally.
 Date: 2026-06-19
 
 ## Purpose
@@ -21,8 +21,9 @@ implemented locally for Android publishing code to consume through the XCPro
 backend only. P0B2A adds encrypted recoverable server-side provider session
 material and fails traffic allowance closed for hash-only, missing, corrupt,
 expired, or unconfigured provider-session material. The inbound traffic overlay
-route contract below is still docs-only as of 2026-06-19 and must be
-implemented in a later server phase before Android traffic client work begins.
+route contract below is implemented locally as of P0B2B on 2026-06-19.
+Live-server deployment parity remains a separate release/deployment phase
+before Android production rollout claims.
 
 Verified current anchors:
 
@@ -36,6 +37,11 @@ Verified current anchors:
 - `app/main.py` exposes `POST /api/v1/puretrack/insert`; tests verify bearer
   and package validation, verified XCPro PRO access, server-only Insert key
   configuration, ack semantics, retry delay propagation, and redaction.
+- `app/main.py` exposes `POST /api/v1/puretrack/traffic`; tests verify bearer
+  and package validation, verified XCPro PRO access, app-key configuration,
+  connected non-expired PureTrack `PREMIUM` provider state, decryptable
+  provider session material, bbox validation, provider error mapping, local
+  rate limiting, normalized DTO caching, and redaction.
 - `app/main.py` stores `PureTrackProviderSession.provider_session_hash` only as
   redacted identity/dedupe material and stores recoverable provider session
   material only in encrypted
@@ -468,8 +474,8 @@ POST /api/v1/puretrack/traffic
 Content-Type: application/json
 ```
 
-Status: contract only. No local server implementation exists in this contract
-phase.
+Status: implemented locally in P0B2B. Production/live-server deployment parity
+is deferred to P6.
 
 Request body: `PureTrackTrafficRequest`.
 
@@ -883,7 +889,7 @@ Recommended server phases:
    the contract above, fake-provider tests, server-only Insert key
    configuration, and redaction/ack semantics.
 5. Complete/current contract docs: specify `POST /api/v1/puretrack/traffic`
-   for inbound normalized overlay traffic, with no server route implementation.
+   for inbound normalized overlay traffic before Android implementation.
 6. Complete/current locally in commit `8fbdb4d`: add traffic request/response
    models, bbox validation, parser,
    normalization, redaction helpers, and tests without exposing a route if the
@@ -893,10 +899,12 @@ Recommended server phases:
    from `XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET`, exact
    encrypt/decrypt/material-available helpers, and status/connect tests proving
    `trafficApiAllowed` requires usable recoverable session material.
-8. Planned P0B2B: add the traffic route/provider adapter, entitlement checks,
-   cache/rate limits, and route tests. This phase must consume the encrypted
-   provider-session read path from P0B2A and must not treat hash-only rows as
-   Traffic API credentials.
+8. Complete/current P0B2B: added the traffic route/provider adapter,
+   entitlement checks, cache/rate limits, and route tests. This phase consumes
+   the encrypted provider-session read path from P0B2A and does not treat
+   hash-only rows as Traffic API credentials. Local verification:
+   `.venv\Scripts\python.exe -m pytest app\tests\test_puretrack_backend_proxy.py`
+   passed with `39 passed`.
 9. Planned later: record live-server deployment parity before production
    rollout.
 
