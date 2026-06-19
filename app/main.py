@@ -4320,11 +4320,17 @@ def build_puretrack_entitlement_provider_state(
         "appKeyConfigured": status["appKeyConfigured"],
         "trafficApiAllowed": status["trafficApiAllowed"],
         "insertApiConfigured": status["insertApiConfigured"],
-        "userAccess": status["userAccess"],
+        "userAccess": puretrack_entitlement_user_access(status["userAccess"]),
         "verifiedAtMs": status["verifiedAtMs"],
         "validUntilMs": status["validUntilMs"],
         "errorCode": status["errorCode"]
     }
+
+
+def puretrack_entitlement_user_access(user_access: str) -> str:
+    if user_access == PURETRACK_PROVIDER_ACCESS_PREMIUM:
+        return "PRO"
+    return user_access
 
 
 def build_canonical_free_entitlement_response(

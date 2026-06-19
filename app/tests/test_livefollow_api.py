@@ -1060,6 +1060,34 @@ class LiveFollowApiTest(unittest.TestCase):
             provider_session_encryption_secret=b"puretrack-provider-session-test-secret",
         )
         self.upsert_entitlement_snapshot(tier="PRO")
+        user_id = self.user_id_for_token()
+        now = self.clock.utcnow()
+        now_ms = main_module.to_epoch_ms(now)
+        valid_until_ms = now_ms + main_module.PURETRACK_PROVIDER_STATUS_CACHE_MS
+        provider_secret = "puretrack-provider-session"
+        db = self.session_local()
+        try:
+            db.merge(
+                main_module.PureTrackProviderSession(
+                    user_id=user_id,
+                    provider_session_hash=main_module.hash_token(provider_secret),
+                    provider_session_ciphertext=(
+                        main_module.encrypt_puretrack_provider_session_secret(provider_secret)
+                    ),
+                    user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+                    account_label="p***@example.com",
+                    verified_at_ms=now_ms,
+                    valid_until_ms=valid_until_ms,
+                    error_code=None,
+                    retry_after_ms=None,
+                    audit_id="pt_entitlement_test",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
 
         response = self.client.get(
             "/api/v1/subscriptions/entitlements",
@@ -1071,11 +1099,11 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertEqual(
             {
                 "appKeyConfigured": True,
-                "trafficApiAllowed": False,
+                "trafficApiAllowed": True,
                 "insertApiConfigured": True,
-                "userAccess": "UNKNOWN",
-                "verifiedAtMs": None,
-                "validUntilMs": None,
+                "userAccess": "PRO",
+                "verifiedAtMs": now_ms,
+                "validUntilMs": valid_until_ms,
                 "errorCode": None,
             },
             puretrack
