@@ -101,6 +101,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             app_key="server-side-app-key",
             api_base_url="https://puretrack.example",
             timeout_seconds=2.0,
+            provider_session_encryption_secret=b"puretrack-provider-session-test-secret",
         )
         self.provider = FakePureTrackProviderClient()
         main_module.PURETRACK_PROVIDER_CLIENT = self.provider
@@ -146,6 +147,10 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             main_module.ErrorCode.PURETRACK_INSERT_REJECTED,
         )
         self.assertEqual(
+            "puretrack_provider_session_unavailable",
+            main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+        )
+        self.assertEqual(
             "feature_access_denied",
             main_module.ErrorCode.FEATURE_ACCESS_DENIED,
         )
@@ -162,6 +167,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
     def test_env_config_loader_uses_contract_defaults_and_values(self):
         default_config = main_module.load_puretrack_runtime_config({})
         self.assertIsNone(default_config.app_key)
+        self.assertIsNone(default_config.provider_session_encryption_secret)
         self.assertEqual(main_module.PURETRACK_DEFAULT_API_BASE_URL, default_config.api_base_url)
         self.assertEqual(10.0, default_config.timeout_seconds)
 
@@ -170,9 +176,11 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             "XCPRO_PURETRACK_INSERT_KEY": " insert-key-value ",
             "XCPRO_PURETRACK_API_BASE_URL": "https://puretrack.test/",
             "XCPRO_PURETRACK_TIMEOUT_SECONDS": "3.5",
+            "XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET": " provider-session-secret ",
         })
         self.assertEqual("app-key-value", configured.app_key)
         self.assertEqual("insert-key-value", configured.insert_key)
+        self.assertEqual(b"provider-session-secret", configured.provider_session_encryption_secret)
         self.assertEqual("https://puretrack.test", configured.api_base_url)
         self.assertEqual(3.5, configured.timeout_seconds)
 
@@ -322,6 +330,14 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             row = db.query(main_module.PureTrackProviderSession).one()
             self.assertEqual(main_module.hash_token("provider-session-secret"), row.provider_session_hash)
             self.assertNotEqual("provider-session-secret", row.provider_session_hash)
+            self.assertIsNotNone(row.provider_session_ciphertext)
+            self.assertNotEqual("provider-session-secret", row.provider_session_ciphertext)
+            self.assertEqual(
+                "provider-session-secret",
+                main_module.decrypt_puretrack_provider_session_secret(
+                    row.provider_session_ciphertext
+                ),
+            )
             self.assertEqual("p***@example.com", row.account_label)
         finally:
             db.close()
@@ -361,6 +377,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                     app_key=app_key,
                     api_base_url="https://puretrack.example",
                     timeout_seconds=2.0,
+                    provider_session_encryption_secret=b"puretrack-provider-session-test-secret",
                 )
                 self.upsert_entitlement_snapshot(token=token, tier=tier)
                 self.upsert_provider_session(token=token, user_access=user_access)
@@ -372,6 +389,132 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
                 self.assertEqual(200, response.status_code)
                 self.assertIs(expected_allowed, response.json()["trafficApiAllowed"])
+
+    def test_hash_only_provider_session_fails_closed_for_traffic_allowance(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.upsert_provider_session(
+            token=self.primary_bearer,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+            include_ciphertext=False,
+        )
+
+        response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertIs(True, body["connected"])
+        self.assertIs(False, body["trafficApiAllowed"])
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            body["errorCode"],
+        )
+
+    def test_missing_puretrack_provider_session_encryption_secret_fails_closed(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+        main_module.PURETRACK_RUNTIME_CONFIG = main_module.PureTrackRuntimeConfig(
+            app_key="server-side-app-key",
+            api_base_url="https://puretrack.example",
+            timeout_seconds=2.0,
+            provider_session_encryption_secret=None,
+        )
+        password = "provider-password"
+
+        response = self.client.post(
+            "/api/v1/puretrack/connect",
+            json={"email": "pilot@example.com", "password": password},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertEqual(main_module.PURETRACK_CONNECT_RESULT_ERROR, body["result"])
+        self.assertIs(False, body["status"]["connected"])
+        self.assertIs(False, body["status"]["trafficApiAllowed"])
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            body["status"]["errorCode"],
+        )
+        self.assert_no_secret_leakage(body, password=password)
+        db = self.session_local()
+        try:
+            self.assertEqual(0, db.query(main_module.PureTrackProviderSession).count())
+        finally:
+            db.close()
+
+    def test_corrupt_puretrack_provider_session_ciphertext_fails_closed(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.upsert_provider_session(
+            token=self.primary_bearer,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+            provider_session_ciphertext="not-a-valid-fernet-token",
+        )
+
+        response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertIs(True, body["connected"])
+        self.assertIs(False, body["trafficApiAllowed"])
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            body["errorCode"],
+        )
+
+    def test_expired_puretrack_provider_session_ciphertext_fails_closed(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.upsert_provider_session(
+            token=self.primary_bearer,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+            valid_until_ms=self.now_ms() - 1,
+        )
+
+        response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        self.assertIs(False, body["connected"])
+        self.assertIs(False, body["trafficApiAllowed"])
+        self.assertIsNone(body["accountLabel"])
+
+    def test_provider_session_material_is_encrypted_and_redacted(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+        provider_session_secret = "provider-session-secret"
+
+        response = self.client.post(
+            "/api/v1/puretrack/connect",
+            json={"email": "pilot@example.com", "password": "provider-password"},
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        body = response.json()
+        db = self.session_local()
+        try:
+            row = db.query(main_module.PureTrackProviderSession).one()
+            self.assertEqual(main_module.hash_token(provider_session_secret), row.provider_session_hash)
+            self.assertIsNotNone(row.provider_session_ciphertext)
+            self.assertNotEqual(provider_session_secret, row.provider_session_ciphertext)
+            self.assertNotEqual(row.provider_session_hash, row.provider_session_ciphertext)
+            self.assertEqual(
+                provider_session_secret,
+                main_module.decrypt_puretrack_provider_session_secret(
+                    row.provider_session_ciphertext
+                ),
+            )
+            serialized_body = json.dumps(body, sort_keys=True)
+            self.assertNotIn(provider_session_secret, serialized_body)
+            self.assertNotIn(row.provider_session_ciphertext, serialized_body)
+        finally:
+            db.close()
 
     def test_connect_maps_provider_results_without_exposing_secrets(self):
         cases = (
@@ -1044,22 +1187,37 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
     def upsert_provider_session(
         self,
-        token: str,
+        token: str | None,
         user_access: str,
+        include_ciphertext: bool = True,
+        provider_session_ciphertext: str | None = None,
+        valid_until_ms: int | None = None,
     ):
         user_id = self.user_id_for_token(token)
         now = self.clock.utcnow()
         now_ms = self.now_ms()
+        provider_session_secret = f"session-{token}"
+        if provider_session_ciphertext is None and include_ciphertext:
+            provider_session_ciphertext = (
+                main_module.encrypt_puretrack_provider_session_secret(
+                    provider_session_secret
+                )
+            )
         db = self.session_local()
         try:
             db.merge(
                 main_module.PureTrackProviderSession(
                     user_id=user_id,
-                    provider_session_hash=main_module.hash_token(f"session-{token}"),
+                    provider_session_hash=main_module.hash_token(provider_session_secret),
+                    provider_session_ciphertext=provider_session_ciphertext,
                     user_access=user_access,
                     account_label="p***@example.com",
                     verified_at_ms=now_ms,
-                    valid_until_ms=now_ms + main_module.PURETRACK_PROVIDER_STATUS_CACHE_MS,
+                    valid_until_ms=(
+                        valid_until_ms
+                        if valid_until_ms is not None
+                        else now_ms + main_module.PURETRACK_PROVIDER_STATUS_CACHE_MS
+                    ),
                     error_code=None,
                     retry_after_ms=None,
                     audit_id="pt_test",
@@ -1077,6 +1235,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             api_base_url="https://puretrack.example",
             timeout_seconds=2.0,
             insert_key="server-side-insert-key",
+            provider_session_encryption_secret=b"puretrack-provider-session-test-secret",
         )
 
     @staticmethod

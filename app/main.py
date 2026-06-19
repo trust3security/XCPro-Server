@@ -409,6 +409,7 @@ PUSH_TOKEN_MAX_LENGTH = 4096
 PUSH_DEVICE_ID_MAX_LENGTH = 160
 PUSH_APP_VERSION_MAX_LENGTH = 80
 PUSH_TOKEN_FERNET_KEY_CONTEXT = b"xcpro-push-token-fernet-v1"
+PURETRACK_PROVIDER_SESSION_FERNET_KEY_CONTEXT = b"xcpro-puretrack-provider-session-fernet-v1"
 FCM_MESSAGING_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 FCM_SEND_URL_TEMPLATE = "https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
 GOOGLE_PLAY_SYNC_RESULT_VALUES = frozenset({
@@ -555,6 +556,7 @@ class ErrorCode:
     PURETRACK_APP_KEY_UNCONFIGURED = "puretrack_app_key_unconfigured"
     PURETRACK_INSERT_KEY_UNCONFIGURED = "puretrack_insert_key_unconfigured"
     PURETRACK_INSERT_REJECTED = "puretrack_insert_rejected"
+    PURETRACK_PROVIDER_SESSION_UNAVAILABLE = "puretrack_provider_session_unavailable"
     PURETRACK_PROVIDER_UNAVAILABLE = "puretrack_provider_unavailable"
     PURETRACK_RATE_LIMITED = "puretrack_rate_limited"
     PURETRACK_STATE_INVALID = "puretrack_state_invalid"
@@ -645,6 +647,7 @@ class PureTrackRuntimeConfig:
     api_base_url: str
     timeout_seconds: float
     insert_key: Optional[str] = None
+    provider_session_encryption_secret: Optional[bytes] = None
 
 
 @dataclass(frozen=True)
@@ -862,6 +865,19 @@ def load_push_token_encryption_secret_from_env(
     return raw_value.encode("utf-8")
 
 
+def load_puretrack_provider_session_encryption_secret_from_env(
+    env: Optional[dict[str, str]] = None
+) -> Optional[bytes]:
+    resolved_env = os.environ if env is None else env
+    raw_value = resolved_env.get(
+        "XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET",
+        ""
+    ).strip()
+    if not raw_value:
+        return None
+    return raw_value.encode("utf-8")
+
+
 def load_private_follow_bearer_ttl_seconds_from_env(
     env: Optional[dict[str, str]] = None
 ) -> int:
@@ -1011,6 +1027,9 @@ def load_puretrack_runtime_config(
         insert_key=load_optional_trimmed_env_value(
             resolved_env,
             "XCPRO_PURETRACK_INSERT_KEY"
+        ),
+        provider_session_encryption_secret=(
+            load_puretrack_provider_session_encryption_secret_from_env(resolved_env)
         ),
     )
 
@@ -1763,6 +1782,54 @@ def decrypt_push_token(push_token_ciphertext: str) -> str:
         raise ValueError("push token ciphertext is invalid")
 
 
+def derive_puretrack_provider_session_fernet_key(secret: bytes) -> bytes:
+    return base64.urlsafe_b64encode(
+        hmac.new(
+            secret,
+            PURETRACK_PROVIDER_SESSION_FERNET_KEY_CONTEXT,
+            hashlib.sha256
+        ).digest()
+    )
+
+
+def build_puretrack_provider_session_fernet(
+    config: Optional[PureTrackRuntimeConfig] = None
+) -> Fernet:
+    resolved_config = config or PURETRACK_RUNTIME_CONFIG
+    if resolved_config.provider_session_encryption_secret is None:
+        raise ApiHTTPException(
+            status_code=503,
+            code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+            detail="PureTrack provider session encryption secret is not configured"
+        )
+    return Fernet(
+        derive_puretrack_provider_session_fernet_key(
+            resolved_config.provider_session_encryption_secret
+        )
+    )
+
+
+def encrypt_puretrack_provider_session_secret(
+    provider_session_secret: str,
+    config: Optional[PureTrackRuntimeConfig] = None,
+) -> str:
+    return build_puretrack_provider_session_fernet(config).encrypt(
+        provider_session_secret.encode("utf-8")
+    ).decode("ascii")
+
+
+def decrypt_puretrack_provider_session_secret(
+    provider_session_ciphertext: str,
+    config: Optional[PureTrackRuntimeConfig] = None,
+) -> str:
+    try:
+        return build_puretrack_provider_session_fernet(config).decrypt(
+            provider_session_ciphertext.encode("ascii")
+        ).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError):
+        raise ValueError("PureTrack provider session ciphertext is invalid")
+
+
 def to_utc_naive(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt
@@ -2160,6 +2227,7 @@ class PureTrackProviderSession(Base):
 
     user_id = Column(String, ForeignKey("users.id"), primary_key=True)
     provider_session_hash = Column(String(64), nullable=True, index=True)
+    provider_session_ciphertext = Column(Text, nullable=True)
     user_access = Column(String(24), nullable=False)
     account_label = Column(String(320), nullable=True)
     verified_at_ms = Column(BigInteger, nullable=True)
@@ -4381,6 +4449,23 @@ def puretrack_session_connected(
     return True
 
 
+def puretrack_provider_session_material_available(
+    session: Optional[PureTrackProviderSession],
+    config: Optional[PureTrackRuntimeConfig] = None,
+) -> bool:
+    if session is None or not session.provider_session_ciphertext:
+        return False
+    try:
+        return bool(
+            decrypt_puretrack_provider_session_secret(
+                session.provider_session_ciphertext,
+                config,
+            )
+        )
+    except (ApiHTTPException, ValueError):
+        return False
+
+
 def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
     snapshot = (
         db.query(AccountEntitlementSnapshot)
@@ -5085,6 +5170,7 @@ def build_puretrack_status_payload(
         if valid_until_ms is not None
         else (session.valid_until_ms if session is not None else None)
     )
+    provider_session_material_ready = puretrack_provider_session_material_available(session)
     resolved_account_label = (
         account_label
         if account_label is not None
@@ -5099,6 +5185,13 @@ def build_puretrack_status_payload(
         if error_code is not None
         else (session.error_code if session is not None else None)
     )
+    if (
+        resolved_error_code is None
+        and resolved_connected
+        and resolved_user_access == PURETRACK_PROVIDER_ACCESS_PREMIUM
+        and not provider_session_material_ready
+    ):
+        resolved_error_code = ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE
     resolved_retry_after_ms = (
         retry_after_ms
         if retry_after_ms is not None
@@ -5115,6 +5208,7 @@ def build_puretrack_status_payload(
         app_key_configured
         and resolved_connected
         and resolved_user_access == PURETRACK_PROVIDER_ACCESS_PREMIUM
+        and provider_session_material_ready
         and account_has_verified_xcpro_pro_entitlement(db, current_user.user.id)
     )
     return {
@@ -5184,6 +5278,9 @@ def save_puretrack_connected_session(
             code=ErrorCode.PURETRACK_STATE_INVALID,
             detail="PureTrack provider session state is invalid"
         )
+    provider_session_ciphertext = encrypt_puretrack_provider_session_secret(
+        provider_result.provider_session_secret
+    )
     now = utcnow()
     now_ms = to_epoch_ms(now)
     session = load_puretrack_provider_session(db, current_user.user.id)
@@ -5196,6 +5293,7 @@ def save_puretrack_connected_session(
         )
         db.add(session)
     session.provider_session_hash = hash_token(provider_result.provider_session_secret)
+    session.provider_session_ciphertext = provider_session_ciphertext
     session.user_access = provider_result.user_access
     session.account_label = redact_puretrack_account_label(email)
     session.verified_at_ms = now_ms
@@ -5248,13 +5346,32 @@ def connect_puretrack_account(
         config=PURETRACK_RUNTIME_CONFIG,
     )
     if provider_result.result == PURETRACK_CONNECT_RESULT_CONNECTED:
-        save_puretrack_connected_session(
-            db=db,
-            current_user=current_user,
-            provider_result=provider_result,
-            email=email,
-            audit_id=audit_id,
-        )
+        try:
+            save_puretrack_connected_session(
+                db=db,
+                current_user=current_user,
+                provider_result=provider_result,
+                email=email,
+                audit_id=audit_id,
+            )
+        except ApiHTTPException as exc:
+            if exc.code != ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE:
+                raise
+            clear_puretrack_provider_session(db, current_user.user.id)
+            db.flush()
+            status = build_puretrack_status_payload(
+                db,
+                current_user,
+                connected=False,
+                user_access=PURETRACK_PROVIDER_ACCESS_ERROR,
+                account_label=None,
+                error_code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
+                audit_id=audit_id,
+            )
+            return {
+                "result": PURETRACK_CONNECT_RESULT_ERROR,
+                "status": status,
+            }
         db.flush()
         return {
             "result": PURETRACK_CONNECT_RESULT_CONNECTED,

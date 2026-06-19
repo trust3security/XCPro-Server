@@ -1,8 +1,9 @@
 # PureTrack Backend Proxy Contract
 
 Status: reviewed contract; status/connect/disconnect and Insert publishing
-implemented locally.
-Date: 2026-06-18
+implemented locally; P0B2A provider-session material/status gating implemented
+locally; inbound traffic overlay route specified for later implementation.
+Date: 2026-06-19
 
 ## Purpose
 
@@ -13,10 +14,15 @@ raw Traffic API rows in the APK.
 
 Local commit `4b7064a Add PureTrack backend proxy endpoints` implements and
 tests the Android-facing status/connect/disconnect routes described here.
-Production deployment/live-server parity, traffic proxy routes, Android queue
-drain wiring, and foreground publishing runtime rollout remain separate future
-work. The Android-facing Insert route contract below is implemented locally for
-Android publishing code to consume through the XCPro backend only.
+Production deployment/live-server parity, traffic proxy implementation,
+Android queue drain wiring, and foreground publishing runtime rollout remain
+separate future work. The Android-facing Insert route contract below is
+implemented locally for Android publishing code to consume through the XCPro
+backend only. P0B2A adds encrypted recoverable server-side provider session
+material and fails traffic allowance closed for hash-only, missing, corrupt,
+expired, or unconfigured provider-session material. The inbound traffic overlay
+route contract below is still docs-only as of 2026-06-19 and must be
+implemented in a later server phase before Android traffic client work begins.
 
 Verified current anchors:
 
@@ -30,6 +36,12 @@ Verified current anchors:
 - `app/main.py` exposes `POST /api/v1/puretrack/insert`; tests verify bearer
   and package validation, verified XCPro PRO access, server-only Insert key
   configuration, ack semantics, retry delay propagation, and redaction.
+- `app/main.py` stores `PureTrackProviderSession.provider_session_hash` only as
+  redacted identity/dedupe material and stores recoverable provider session
+  material only in encrypted
+  `PureTrackProviderSession.provider_session_ciphertext`.
+  Hash-only rows are not sufficient to authorize future PureTrack Traffic API
+  calls and fail closed with `puretrack_provider_session_unavailable`.
 - `app/main.py` still returns coarse `providerStates.pureTrack` values inside
   entitlement response builders; dedicated PureTrack settings state comes from
   `/api/v1/puretrack/status`.
@@ -43,9 +55,11 @@ XCPro backend owns:
 
 - PureTrack app key configuration.
 - PureTrack login/token exchange.
-- PureTrack provider token storage if implementation persists provider access.
+- PureTrack provider token/session storage for inbound traffic. Existing
+  hash-only session rows are not usable Traffic API credentials.
 - PureTrack Traffic API calls, bbox validation, filtering, rate limiting,
-  compact-row parsing, and redaction in later traffic phases.
+  compact-row parsing, normalization, cache policy, and redaction in later
+  traffic phases.
 - Redacted Android-visible PureTrack status projection.
 - Server-only PureTrack Insert key configuration and upstream Insert calls.
 
@@ -64,6 +78,9 @@ Android must never store or receive:
 - PureTrack access token, refresh token, Bearer token, cookie, or session key.
 - PureTrack password after the connect request completes.
 - Raw compact Traffic API rows.
+- Raw PureTrack Traffic API object keys, tracker IDs, target IDs, source
+  tracker IDs, receiver names, phone numbers, raw pilot names, usernames, or
+  provider response URLs.
 - Direct PureTrack API URLs for production calls.
 
 ## Environment Contract
@@ -73,18 +90,24 @@ Server implementation must use these environment keys:
 ```dotenv
 XCPRO_PURETRACK_APP_KEY=
 XCPRO_PURETRACK_INSERT_KEY=
+XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET=
 XCPRO_PURETRACK_API_BASE_URL=https://puretrack.io
 XCPRO_PURETRACK_TIMEOUT_SECONDS=10
 ```
 
 Rules:
 
-- `XCPRO_PURETRACK_APP_KEY`, XCPro `PlanTier.PRO` entitlement, and PureTrack
-  Pro provider access are required before `trafficApiAllowed` can be true.
-  Android/server domain models represent the PureTrack provider-capable state as
-  `PREMIUM` to avoid conflating it with XCPro `PlanTier.PRO`.
+- `XCPRO_PURETRACK_APP_KEY`, verified XCPro `PlanTier.PRO` entitlement,
+  PureTrack Pro provider access, and usable server-side provider session
+  material are required before `trafficApiAllowed` can be true. Android/server
+  domain models represent the PureTrack provider-capable state as `PREMIUM` to
+  avoid conflating it with XCPro `PlanTier.PRO`.
 - `XCPRO_PURETRACK_INSERT_KEY` is required before `insertApiConfigured` can be
   true and before `POST /api/v1/puretrack/insert` can publish upstream.
+- `XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET` is required before the
+  backend can persist or decrypt recoverable PureTrack provider session
+  material for inbound Traffic API Bearer/session use. It must not reuse
+  `XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET`.
 - Outbound Insert publishing requires verified XCPro `PlanTier.PRO` entitlement
   plus server Insert-key configuration. A PureTrack Pro provider account is not
   required for outbound publishing unless a later product decision updates this
@@ -120,6 +143,7 @@ GET  /api/v1/puretrack/status
 POST /api/v1/puretrack/connect
 POST /api/v1/puretrack/disconnect
 POST /api/v1/puretrack/insert
+POST /api/v1/puretrack/traffic
 ```
 
 No Android production route may call PureTrack directly. These routes are
@@ -151,9 +175,10 @@ Fields:
   provider session for this XCPro account.
 - `appKeyConfigured`: true only when server has `XCPRO_PURETRACK_APP_KEY`.
 - `trafficApiAllowed`: server-computed combined allowance. It is true only
-  when server app key, XCPro `PlanTier.PRO` entitlement, and PureTrack provider
-  state allow production inbound PureTrack traffic proxy calls. Android must
-  consume this field and must not infer PureTrack provider entitlement locally.
+  when server app key, XCPro `PlanTier.PRO` entitlement, PureTrack provider
+  `PREMIUM` access, and usable server-side provider session material allow
+  production inbound PureTrack traffic proxy calls. Android must consume this
+  field and must not infer PureTrack provider entitlement locally.
 - `insertApiConfigured`: true only when server-side Insert publishing
   configuration is present through `XCPRO_PURETRACK_INSERT_KEY`.
 - `userAccess`: PureTrack provider access only; one of `UNKNOWN`, `NONE`,
@@ -436,6 +461,291 @@ Insert route behavior:
 - Does not read or write Android queue state, LiveFollow state, map/traffic
   state, or profile identity state.
 
+## Inbound Traffic Overlay Route
+
+```http
+POST /api/v1/puretrack/traffic
+Content-Type: application/json
+```
+
+Status: contract only. No local server implementation exists in this contract
+phase.
+
+Request body: `PureTrackTrafficRequest`.
+
+```json
+{
+  "bbox": {
+    "north": -37.49503,
+    "east": 176.54678,
+    "south": -38.06575,
+    "west": 174.82046
+  },
+  "filters": {
+    "category": "air",
+    "objectTypeIds": [1, 2, 6, 7],
+    "sourceTypeIds": [0, 7, 12, 16],
+    "maxAgeSeconds": 300
+  },
+  "clientRequestId": "map-refresh-20260619-0001"
+}
+```
+
+Request validation:
+
+- Request models must reject unknown fields at every level.
+- `bbox` is required.
+- `bbox.north`, `bbox.south`, `bbox.east`, and `bbox.west` are required finite
+  decimals.
+- `north` and `south` are latitude degrees in `[-90, 90]`; `north` must be
+  greater than `south`.
+- `east` and `west` are longitude degrees in `[-180, 180]`; `east` must be
+  greater than `west` in the initial contract.
+- Anti-meridian-crossing requests are rejected with `validation_error` in the
+  initial contract. Supporting anti-meridian fetches requires a later explicit
+  split phase because it needs multiple upstream provider calls, merge/dedupe
+  behavior, and separate verification.
+- The server validates requested bbox size before calling PureTrack. Initial
+  limits are:
+  - width must be `<= 300000` meters;
+  - height must be `<= 300000` meters;
+  - diagonal must be `<= 425000` meters.
+- The server must not call the provider when bbox validation fails. It must not
+  rely on the provider's large-bbox fallback because the official provider docs
+  say large bboxes can lower max age and return whole-planet data.
+- `filters` is optional; when omitted, the default is category `air`,
+  `maxAgeSeconds=300`, and no object/source filter.
+- `filters.category` is optional. Allowed values are `air`, `ground`, `other`,
+  and `water`, matching the provider type categories. The initial Android
+  overlay phases should request `air` unless a later product phase explicitly
+  extends scope.
+- `filters.objectTypeIds` is optional. It is an array of unique integers in
+  `[0, 999]`, maximum 32 entries. The server maps this to the provider `o`
+  parameter when present.
+- `filters.sourceTypeIds` is optional. It is an array of unique integers in
+  `[0, 999]`, maximum 32 entries. The official provider Traffic API does not
+  document an upstream source filter parameter, so the server applies this only
+  after parsing normalized rows.
+- `filters.maxAgeSeconds` is optional. It is an integer in `[30, 900]`, default
+  `300`. The server maps it to the provider `t` parameter by rounding up to
+  whole minutes.
+- Provider `s` always-include and `i` isolate filters are not accepted in the
+  initial Android-facing route. They require raw provider map item keys, so a
+  later phase must first define an opaque Android-safe target reference if the
+  product needs always-include/isolate behavior.
+- `clientRequestId` is optional. When present it must be a non-blank string,
+  maximum 128 characters. It is a client correlation id only and must not
+  contain account emails, provider IDs, phone numbers, coordinates, or tokens.
+- Android must not send PureTrack provider app keys, Insert keys, provider
+  Bearer tokens, passwords, raw provider URLs, raw compact rows, or direct
+  PureTrack request parameters outside this XCPro request schema.
+
+Provider call behavior:
+
+- Requires the common XCPro Bearer token and package header.
+- Requires verified XCPro `PlanTier.PRO` entitlement for the authenticated
+  account.
+- Requires `XCPRO_PURETRACK_APP_KEY`; when absent, returns
+  `puretrack_app_key_unconfigured`.
+- Requires a connected server-side PureTrack provider session with provider
+  access `PREMIUM`. `FREE`, `NONE`, `UNKNOWN`, `ERROR`, expired, missing, or
+  invalid provider state must not call the Traffic API.
+- Requires recoverable server-side PureTrack provider session material for
+  Bearer authentication to the provider Traffic API. Existing hash-only
+  `provider_session_hash` rows are insufficient for traffic and must fail
+  closed with `puretrack_provider_session_unavailable` or require reconnect.
+- The backend injects the server-only `XCPRO_PURETRACK_APP_KEY` into the
+  upstream Traffic API request and sends the provider Bearer token/session only
+  server-to-provider.
+- The backend may call the provider with POST or GET as allowed by the provider,
+  but Android sees only this XCPro POST route.
+- The route does not mutate PureTrack connect/disconnect state, outbound Insert
+  queue state, LiveFollow state, map state, traffic state, or profile state.
+
+Success response: `200 PureTrackTrafficResponse`.
+
+```json
+{
+  "result": "OK",
+  "targets": [
+    {
+      "targetId": "pt_opaque_01H...",
+      "lastSeenAtMs": 1713592586000,
+      "latitudeDeg": -37.78174,
+      "longitudeDeg": 174.88159,
+      "altitudeGpsMeters": 4685.0,
+      "altitudePressureMeters": null,
+      "courseDeg": 338.0,
+      "groundSpeedMps": 144.05,
+      "verticalSpeedMps": -13.31,
+      "objectTypeId": 56,
+      "objectCategory": "air",
+      "sourceTypeId": 12,
+      "sourceLabel": "ADSBHub",
+      "displayLabel": "ZK-MZE",
+      "registration": "ZK-MZE",
+      "callsign": "ANZ118M",
+      "model": null,
+      "colorHex": null,
+      "groundElevationMeters": 43.0,
+      "thermalClimbRateMps": null,
+      "signalQuality": null,
+      "stealth": false,
+      "noTracking": false,
+      "onGround": false,
+      "randomId": false
+    }
+  ],
+  "bbox": {
+    "north": -37.49503,
+    "east": 176.54678,
+    "south": -38.06575,
+    "west": 174.82046
+  },
+  "filtersApplied": {
+    "category": "air",
+    "objectTypeIds": [1, 2, 6, 7],
+    "sourceTypeIds": [0, 7, 12, 16],
+    "maxAgeSeconds": 300
+  },
+  "serverFetchedAtMs": 1760000000000,
+  "freshUntilMs": 1760000005000,
+  "providerRowCount": 1,
+  "droppedRowCount": 0,
+  "redactedFieldCount": 3,
+  "cacheStatus": "MISS",
+  "retryAfterMs": null,
+  "auditId": "redacted-audit-id"
+}
+```
+
+`PureTrackTrafficResponse` fields:
+
+- `result`: one of `OK`, `EMPTY`, `DEGRADED_CACHE`, or `PARTIAL`. HTTP errors
+  use the normal error envelope instead of these result values.
+- `targets`: normalized live overlay targets, never raw provider rows.
+- `bbox`: the validated Android-requested bbox, not a provider URL and not a
+  raw provider debug bbox.
+- `filtersApplied`: the validated filters the server used.
+- `serverFetchedAtMs`: server wall-clock epoch milliseconds when the provider
+  fetch or cache hit was produced.
+- `freshUntilMs`: server wall-clock epoch milliseconds after which Android
+  should consider this response stale unless a later repository phase defines a
+  stricter local freshness rule.
+- `providerRowCount`: count of provider compact rows received before redaction
+  and filtering. It is diagnostic only and must not expose row contents.
+- `droppedRowCount`: count of rows dropped because required fields were missing,
+  malformed, outside requested filters, or privacy rules required omission.
+- `redactedFieldCount`: count of provider fields omitted for privacy/security.
+- `cacheStatus`: one of `MISS`, `HIT`, or `BYPASS`.
+- `retryAfterMs`: nullable non-negative retry delay. When the HTTP response has
+  `Retry-After`, this value and the header must agree.
+- `auditId`: redacted backend support correlation id. It must not encode the
+  bearer token, account email, provider email, provider token, app key, bbox,
+  location, provider object key, raw row, or provider URL.
+
+`PureTrackTrafficTarget` fields:
+
+- `targetId`: required opaque Android-safe id. It may be stable for a provider
+  object across refreshes, but it must not contain the raw provider `K` key,
+  tracker UID, target id, aircraft id, source tracker id, phone, email, or
+  provider token. Android treats it as opaque and must not display it.
+- `lastSeenAtMs`: required provider timestamp converted from Unix seconds to
+  epoch milliseconds.
+- `latitudeDeg`, `longitudeDeg`: required decimal degrees.
+- `altitudeGpsMeters`, `altitudePressureMeters`, `groundElevationMeters`:
+  optional meters.
+- `courseDeg`: optional degrees in `[0, 360]`.
+- `groundSpeedMps`, `verticalSpeedMps`, `thermalClimbRateMps`: optional meters
+  per second.
+- `objectTypeId`: optional provider object type id.
+- `objectCategory`: optional category derived from the official type list.
+- `sourceTypeId`: optional provider source type id.
+- `sourceLabel`: optional server-owned display label for known source ids. It
+  must be generic and must not include raw receiver names or account details.
+- `displayLabel`: optional sanitized display label, maximum 48 characters.
+  Server selection must prefer public aircraft registration or callsign-style
+  values and must never expose phone numbers, email addresses, provider token
+  fragments, raw pilot names, usernames, or raw tracker ids.
+- `registration`: optional sanitized aircraft registration, maximum 32
+  characters.
+- `callsign`: optional sanitized callsign, maximum 32 characters.
+- `model`: optional sanitized aircraft model, maximum 64 characters.
+- `colorHex`: optional `#RRGGBB` display color. Invalid provider colors become
+  null.
+- `signalQuality`: optional finite numeric quality if provider row carries it.
+- `stealth`, `noTracking`, `onGround`, `randomId`: optional booleans derived
+  from provider flags; absent flags map to `false`.
+
+Privacy and redaction:
+
+- The server must never return raw compact rows, raw provider responses, raw
+  provider URLs, provider app key, provider Bearer token/session, Insert key,
+  provider password, raw account email, or Android `Authorization` header.
+- The server must never return provider `phone`, raw pilot `name`, `username`,
+  raw `tracker_uid`, raw `tracker_id`, raw `target_id`, raw `target_key`,
+  raw `aircraft_id`, raw `receiver_name`, raw source-specific keys such as
+  InReach/SPOT/FFVL identifiers, raw competition names/classes, takeoff/landing
+  ids, voltage fields, satellite counts, or OGN forwarding identifiers.
+- When provider stealth/no-tracking flags are present, the server may return
+  location only as already provided by the provider Traffic API, but it must
+  omit identity fields that are not needed for rendering: `displayLabel`,
+  `registration`, `callsign`, `model`, and `colorHex`.
+- Parser, mapper, error, audit, support, and test-fixture code must prove that
+  excluded fields cannot reach Android-visible responses or logs.
+
+Cache, freshness, and rate limits:
+
+- Initial server cache is optional and may be in-memory only. If implemented,
+  it must be per-authenticated XCPro account and keyed by normalized bbox,
+  filters, and package context. It must not be shared across accounts.
+- Cache TTL must be `<= 5000` ms. Cached responses must set
+  `cacheStatus=HIT`, preserve the original `serverFetchedAtMs`, and compute
+  `freshUntilMs` from the cached fetch time.
+- Raw provider rows must not be persisted in cache. Cache may store only the
+  normalized redacted `PureTrackTrafficResponse`.
+- The route should enforce a per-account rate limit of 12 requests per minute
+  with a burst of 3. A stricter production limit is allowed; a looser limit
+  requires a contract update.
+- Rate-limited responses return HTTP 429, error code `puretrack_rate_limited`,
+  a `Retry-After` header in seconds, and JSON `retryAfterMs` when the response
+  shape can carry it.
+- Provider 429 responses return HTTP 429 with `puretrack_rate_limited` and
+  propagate a reliable provider `Retry-After` delay after clamping it to a
+  non-negative value.
+- Provider timeouts, network failures, and provider 5xx return
+  `puretrack_provider_unavailable`; if a non-expired normalized cache entry is
+  available, the server may return `200 result=DEGRADED_CACHE` instead.
+
+Official provider references checked for this contract:
+
+- Traffic API: `https://puretrack.io/help/api`, last checked 2026-06-19.
+- Type list: `https://puretrack.io/types.json`, last checked 2026-06-19.
+- Insert API: `https://puretrack.io/help/api-insert`, last checked
+  2026-06-19. This is outbound contrast only and must not drive inbound
+  overlay route cadence, Device ID, queue, or Insert-key behavior.
+
+P0B server tests must add or update `app/tests/test_puretrack_backend_proxy.py`
+coverage for:
+
+- route registration and request model unknown-field rejection;
+- valid/invalid bearer and package headers;
+- missing app key, missing/expired/non-`PREMIUM` provider session, hash-only
+  provider session material, and missing XCPro PRO entitlement;
+- bbox coordinate bounds, size limits, and anti-meridian rejection;
+- category/object/source/max-age filter mapping and source post-filtering;
+- always-include/isolate rejection in the initial contract;
+- parser required fields, optional fields, malformed row drops, unit mapping,
+  and nullability;
+- privacy redaction for phone, name, username, raw keys/ids, receiver names,
+  provider URL, app key, and provider token;
+- cache hit/miss/freshness behavior, route rate limiting, provider
+  `Retry-After` propagation, and redacted `auditId` behavior.
+
+Android P1B contract tests must prove Android DTOs contain only the normalized
+fields above and have no raw compact row, provider URL, provider token/session,
+app key, phone, username, or raw provider key/id fields.
+
 ## Error Envelope
 
 All HTTP errors use the existing server envelope:
@@ -453,15 +763,24 @@ Required error codes:
 - `invalid_package`: missing or invalid Android package context.
 - `validation_error`: malformed JSON or field validation failure.
 - `feature_access_denied`: authenticated account lacks verified XCPro PRO
-  access for outbound Insert publishing.
+  access for outbound Insert publishing or inbound traffic.
 - `puretrack_app_key_unconfigured`: server lacks
   `XCPRO_PURETRACK_APP_KEY`.
 - `puretrack_insert_key_unconfigured`: server lacks
   `XCPRO_PURETRACK_INSERT_KEY`.
 - `puretrack_insert_rejected`: request was valid at the XCPro boundary but the
   upstream provider rejected the whole Insert batch as non-retryable.
+- `puretrack_provider_not_connected`: authenticated XCPro account has no
+  connected PureTrack provider session for inbound traffic.
+- `puretrack_provider_access_denied`: connected provider state is not
+  `PREMIUM`, so PureTrack Pro provider access is missing for inbound traffic.
+- `puretrack_provider_session_unavailable`: provider state exists but the
+  server lacks usable recoverable provider Bearer/session material for Traffic
+  API authentication.
 - `puretrack_provider_unavailable`: PureTrack request failed, timed out, or
   returned retryable 5xx/429.
+- `puretrack_traffic_rejected`: request was valid at the XCPro boundary but the
+  upstream provider rejected the Traffic API request as non-retryable.
 - `puretrack_rate_limited`: backend or PureTrack rate limit applies.
 - `puretrack_state_invalid`: persisted server-side provider state is invalid.
 
@@ -498,6 +817,10 @@ Decision:
 - `/api/v1/puretrack/status` is the authoritative Android-visible connection
   status route for settings UI.
 - Connect/disconnect must update the server-side source used by status.
+- `trafficApiAllowed` may be true only when the server has app-key config,
+  verified XCPro PRO entitlement, provider `PREMIUM` access, and usable
+  server-side provider session material. Hash-only provider session state must
+  not unlock inbound traffic.
 - Android P3A2 is required only if the entitlement provider-state fields above
   change or if entitlement readback starts carrying additional PureTrack fields.
 
@@ -506,9 +829,9 @@ account raw email, or raw provider payloads.
 
 ## Traffic API And Insert API Separation
 
-Future inbound PureTrack overlay/aircraft traffic must use backend/proxy
-routes and must return normalized XCPro DTOs. Android must not parse or store
-raw compact PureTrack Traffic API rows.
+Inbound PureTrack overlay/aircraft traffic must use the XCPro backend
+`POST /api/v1/puretrack/traffic` route and must return normalized XCPro DTOs.
+Android must not parse or store raw compact PureTrack Traffic API rows.
 
 Outbound Insert publishing is a separate flow from status/connect/disconnect
 and traffic proxy routes. It must consume the selected aircraft PureTrack Device
@@ -530,6 +853,11 @@ state, test fixtures, and exception detail:
 - Raw PureTrack Insert provider responses.
 - Raw location point payloads and queued publish batches in support snapshots.
 - Raw compact Traffic API rows.
+- Raw PureTrack Traffic API object keys, tracker UIDs, tracker IDs, target IDs,
+  target keys, aircraft IDs, source tracker IDs, receiver names, source-specific
+  keys, phone numbers, pilot names, usernames, competition names/classes,
+  takeoff/landing IDs, voltage values, satellite counts, and OGN forwarding
+  identifiers.
 - Direct PureTrack request URLs when query parameters could contain sensitive
   account, location, bbox, or filtering context.
 - Raw account email outside the inbound connect request.
@@ -554,10 +882,27 @@ Recommended server phases:
 4. Complete/current locally: implement `POST /api/v1/puretrack/insert` using
    the contract above, fake-provider tests, server-only Insert key
    configuration, and redaction/ack semantics.
-5. Planned later: add traffic proxy contracts and production deployment parity
-   as separate phases.
+5. Complete/current contract docs: specify `POST /api/v1/puretrack/traffic`
+   for inbound normalized overlay traffic, with no server route implementation.
+6. Complete/current locally in commit `8fbdb4d`: add traffic request/response
+   models, bbox validation, parser,
+   normalization, redaction helpers, and tests without exposing a route if the
+   server structure allows that split.
+7. P0B2A complete locally with post-review PASS: add nullable
+   `provider_session_ciphertext`, dedicated provider-session encryption config
+   from `XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET`, exact
+   encrypt/decrypt/material-available helpers, and status/connect tests proving
+   `trafficApiAllowed` requires usable recoverable session material.
+8. Planned P0B2B: add the traffic route/provider adapter, entitlement checks,
+   cache/rate limits, and route tests. This phase must consume the encrypted
+   provider-session read path from P0B2A and must not treat hash-only rows as
+   Traffic API credentials.
+9. Planned later: record live-server deployment parity before production
+   rollout.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the
-Android PureTrack IP records the local server evidence. Live server deployment
-parity remains a separate deployment/release concern.
+Android PureTrack IP records the local server evidence. Android inbound traffic
+P1B/P2 phases must wait until the server traffic contract and P0B route
+evidence exist. Live server deployment parity remains a separate
+deployment/release concern.
