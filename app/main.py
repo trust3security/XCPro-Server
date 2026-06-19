@@ -4311,7 +4311,26 @@ def build_firebase_auth_exchange_response(
     }
 
 
-def build_canonical_free_entitlement_response(current_user: CurrentUserRecord) -> dict[str, Any]:
+def build_puretrack_entitlement_provider_state(
+    db,
+    current_user: CurrentUserRecord
+) -> dict[str, Any]:
+    status = build_puretrack_status_payload(db, current_user)
+    return {
+        "appKeyConfigured": status["appKeyConfigured"],
+        "trafficApiAllowed": status["trafficApiAllowed"],
+        "insertApiConfigured": status["insertApiConfigured"],
+        "userAccess": status["userAccess"],
+        "verifiedAtMs": status["verifiedAtMs"],
+        "validUntilMs": status["validUntilMs"],
+        "errorCode": status["errorCode"]
+    }
+
+
+def build_canonical_free_entitlement_response(
+    db,
+    current_user: CurrentUserRecord
+) -> dict[str, Any]:
     fetched_at_ms = to_epoch_ms(utcnow())
     return {
         "entitlement": {
@@ -4341,15 +4360,7 @@ def build_canonical_free_entitlement_response(current_user: CurrentUserRecord) -
                     "validUntilMs": None,
                     "errorCode": None
                 },
-                "pureTrack": {
-                    "appKeyConfigured": False,
-                    "trafficApiAllowed": False,
-                    "insertApiConfigured": False,
-                    "userAccess": "UNKNOWN",
-                    "verifiedAtMs": None,
-                    "validUntilMs": None,
-                    "errorCode": None
-                }
+                "pureTrack": build_puretrack_entitlement_provider_state(db, current_user)
             }
         },
         "auditId": None
@@ -4447,6 +4458,7 @@ def require_stored_entitlement_contract(snapshot: AccountEntitlementSnapshot) ->
 
 
 def build_stored_entitlement_response(
+    db,
     current_user: CurrentUserRecord,
     snapshot: AccountEntitlementSnapshot
 ) -> dict[str, Any]:
@@ -4490,15 +4502,7 @@ def build_stored_entitlement_response(
                     "validUntilMs": None,
                     "errorCode": None
                 },
-                "pureTrack": {
-                    "appKeyConfigured": False,
-                    "trafficApiAllowed": False,
-                    "insertApiConfigured": False,
-                    "userAccess": "UNKNOWN",
-                    "verifiedAtMs": None,
-                    "validUntilMs": None,
-                    "errorCode": None
-                }
+                "pureTrack": build_puretrack_entitlement_provider_state(db, current_user)
             }
         },
         "auditId": None
@@ -4512,8 +4516,8 @@ def build_entitlement_response(db, current_user: CurrentUserRecord) -> dict[str,
         .first()
     )
     if snapshot is None:
-        return build_canonical_free_entitlement_response(current_user)
-    return build_stored_entitlement_response(current_user, snapshot)
+        return build_canonical_free_entitlement_response(db, current_user)
+    return build_stored_entitlement_response(db, current_user, snapshot)
 
 
 def validate_puretrack_connect_request(request: PureTrackConnectRequest) -> tuple[str, str]:

@@ -212,6 +212,7 @@ class LiveFollowApiTest(unittest.TestCase):
         self.original_google_id_token_verifier = main_module.GOOGLE_ID_TOKEN_VERIFIER
         self.original_private_follow_bearer_secret = main_module.PRIVATE_FOLLOW_BEARER_SECRET
         self.original_push_token_encryption_secret = main_module.PUSH_TOKEN_ENCRYPTION_SECRET
+        self.original_puretrack_runtime_config = main_module.PURETRACK_RUNTIME_CONFIG
         self.original_live_read_rate_limit_config = (
             main_module.LIVE_READ_RATE_LIMIT_WINDOW_SECONDS,
             main_module.LIVE_READ_RATE_LIMIT_GLOBAL,
@@ -270,6 +271,7 @@ class LiveFollowApiTest(unittest.TestCase):
         main_module.GOOGLE_ID_TOKEN_VERIFIER = self.original_google_id_token_verifier
         main_module.PRIVATE_FOLLOW_BEARER_SECRET = self.original_private_follow_bearer_secret
         main_module.PUSH_TOKEN_ENCRYPTION_SECRET = self.original_push_token_encryption_secret
+        main_module.PURETRACK_RUNTIME_CONFIG = self.original_puretrack_runtime_config
         (
             main_module.LIVE_READ_RATE_LIMIT_WINDOW_SECONDS,
             main_module.LIVE_READ_RATE_LIMIT_GLOBAL,
@@ -1048,6 +1050,36 @@ class LiveFollowApiTest(unittest.TestCase):
             entitlement["providerStates"]["skySight"]
         )
         self.assertEqual("UNKNOWN", entitlement["providerStates"]["pureTrack"]["userAccess"])
+
+    def test_subscription_entitlement_read_projects_puretrack_runtime_config(self):
+        main_module.PURETRACK_RUNTIME_CONFIG = main_module.PureTrackRuntimeConfig(
+            app_key="puretrack-app-key",
+            api_base_url="https://puretrack.example",
+            timeout_seconds=2.0,
+            insert_key="puretrack-insert-key",
+            provider_session_encryption_secret=b"puretrack-provider-session-test-secret",
+        )
+        self.upsert_entitlement_snapshot(tier="PRO")
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        puretrack = response.json()["entitlement"]["providerStates"]["pureTrack"]
+        self.assertEqual(
+            {
+                "appKeyConfigured": True,
+                "trafficApiAllowed": False,
+                "insertApiConfigured": True,
+                "userAccess": "UNKNOWN",
+                "verifiedAtMs": None,
+                "validUntilMs": None,
+                "errorCode": None,
+            },
+            puretrack
+        )
 
     def test_subscription_entitlement_read_rejects_expired_bearer(self):
         token = main_module.issue_private_follow_bearer(
