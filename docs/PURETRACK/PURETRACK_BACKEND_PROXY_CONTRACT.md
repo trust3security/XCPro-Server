@@ -14,16 +14,21 @@ raw Traffic API rows in the APK.
 
 Local commit `4b7064a Add PureTrack backend proxy endpoints` implements and
 tests the Android-facing status/connect/disconnect routes described here.
-Production deployment/live-server parity, traffic proxy implementation,
-Android queue drain wiring, and foreground publishing runtime rollout remain
-separate future work. The Android-facing Insert route contract below is
-implemented locally for Android publishing code to consume through the XCPro
-backend only. P0B2A adds encrypted recoverable server-side provider session
-material and fails traffic allowance closed for hash-only, missing, corrupt,
-expired, or unconfigured provider-session material. The inbound traffic overlay
-route contract below is implemented locally as of P0B2B on 2026-06-19.
-Live-server deployment parity remains a separate release/deployment phase
-before Android production rollout claims.
+The Android-facing Insert route contract below is implemented locally for
+Android publishing code to consume through the XCPro backend only. P0B2A adds
+encrypted recoverable server-side provider session material and fails traffic
+allowance closed for hash-only, missing, corrupt, expired, or unconfigured
+provider-session material. The inbound traffic overlay route contract below is
+implemented locally as of P0B2B on 2026-06-19.
+
+Production deployment/live-server parity remains a separate release/deployment
+phase before Android production rollout claims. Live-device testing on
+2026-06-19 confirmed the production PureTrack status/connect routes were
+reachable, but the running API container did not receive the required
+`XCPRO_PURETRACK_*` runtime environment. Route implementation alone is not
+provider readiness; production also needs Compose env projection, real
+server-side PureTrack values in `/opt/xcpro/.env`, API container recreation,
+and a sanitized live smoke test under the `DEPLOY.md` live deployment contract.
 
 Verified current anchors:
 
@@ -103,6 +108,16 @@ XCPRO_PURETRACK_TIMEOUT_SECONDS=10
 
 Rules:
 
+- Docker Compose must project these keys into the `api` service environment.
+  Having values in `/opt/xcpro/.env` is not sufficient if the running
+  container does not receive them.
+- Production `/opt/xcpro/.env` must contain real values outside Git. The repo
+  may contain only placeholders in `.env.example` and documentation.
+- After changing PureTrack env values or Compose env projection, validate
+  Compose and recreate the API container so the process receives the new
+  environment.
+- `DEPLOY.md` is the canonical live deployment contract for repo-side and
+  production evidence before live PureTrack provider readiness is claimed.
 - `XCPRO_PURETRACK_APP_KEY`, verified XCPro `PlanTier.PRO` entitlement,
   PureTrack Pro provider access, and usable server-side provider session
   material are required before `trafficApiAllowed` can be true. Android/server
@@ -475,7 +490,8 @@ Content-Type: application/json
 ```
 
 Status: implemented locally in P0B2B. Production/live-server deployment parity
-is deferred to P6.
+is tracked by
+`docs/PURETRACK/CHANGE_PLAN_PURETRACK_PRODUCTION_CONFIG_DEPLOYMENT_PHASED_IP_2026-06-19.md`.
 
 Request body: `PureTrackTrafficRequest`.
 
@@ -905,12 +921,14 @@ Recommended server phases:
    hash-only rows as Traffic API credentials. Local verification:
    `.venv\Scripts\python.exe -m pytest app\tests\test_puretrack_backend_proxy.py`
    passed with `39 passed`.
-9. Planned later: record live-server deployment parity before production
-   rollout.
+9. Planned/current deployment IP: record and repair live-server PureTrack
+   runtime config parity in
+   `docs/PURETRACK/CHANGE_PLAN_PURETRACK_PRODUCTION_CONFIG_DEPLOYMENT_PHASED_IP_2026-06-19.md`
+   before production PureTrack provider readiness is claimed.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the
 Android PureTrack IP records the local server evidence. Android inbound traffic
-P1B/P2 phases must wait until the server traffic contract and P0B route
-evidence exist. Live server deployment parity remains a separate
-deployment/release concern.
+and outbound publishing must still treat live server deployment parity as a
+separate deployment/release concern until the production config deployment IP
+is complete.

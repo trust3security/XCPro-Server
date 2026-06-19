@@ -77,6 +77,11 @@ XCPRO_LIVE_READ_RATE_LIMIT_GLOBAL=0
 XCPRO_LIVE_READ_RATE_LIMIT_PER_USER=0
 XCPRO_LIVE_READ_RATE_LIMIT_PER_IP=0
 XCPRO_LIVE_READ_RATE_LIMIT_PER_SESSION=0
+XCPRO_PURETRACK_APP_KEY=your-puretrack-app-key
+XCPRO_PURETRACK_INSERT_KEY=your-puretrack-insert-key-if-publishing
+XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET=generated-secret
+XCPRO_PURETRACK_API_BASE_URL=https://puretrack.io
+XCPRO_PURETRACK_TIMEOUT_SECONDS=10
 ```
 
 Do not commit the real production values.
@@ -84,6 +89,123 @@ Do not commit the real production values.
 The live-read rate-limit defaults above intentionally leave rate limiting
 disabled (`0`) while metrics are observed. Set nonzero values only after a
 traffic-based decision; Android already honors `429 Retry-After` responses.
+
+## Live deployment contract
+
+Every server-backed feature that depends on environment values, external
+provider credentials, feature flags, service-account files, or deployment-time
+configuration must satisfy this contract before Android or another client can
+claim the live feature is ready.
+
+Required repo-side evidence:
+
+- `.env.example` lists every required variable by name with placeholder values
+  only.
+- `docker-compose.yml` projects every required variable into the service that
+  reads it.
+- This deploy guide documents the feature-specific live values, secret
+  handling, safe verification command, and recreate/restart scope.
+- Feature contract docs name any required provider credentials, server-only
+  tokens, route availability, degraded-state behavior, and live parity
+  requirement.
+- Tests or local checks prove code behavior for missing/unconfigured values
+  where the feature has server route logic.
+
+Required production evidence:
+
+- Real secret values exist only in `/opt/xcpro/.env`, host secret files, or a
+  future approved secret store. They must not be committed to Git.
+- Compose config validates successfully on the production host before applying
+  changes.
+- The running container receives the values after deploy. Checking
+  `/opt/xcpro/.env` alone is not enough.
+- Any changed environment projection is followed by the smallest safe service
+  recreate, normally:
+
+```bash
+cd /opt/xcpro
+docker compose config
+docker compose up -d --no-deps --force-recreate api
+```
+
+- Verification commands print only presence or aggregate status, never raw
+  secrets, tokens, passwords, service-account JSON, provider sessions, or
+  bearer tokens.
+- Public route smoke tests verify the expected auth boundary. For protected
+  routes, unauthenticated requests should still fail closed.
+- Feature-specific smoke tests prove the live user-visible state after
+  deployment.
+- Rollback is available through the pre-change backup and the previous
+  Compose/env/app state.
+
+For any new or changed server-backed feature, do not treat a local route
+implementation, a passing unit test, or a pushed commit as live readiness until
+the repo-side and production evidence above are complete.
+
+## PureTrack provider and Insert configuration
+
+PureTrack integration is server-owned in production. Android calls XCPro_Server;
+it must not hold PureTrack app keys, Insert keys, provider tokens, or direct
+PureTrack production URLs.
+
+This section is the PureTrack-specific application of the live deployment
+contract above.
+
+Production PureTrack routes can exist and still report "PureTrack backend
+unavailable" to Android if the API container does not receive the required
+runtime environment. Both of these must be true before live PureTrack
+connection testing is meaningful:
+
+- `/opt/xcpro/.env` contains the required PureTrack values outside Git.
+- `/opt/xcpro/docker-compose.yml` projects those values into the `api` service
+  environment.
+
+Required production variables:
+
+```dotenv
+XCPRO_PURETRACK_APP_KEY=your-puretrack-app-key
+XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET=generated-secret
+XCPRO_PURETRACK_API_BASE_URL=https://puretrack.io
+XCPRO_PURETRACK_TIMEOUT_SECONDS=10
+```
+
+`XCPRO_PURETRACK_INSERT_KEY` is also required before outbound Insert publishing
+can send points upstream. It is not required to fix the PureTrack
+login/connect "backend unavailable" symptom.
+
+Do not reuse `XCPRO_PUSH_TOKEN_ENCRYPTION_SECRET` as the PureTrack provider
+session encryption secret.
+
+After changing PureTrack env or Compose projection, validate Compose and
+recreate only the API container so the running process receives the new
+environment:
+
+```bash
+cd /opt/xcpro
+docker compose config
+docker compose up -d --no-deps --force-recreate api
+```
+
+Verify secret presence without printing values:
+
+```bash
+docker compose exec -T api python - <<'PY'
+import os
+for name in [
+    "XCPRO_PURETRACK_APP_KEY",
+    "XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET",
+    "XCPRO_PURETRACK_API_BASE_URL",
+    "XCPRO_PURETRACK_TIMEOUT_SECONDS",
+    "XCPRO_PURETRACK_INSERT_KEY",
+]:
+    print(f"{name}={'SET' if os.getenv(name) else 'MISSING'}")
+PY
+```
+
+For PureTrack login/connect validation, the app key, provider-session
+encryption secret, API base URL, and timeout must report `SET`. The Insert key
+may remain `MISSING` only while outbound Insert publishing is not being
+validated.
 
 ## Firebase Auth identity configuration
 
@@ -257,6 +379,9 @@ docker-compose up -d
 
 Note:
 - the first migration from Compose v1 to Compose v2 may recreate containers
+- for PureTrack env-only or API-service env-projection changes, prefer
+  `docker compose up -d --no-deps --force-recreate api` after
+  `docker compose config`
 
 ### If app code changed
 
@@ -340,6 +465,17 @@ docker ps
 curl -i http://127.0.0.1:8000/
 curl -i https://api.xcpro.com.au/
 docker compose run --rm api python /app/scripts/private_follow_env_preflight.py
+docker compose exec -T api python - <<'PY'
+import os
+for name in [
+    "XCPRO_PURETRACK_APP_KEY",
+    "XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET",
+    "XCPRO_PURETRACK_API_BASE_URL",
+    "XCPRO_PURETRACK_TIMEOUT_SECONDS",
+    "XCPRO_PURETRACK_INSERT_KEY",
+]:
+    print(f"{name}={'SET' if os.getenv(name) else 'MISSING'}")
+PY
 systemctl status xcpro-notification-delivery.timer --no-pager -l
 journalctl -u xcpro-notification-delivery.service -n 50 --no-pager
 ```
@@ -353,6 +489,10 @@ Expected:
 - private-follow preflight reports `ok: true`
 - staging/prod preflight includes Firebase Auth config and fails if
   `XCPRO_FIREBASE_AUTH_PROJECT_ID` is missing
+- PureTrack app key, provider-session encryption secret, API base URL, and
+  timeout report `SET` before live PureTrack login/connect validation
+- PureTrack Insert key reports `SET` before outbound Insert publishing
+  validation
 - notification timer status and journal output remain aggregate-only
 
 Do not run `deliver_notifications.py --confirm-send` as a generic deploy smoke

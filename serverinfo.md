@@ -136,6 +136,19 @@ Production env and secret inventory includes:
 - `XCPRO_FCM_PROJECT_ID`
 - `XCPRO_FCM_SERVICE_ACCOUNT_JSON_PATH`
 - live-read rate-limit variables
+- `XCPRO_PURETRACK_APP_KEY`
+- `XCPRO_PURETRACK_INSERT_KEY`
+- `XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET`
+- `XCPRO_PURETRACK_API_BASE_URL`
+- `XCPRO_PURETRACK_TIMEOUT_SECONDS`
+
+PureTrack runtime config is server-owned. Android calls XCPro_Server and must
+not hold PureTrack app keys, Insert keys, provider tokens, or direct PureTrack
+production URLs. Live PureTrack routes are not provider-ready unless
+`/opt/xcpro/.env` contains the required PureTrack values and
+`/opt/xcpro/docker-compose.yml` projects them into the `api` service
+environment. If the container is missing these values, Android may reach the
+routes but still show "PureTrack backend unavailable".
 
 The Firebase Auth service-account file path is currently:
 
@@ -194,5 +207,7 @@ These included:
 - private-follow notification delivery is scheduled by a host systemd timer,
   not a dedicated Compose worker service
 - production secrets live outside Git on the server in `/opt/xcpro/.env`
-- `.env.example` in this repo shows the required variable names only
+- `.env.example` must show required variable names only; when a feature adds a
+  new env var, update `.env.example` and Compose projection before claiming
+  live readiness
 - the real `.env` file must never be committed
