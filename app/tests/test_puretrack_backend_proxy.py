@@ -1111,11 +1111,12 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
     def test_traffic_response_models_reject_raw_rows_and_provider_secrets(self):
         target = {
-            "targetId": "pt_opaque",
+            "targetId": "pt_077111111111111111111111",
             "lastSeenAtMs": 1713592586000,
             "latitudeDeg": -37.78174,
             "longitudeDeg": 174.88159,
         }
+        main_module.PureTrackTrafficTarget(**target)
         with self.assertRaises(ValidationError):
             main_module.PureTrackTrafficTarget(
                 **dict(target, rawCompactRow="T1713592586,L-37.7,G174.8,KY-ZK-MZE")
@@ -1131,6 +1132,10 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             main_module.PureTrackTrafficTarget(
                 **dict(target, targetId="Y-ZK-MZE")
+            )
+        with self.assertRaises(ValidationError):
+            main_module.PureTrackTrafficTarget(
+                **dict(target, targetId="pt_opaque")
             )
 
         response = main_module.PureTrackTrafficResponse(

@@ -5049,6 +5049,10 @@ def puretrack_text_has_sensitive_value(raw_value: str) -> bool:
     )
 
 
+def is_opaque_puretrack_target_id(raw_value: str) -> bool:
+    return bool(re.fullmatch(r"pt_[0-9a-f]{24}", raw_value))
+
+
 def reject_sensitive_puretrack_visible_text(
     payload: Mapping[str, Any],
     field_name: str,
@@ -5072,10 +5076,8 @@ def reject_sensitive_puretrack_traffic_target_payload(payload: Any) -> Any:
     if not isinstance(payload, MappingABC):
         return payload
     target_id = payload.get("targetId")
-    if not isinstance(target_id, str) or not target_id.startswith("pt_"):
+    if not isinstance(target_id, str) or not is_opaque_puretrack_target_id(target_id):
         raise ValueError("targetId must be an opaque PureTrack target id")
-    if puretrack_text_has_sensitive_value(target_id):
-        raise ValueError("targetId contains sensitive provider data")
     reject_sensitive_puretrack_visible_text(payload, "sourceLabel", 64, True)
     reject_sensitive_puretrack_visible_text(payload, "displayLabel", 48, False)
     reject_sensitive_puretrack_visible_text(payload, "registration", 32, False)
