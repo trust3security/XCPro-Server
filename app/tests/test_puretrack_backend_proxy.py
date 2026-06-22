@@ -364,10 +364,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertEqual("p***@example.com", status["accountLabel"])
         self.assertIsNone(status["errorCode"])
         self.assertEqual(self.now_ms(), status["verifiedAtMs"])
-        self.assertEqual(
-            self.now_ms() + main_module.PURETRACK_PROVIDER_STATUS_CACHE_MS,
-            status["validUntilMs"],
-        )
+        self.assertIsNone(status["validUntilMs"])
         self.assertTrue(status["auditId"].startswith("pt_"))
         self.assertEqual([{
             "email": "pilot@example.com",
@@ -389,6 +386,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                 ),
             )
             self.assertEqual("p***@example.com", row.account_label)
+            self.assertIsNone(row.valid_until_ms)
         finally:
             db.close()
 
@@ -455,8 +453,9 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         body = response.json()
-        self.assertIs(True, body["connected"])
+        self.assertIs(False, body["connected"])
         self.assertIs(False, body["trafficApiAllowed"])
+        self.assertIsNone(body["accountLabel"])
         self.assertEqual(
             main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
             body["errorCode"],
@@ -509,14 +508,15 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         body = response.json()
-        self.assertIs(True, body["connected"])
+        self.assertIs(False, body["connected"])
         self.assertIs(False, body["trafficApiAllowed"])
+        self.assertIsNone(body["accountLabel"])
         self.assertEqual(
             main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
             body["errorCode"],
         )
 
-    def test_expired_puretrack_provider_session_ciphertext_fails_closed(self):
+    def test_historical_expired_provider_session_ciphertext_remains_connected(self):
         self.upsert_entitlement_snapshot(tier="PRO")
         self.upsert_provider_session(
             token=self.primary_bearer,
@@ -531,9 +531,10 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         body = response.json()
-        self.assertIs(False, body["connected"])
-        self.assertIs(False, body["trafficApiAllowed"])
-        self.assertIsNone(body["accountLabel"])
+        self.assertIs(True, body["connected"])
+        self.assertIs(True, body["trafficApiAllowed"])
+        self.assertEqual("p***@example.com", body["accountLabel"])
+        self.assertIsNone(body["validUntilMs"])
 
     def test_provider_session_material_is_encrypted_and_redacted(self):
         self.upsert_entitlement_snapshot(tier="PRO")
@@ -1561,11 +1562,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                     user_access=user_access,
                     account_label="p***@example.com",
                     verified_at_ms=now_ms,
-                    valid_until_ms=(
-                        valid_until_ms
-                        if valid_until_ms is not None
-                        else now_ms + main_module.PURETRACK_PROVIDER_STATUS_CACHE_MS
-                    ),
+                    valid_until_ms=valid_until_ms,
                     error_code=None,
                     retry_after_ms=None,
                     audit_id="pt_test",

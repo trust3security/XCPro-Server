@@ -959,9 +959,17 @@ Recommended server phases:
     diagnostic metadata only for the current provider contract, and disconnect
     remains local server-side token/status clear unless a future approved
     policy adds upstream logout.
-11. Planned/current P1A: update implementation and tests to remove the
-    one-hour provider-token auth gate while preserving encrypted server-only
-    token storage, redaction, disconnect clear, and access gates.
+11. Complete/current P1A on 2026-06-22: updated implementation and tests to
+    remove the one-hour provider-token auth gate while preserving encrypted
+    server-only token storage, redaction, disconnect clear, and access gates.
+    Local verification:
+    `.venv\Scripts\python.exe -m pytest app\tests\test_puretrack_backend_proxy.py -k "puretrack and (connect or status or session or traffic)"`
+    passed with `30 passed, 9 deselected`; `git diff --check -- app/main.py app/tests/test_puretrack_backend_proxy.py docs/PURETRACK/PURETRACK_BACKEND_PROXY_CONTRACT.md`
+    passed; the P1A negative search for old expiry writes/assertions and raw
+    secret logging returned no hits.
+12. Planned/current P1B: mark stored provider tokens reconnect-needed or
+    unusable when PureTrack rejects them during Traffic API use, then expose a
+    redacted status that Android can map to user action.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the

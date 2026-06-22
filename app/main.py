@@ -331,7 +331,6 @@ PURETRACK_TRAFFIC_EXCLUDED_ROW_KEYS = frozenset({
     "^",
 })
 PURETRACK_TRAFFIC_STEALTH_IDENTITY_KEYS = frozenset({"B", "E", "M", "c", "m"})
-PURETRACK_PROVIDER_STATUS_CACHE_MS = 3_600_000
 PURETRACK_DEFAULT_API_BASE_URL = "https://puretrack.io"
 PURETRACK_DEFAULT_TIMEOUT_SECONDS = 10.0
 BILLING_PERIOD_VALUES = frozenset({"NONE", "MONTHLY", "ANNUAL"})
@@ -4579,7 +4578,6 @@ def load_puretrack_provider_session(db, user_id: str) -> Optional[PureTrackProvi
 
 def puretrack_session_connected(
     session: Optional[PureTrackProviderSession],
-    now_ms: int
 ) -> bool:
     if session is None:
         return False
@@ -4589,8 +4587,6 @@ def puretrack_session_connected(
         PURETRACK_PROVIDER_ACCESS_FREE,
         PURETRACK_PROVIDER_ACCESS_PREMIUM,
     }:
-        return False
-    if session.valid_until_ms is not None and session.valid_until_ms < now_ms:
         return False
     return True
 
@@ -5390,9 +5386,8 @@ def require_puretrack_traffic_provider_session_secret(
             detail="PureTrack traffic requires XCPro PRO access"
         )
 
-    now_ms = to_epoch_ms(utcnow())
     session = load_puretrack_provider_session(db, current_user.user.id)
-    if not puretrack_session_connected(session, now_ms):
+    if not puretrack_session_connected(session):
         raise ApiHTTPException(
             status_code=409,
             code=ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
@@ -5538,9 +5533,10 @@ def build_puretrack_status_payload(
     retry_after_ms: Optional[int] = None,
     audit_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    now_ms = to_epoch_ms(utcnow())
     session = load_puretrack_provider_session(db, current_user.user.id)
-    session_is_connected = puretrack_session_connected(session, now_ms)
+    session_has_provider_state = puretrack_session_connected(session)
+    provider_session_material_ready = puretrack_provider_session_material_available(session)
+    session_is_connected = session_has_provider_state and provider_session_material_ready
     resolved_connected = session_is_connected if connected is None else connected
     resolved_user_access = (
         user_access
@@ -5555,9 +5551,8 @@ def build_puretrack_status_payload(
     resolved_valid_until_ms = (
         valid_until_ms
         if valid_until_ms is not None
-        else (session.valid_until_ms if session is not None else None)
+        else None
     )
-    provider_session_material_ready = puretrack_provider_session_material_available(session)
     resolved_account_label = (
         account_label
         if account_label is not None
@@ -5574,7 +5569,7 @@ def build_puretrack_status_payload(
     )
     if (
         resolved_error_code is None
-        and resolved_connected
+        and session_has_provider_state
         and resolved_user_access == PURETRACK_PROVIDER_ACCESS_PREMIUM
         and not provider_session_material_ready
     ):
@@ -5684,7 +5679,7 @@ def save_puretrack_connected_session(
     session.user_access = provider_result.user_access
     session.account_label = redact_puretrack_account_label(email)
     session.verified_at_ms = now_ms
-    session.valid_until_ms = now_ms + PURETRACK_PROVIDER_STATUS_CACHE_MS
+    session.valid_until_ms = None
     session.error_code = None
     session.retry_after_ms = None
     session.audit_id = audit_id
