@@ -4,7 +4,7 @@ Status: reviewed contract; status/connect/disconnect and Insert publishing
 implemented locally; P0B2A provider-session material/status gating implemented
 locally; P0B2B inbound traffic overlay route implemented locally; P0A
 persistent-provider-token contract correction recorded; P1B provider-rejection
-state handling implemented locally.
+state handling implemented locally; P1C disconnect policy confirmed locally.
 Date: 2026-06-22
 
 ## Purpose
@@ -31,6 +31,8 @@ P1B on 2026-06-22 records provider rejection handling: provider Traffic API
 401 clears stored token material and exposes not-connected/reconnect-required
 status, while provider Traffic API 403 records PureTrack provider access denial
 without changing XCPro entitlement state.
+P1C on 2026-06-22 confirms disconnect remains local to XCPro_Server stored
+token/status clear only and does not introduce upstream PureTrack logout.
 
 Production deployment/live-server parity remains a separate release/deployment
 phase before Android production rollout claims. Live-device testing on
@@ -1000,9 +1002,13 @@ Recommended server phases:
     `Authorization: Bearer {provider_session_secret}` construction, which is
     the intended server-only upstream header and not a log, response, fixture,
     Android exposure, or raw provider payload.
-13. Planned/current P1C: confirm disconnect policy remains local
-    XCPro_Server token/status clear only unless an explicit future decision
-    approves upstream provider logout.
+13. Complete/current P1C on 2026-06-22: disconnect policy remains local
+    XCPro_Server token/status clear only. No upstream PureTrack logout call was
+    introduced. Local verification:
+    `.venv\Scripts\python.exe -m pytest app\tests\test_puretrack_backend_proxy.py -k "puretrack and disconnect"`
+    passed with `4 passed, 37 deselected`; `git diff --check -- app/main.py app/tests/test_puretrack_backend_proxy.py docs/PURETRACK/PURETRACK_BACKEND_PROXY_CONTRACT.md`
+    passed; the targeted disconnect-policy search for logout/raw leakage hit
+    only policy/documentation mentions and no code/test upstream logout call.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the

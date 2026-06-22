@@ -659,6 +659,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         )
         self.assertEqual(200, connect.status_code)
         self.assertIs(True, connect.json()["status"]["connected"])
+        self.assertEqual(1, len(self.provider.calls))
 
         disconnected = self.client.post(
             "/api/v1/puretrack/disconnect",
@@ -688,6 +689,19 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             main_module.PURETRACK_DISCONNECT_RESULT_NOT_CONNECTED,
             not_connected.json()["result"],
         )
+        status_response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(),
+        )
+        status = status_response.json()
+        self.assertEqual(200, status_response.status_code)
+        self.assertIs(False, status["connected"])
+        self.assertIs(False, status["trafficApiAllowed"])
+        self.assertEqual(main_module.PURETRACK_PROVIDER_ACCESS_UNKNOWN, status["userAccess"])
+        self.assertIsNone(status["accountLabel"])
+        self.assertIsNone(status["errorCode"])
+        self.assertEqual(1, len(self.provider.calls))
+        self.assertEqual([], self.traffic_client.calls)
         db = self.session_local()
         try:
             self.assertEqual(0, db.query(main_module.PureTrackProviderSession).count())
