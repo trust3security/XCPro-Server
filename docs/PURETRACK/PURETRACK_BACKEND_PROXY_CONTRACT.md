@@ -2,8 +2,9 @@
 
 Status: reviewed contract; status/connect/disconnect and Insert publishing
 implemented locally; P0B2A provider-session material/status gating implemented
-locally; P0B2B inbound traffic overlay route implemented locally.
-Date: 2026-06-19
+locally; P0B2B inbound traffic overlay route implemented locally; P0A
+persistent-provider-token contract correction recorded.
+Date: 2026-06-22
 
 ## Purpose
 
@@ -17,9 +18,14 @@ tests the Android-facing status/connect/disconnect routes described here.
 The Android-facing Insert route contract below is implemented locally for
 Android publishing code to consume through the XCPro backend only. P0B2A adds
 encrypted recoverable server-side provider session material and fails traffic
-allowance closed for hash-only, missing, corrupt, expired, or unconfigured
-provider-session material. The inbound traffic overlay route contract below is
-implemented locally as of P0B2B on 2026-06-19.
+allowance closed for hash-only, missing, corrupt, unconfigured, or
+provider-rejected provider-session material. The inbound traffic overlay route
+contract below is implemented locally as of P0B2B on 2026-06-19. P0A on
+2026-06-22 corrects the provider-session lifetime contract: PureTrack provider
+API tokens are stored encrypted on XCPro_Server and are not artificially expired
+after one hour by XCPro. They remain usable until local disconnect, missing or
+corrupt server-held material, provider rejection/revocation, or a future
+provider contract with a real token expiry.
 
 Production deployment/live-server parity remains a separate release/deployment
 phase before Android production rollout claims. Live-device testing on
@@ -44,15 +50,18 @@ Verified current anchors:
   configuration, ack semantics, retry delay propagation, and redaction.
 - `app/main.py` exposes `POST /api/v1/puretrack/traffic`; tests verify bearer
   and package validation, verified XCPro PRO access, app-key configuration,
-  connected non-expired PureTrack `PREMIUM` provider state, decryptable
-  provider session material, bbox validation, provider error mapping, local
-  rate limiting, normalized DTO caching, and redaction.
+  connected PureTrack `PREMIUM` provider state, decryptable provider session
+  material, bbox validation, provider error mapping, local rate limiting,
+  normalized DTO caching, and redaction.
 - `app/main.py` stores `PureTrackProviderSession.provider_session_hash` only as
   redacted identity/dedupe material and stores recoverable provider session
   material only in encrypted
   `PureTrackProviderSession.provider_session_ciphertext`.
   Hash-only rows are not sufficient to authorize future PureTrack Traffic API
   calls and fail closed with `puretrack_provider_session_unavailable`.
+  `valid_until_ms` is nullable legacy/status metadata for this provider flow,
+  not an XCPro-imposed one-hour authorization expiry for encrypted provider
+  token material.
 - `app/main.py` still returns coarse `providerStates.pureTrack` values inside
   entitlement response builders; dedicated PureTrack settings state comes from
   `/api/v1/puretrack/status`.
@@ -66,8 +75,8 @@ XCPro backend owns:
 
 - PureTrack app key configuration.
 - PureTrack login/token exchange.
-- PureTrack provider token/session storage for inbound traffic. Existing
-  hash-only session rows are not usable Traffic API credentials.
+- PureTrack provider token/session storage and lifecycle for inbound traffic.
+  Existing hash-only session rows are not usable Traffic API credentials.
 - PureTrack Traffic API calls, bbox validation, filtering, rate limiting,
   compact-row parsing, normalization, cache policy, and redaction in later
   traffic phases.
@@ -98,10 +107,10 @@ Android must never store or receive:
 
 Server implementation must use these environment keys:
 
-```dotenv
-XCPRO_PURETRACK_APP_KEY=
-XCPRO_PURETRACK_INSERT_KEY=
-XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET=
+```text
+XCPRO_PURETRACK_APP_KEY
+XCPRO_PURETRACK_INSERT_KEY
+XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET
 XCPRO_PURETRACK_API_BASE_URL=https://puretrack.io
 XCPRO_PURETRACK_TIMEOUT_SECONDS=10
 ```
@@ -192,8 +201,9 @@ Android-to-XCPro-backend only.
 
 Fields:
 
-- `connected`: true only when backend has a valid server-side PureTrack
-  provider session for this XCPro account.
+- `connected`: true only when backend has usable encrypted server-side
+  PureTrack provider token/session material for this XCPro account and the
+  provider state has not been cleared or marked reconnect-required.
 - `appKeyConfigured`: true only when server has `XCPRO_PURETRACK_APP_KEY`.
 - `trafficApiAllowed`: server-computed combined allowance. It is true only
   when server app key, XCPro `PlanTier.PRO` entitlement, PureTrack provider
@@ -207,8 +217,11 @@ Fields:
   provider account and is not the XCPro `PlanTier.PRO` entitlement value.
 - `verifiedAtMs`: server wall-clock epoch milliseconds for last provider state
   verification, or null.
-- `validUntilMs`: server wall-clock epoch milliseconds for known provider
-  validity/cache expiry, or null.
+- `validUntilMs`: nullable diagnostic metadata only. For the current PureTrack
+  provider-token contract this is normally null for connected accounts and must
+  not be treated as an authentication expiry by Android or by server traffic
+  authorization. It may carry a real provider-supplied expiry only if a future
+  provider contract introduces one and this contract is updated first.
 - `accountLabel`: redacted display label only, for example `p***@example.com`;
   never a raw credential or token.
 - `errorCode`: nullable PureTrack provider/status code from the table below.
@@ -244,8 +257,8 @@ Content-Type: application/json
 
 ```json
 {
-  "email": "pilot@example.com",
-  "password": "provider-password"
+  "email": "<provider-email>",
+  "password": "<provider-password>"
 }
 ```
 
@@ -269,7 +282,7 @@ Success response: `200 PureTrackConnectResponse`.
     "insertApiConfigured": false,
     "userAccess": "PREMIUM",
     "verifiedAtMs": 1760000000000,
-    "validUntilMs": 1760003600000,
+    "validUntilMs": null,
     "accountLabel": "p***@example.com",
     "errorCode": null,
     "retryAfterMs": null,
@@ -293,7 +306,11 @@ Behavior:
 - Password must not be persisted.
 - Password must be redacted from logs, audit detail, support snapshots, test
   failure output, and exception detail.
-- Provider token/session material, if any, is server-side only.
+- Provider token/session material, if any, is server-side only, encrypted at
+  rest, and not returned to Android.
+- Provider tokens are not artificially expired after one hour. The server
+  should return `validUntilMs=null` for current persistent provider-token
+  status unless a future provider contract supplies a real expiry.
 - Provider authentication rejection is represented by `result=AUTH_REJECTED`
   and a redacted `status.errorCode`, not by returning the PureTrack response.
 
@@ -345,6 +362,10 @@ Behavior:
 
 - Clears server-side PureTrack provider token/session material for the XCPro
   account.
+- This is a local XCPro_Server disconnect: it clears the stored encrypted
+  provider token/status for this XCPro account and does not call upstream
+  PureTrack `/api/logout` unless a future explicitly approved policy adds and
+  tests provider-side revocation.
 - Does not alter XCPro account identity, Google Play entitlement, LiveFollow
   relationships, or Android local profile data.
 - Does not call PureTrack Insert publishing or traffic overlay routes.
@@ -569,9 +590,10 @@ Provider call behavior:
   account.
 - Requires `XCPRO_PURETRACK_APP_KEY`; when absent, returns
   `puretrack_app_key_unconfigured`.
-- Requires a connected server-side PureTrack provider session with provider
-  access `PREMIUM`. `FREE`, `NONE`, `UNKNOWN`, `ERROR`, expired, missing, or
-  invalid provider state must not call the Traffic API.
+- Requires a connected server-side PureTrack provider token/session with
+  provider access `PREMIUM`. `FREE`, `NONE`, `UNKNOWN`, `ERROR`, missing,
+  corrupt, provider-rejected, or invalid provider state must not call the
+  Traffic API.
 - Requires recoverable server-side PureTrack provider session material for
   Bearer authentication to the provider Traffic API. Existing hash-only
   `provider_session_hash` rows are insufficient for traffic and must fail
@@ -752,8 +774,9 @@ coverage for:
 
 - route registration and request model unknown-field rejection;
 - valid/invalid bearer and package headers;
-- missing app key, missing/expired/non-`PREMIUM` provider session, hash-only
-  provider session material, and missing XCPro PRO entitlement;
+- missing app key, missing/corrupt/non-`PREMIUM` provider session, hash-only
+  provider session material, provider reconnect-required state, and missing
+  XCPro PRO entitlement;
 - bbox coordinate bounds, size limits, and anti-meridian rejection;
 - category/object/source/max-age filter mapping and source post-filtering;
 - always-include/isolate rejection in the initial contract;
@@ -793,12 +816,15 @@ Required error codes:
 - `puretrack_insert_rejected`: request was valid at the XCPro boundary but the
   upstream provider rejected the whole Insert batch as non-retryable.
 - `puretrack_provider_not_connected`: authenticated XCPro account has no
-  connected PureTrack provider session for inbound traffic.
+  connected PureTrack provider session for inbound traffic, or the stored
+  provider token was locally cleared or marked reconnect-required.
 - `puretrack_provider_access_denied`: connected provider state is not
   `PREMIUM`, so PureTrack Pro provider access is missing for inbound traffic.
 - `puretrack_provider_session_unavailable`: provider state exists but the
   server lacks usable recoverable provider Bearer/session material for Traffic
-  API authentication.
+  API authentication, for example because encrypted material is missing or
+  corrupt. Historical/past `valid_until_ms` metadata alone is not a reason to
+  return this error for otherwise usable encrypted provider token material.
 - `puretrack_provider_unavailable`: PureTrack request failed, timed out, or
   returned retryable 5xx/429.
 - `puretrack_traffic_rejected`: request was valid at the XCPro boundary but the
@@ -839,6 +865,8 @@ Decision:
 - `/api/v1/puretrack/status` is the authoritative Android-visible connection
   status route for settings UI.
 - Connect/disconnect must update the server-side source used by status.
+- `validUntilMs` remains nullable diagnostic metadata here too. It is not an
+  Android-visible auth expiry for current persistent PureTrack provider tokens.
 - `trafficApiAllowed` may be true only when the server has app-key config,
   verified XCPro PRO entitlement, provider `PREMIUM` access, and usable
   server-side provider session material. Hash-only provider session state must
@@ -925,6 +953,15 @@ Recommended server phases:
    runtime config parity in
    `docs/PURETRACK/CHANGE_PLAN_PURETRACK_PRODUCTION_CONFIG_DEPLOYMENT_PHASED_IP_2026-06-19.md`
    before production PureTrack provider readiness is claimed.
+10. Complete/current P0A on 2026-06-22: corrected this contract to persistent
+    server-side provider-token semantics. Encrypted provider token material is
+    not artificially expired after one hour, `validUntilMs` is nullable
+    diagnostic metadata only for the current provider contract, and disconnect
+    remains local server-side token/status clear unless a future approved
+    policy adds upstream logout.
+11. Planned/current P1A: update implementation and tests to remove the
+    one-hour provider-token auth gate while preserving encrypted server-only
+    token storage, redaction, disconnect clear, and access gates.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the
