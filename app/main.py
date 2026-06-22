@@ -5443,9 +5443,9 @@ def raise_puretrack_traffic_provider_error(
         )
     if provider_result.error_code == ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE:
         raise ApiHTTPException(
-            status_code=503,
-            code=ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE,
-            detail="PureTrack provider session material is unavailable"
+            status_code=409,
+            code=ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+            detail="PureTrack provider account must be reconnected"
         )
     if provider_result.error_code == ErrorCode.PURETRACK_TRAFFIC_REJECTED:
         raise ApiHTTPException(
@@ -5458,6 +5458,68 @@ def raise_puretrack_traffic_provider_error(
         code=ErrorCode.PURETRACK_PROVIDER_UNAVAILABLE,
         detail="PureTrack provider is unavailable"
     )
+
+
+def mark_puretrack_provider_session_reconnect_required(
+    db,
+    user_id: str,
+    audit_id: str,
+) -> bool:
+    session = load_puretrack_provider_session(db, user_id)
+    if session is None:
+        return False
+    now = utcnow()
+    session.provider_session_hash = None
+    session.provider_session_ciphertext = None
+    session.user_access = PURETRACK_PROVIDER_ACCESS_NONE
+    session.account_label = None
+    session.valid_until_ms = None
+    session.error_code = ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED
+    session.retry_after_ms = None
+    session.audit_id = audit_id
+    session.updated_at = now
+    return True
+
+
+def mark_puretrack_provider_access_denied(
+    db,
+    user_id: str,
+    audit_id: str,
+) -> bool:
+    session = load_puretrack_provider_session(db, user_id)
+    if session is None:
+        return False
+    now = utcnow()
+    session.user_access = PURETRACK_PROVIDER_ACCESS_FREE
+    session.valid_until_ms = None
+    session.error_code = ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED
+    session.retry_after_ms = None
+    session.audit_id = audit_id
+    session.updated_at = now
+    return True
+
+
+def persist_puretrack_traffic_provider_error_state(
+    db,
+    current_user: CurrentUserRecord,
+    provider_result: PureTrackTrafficProviderResult,
+) -> None:
+    audit_id = puretrack_traffic_audit_id()
+    mutated = False
+    if provider_result.error_code == ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE:
+        mutated = mark_puretrack_provider_session_reconnect_required(
+            db,
+            current_user.user.id,
+            audit_id,
+        )
+    elif provider_result.error_code == ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED:
+        mutated = mark_puretrack_provider_access_denied(
+            db,
+            current_user.user.id,
+            audit_id,
+        )
+    if mutated:
+        db.commit()
 
 
 def fetch_puretrack_traffic(
@@ -5492,6 +5554,11 @@ def fetch_puretrack_traffic(
         config=PURETRACK_RUNTIME_CONFIG,
     )
     if provider_result.error_code is not None or provider_result.rows is None:
+        persist_puretrack_traffic_provider_error_state(
+            db,
+            current_user,
+            provider_result,
+        )
         raise_puretrack_traffic_provider_error(provider_result)
 
     targets, dropped_count, redacted_count = map_puretrack_compact_rows_to_traffic_targets(

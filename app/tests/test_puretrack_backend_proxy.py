@@ -1390,7 +1390,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
 
     def test_traffic_provider_error_mapping_and_retry_after(self):
         cases = [
-            (401, 503, main_module.ErrorCode.PURETRACK_PROVIDER_SESSION_UNAVAILABLE, None),
+            (401, 409, main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED, None),
             (403, 403, main_module.ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED, None),
             (422, 502, main_module.ErrorCode.PURETRACK_TRAFFIC_REJECTED, None),
             (429, 429, main_module.ErrorCode.PURETRACK_RATE_LIMITED, 7000),
@@ -1422,6 +1422,152 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                 self.assertEqual(expected_code, response.json()["code"])
                 if retry_after_ms is not None:
                     self.assertEqual("7", response.headers.get("Retry-After"))
+
+    def test_traffic_provider_401_marks_reconnect_required_and_stops_retry(self):
+        token = "traffic-provider-revoked"
+        self.add_static_bearer(token, token)
+        self.upsert_entitlement_snapshot(token=token, tier="PRO")
+        self.upsert_provider_session(
+            token=token,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+        )
+        self.traffic_client.result = (
+            main_module.puretrack_traffic_provider_failure_for_http_status(401)
+        )
+
+        response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(token=token),
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+            response.json()["code"],
+        )
+        self.assertEqual(1, len(self.traffic_client.calls))
+
+        status_response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(token=token),
+        )
+        status = status_response.json()
+        self.assertEqual(200, status_response.status_code)
+        self.assertIs(False, status["connected"])
+        self.assertIs(False, status["trafficApiAllowed"])
+        self.assertEqual(main_module.PURETRACK_PROVIDER_ACCESS_NONE, status["userAccess"])
+        self.assertIsNone(status["accountLabel"])
+        self.assertIsNone(status["validUntilMs"])
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+            status["errorCode"],
+        )
+
+        user_id = self.user_id_for_token(token)
+        db = self.session_local()
+        try:
+            row = (
+                db.query(main_module.PureTrackProviderSession)
+                .filter(main_module.PureTrackProviderSession.user_id == user_id)
+                .one()
+            )
+            self.assertIsNone(row.provider_session_hash)
+            self.assertIsNone(row.provider_session_ciphertext)
+            self.assertEqual(main_module.PURETRACK_PROVIDER_ACCESS_NONE, row.user_access)
+            self.assertIsNone(row.account_label)
+            self.assertEqual(
+                main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+                row.error_code,
+            )
+        finally:
+            db.close()
+
+        retry_response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(token=token),
+        )
+
+        self.assertEqual(409, retry_response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+            retry_response.json()["code"],
+        )
+        self.assertEqual(1, len(self.traffic_client.calls))
+
+    def test_traffic_provider_403_marks_provider_access_denied_and_stops_retry(self):
+        token = "traffic-provider-access-denied"
+        self.add_static_bearer(token, token)
+        self.upsert_entitlement_snapshot(token=token, tier="PRO")
+        self.upsert_provider_session(
+            token=token,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+        )
+        self.traffic_client.result = (
+            main_module.puretrack_traffic_provider_failure_for_http_status(403)
+        )
+
+        response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(token=token),
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+            response.json()["code"],
+        )
+        self.assertEqual(1, len(self.traffic_client.calls))
+
+        status_response = self.client.get(
+            "/api/v1/puretrack/status",
+            headers=self.headers(token=token),
+        )
+        status = status_response.json()
+        self.assertEqual(200, status_response.status_code)
+        self.assertIs(True, status["connected"])
+        self.assertIs(False, status["trafficApiAllowed"])
+        self.assertEqual(main_module.PURETRACK_PROVIDER_ACCESS_FREE, status["userAccess"])
+        self.assertEqual("p***@example.com", status["accountLabel"])
+        self.assertIsNone(status["validUntilMs"])
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+            status["errorCode"],
+        )
+
+        user_id = self.user_id_for_token(token)
+        db = self.session_local()
+        try:
+            row = (
+                db.query(main_module.PureTrackProviderSession)
+                .filter(main_module.PureTrackProviderSession.user_id == user_id)
+                .one()
+            )
+            self.assertIsNotNone(row.provider_session_hash)
+            self.assertIsNotNone(row.provider_session_ciphertext)
+            self.assertEqual(main_module.PURETRACK_PROVIDER_ACCESS_FREE, row.user_access)
+            self.assertEqual("p***@example.com", row.account_label)
+            self.assertEqual(
+                main_module.ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+                row.error_code,
+            )
+        finally:
+            db.close()
+
+        retry_response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(token=token),
+        )
+
+        self.assertEqual(403, retry_response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_ACCESS_DENIED,
+            retry_response.json()["code"],
+        )
+        self.assertEqual(1, len(self.traffic_client.calls))
 
     def test_traffic_provider_error_envelope_mapping_matches_status_mapping(self):
         cases = {

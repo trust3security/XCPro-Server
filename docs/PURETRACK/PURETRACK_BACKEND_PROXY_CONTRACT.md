@@ -3,7 +3,8 @@
 Status: reviewed contract; status/connect/disconnect and Insert publishing
 implemented locally; P0B2A provider-session material/status gating implemented
 locally; P0B2B inbound traffic overlay route implemented locally; P0A
-persistent-provider-token contract correction recorded.
+persistent-provider-token contract correction recorded; P1B provider-rejection
+state handling implemented locally.
 Date: 2026-06-22
 
 ## Purpose
@@ -26,6 +27,10 @@ API tokens are stored encrypted on XCPro_Server and are not artificially expired
 after one hour by XCPro. They remain usable until local disconnect, missing or
 corrupt server-held material, provider rejection/revocation, or a future
 provider contract with a real token expiry.
+P1B on 2026-06-22 records provider rejection handling: provider Traffic API
+401 clears stored token material and exposes not-connected/reconnect-required
+status, while provider Traffic API 403 records PureTrack provider access denial
+without changing XCPro entitlement state.
 
 Production deployment/live-server parity remains a separate release/deployment
 phase before Android production rollout claims. Live-device testing on
@@ -52,7 +57,7 @@ Verified current anchors:
   and package validation, verified XCPro PRO access, app-key configuration,
   connected PureTrack `PREMIUM` provider state, decryptable provider session
   material, bbox validation, provider error mapping, local rate limiting,
-  normalized DTO caching, and redaction.
+  normalized DTO caching, provider-token rejection state, and redaction.
 - `app/main.py` stores `PureTrackProviderSession.provider_session_hash` only as
   redacted identity/dedupe material and stores recoverable provider session
   material only in encrypted
@@ -603,8 +608,20 @@ Provider call behavior:
   server-to-provider.
 - The backend may call the provider with POST or GET as allowed by the provider,
   but Android sees only this XCPro POST route.
-- The route does not mutate PureTrack connect/disconnect state, outbound Insert
-  queue state, LiveFollow state, map state, traffic state, or profile state.
+- If the provider Traffic API rejects the stored provider token with 401, the
+  server clears `provider_session_hash`, `provider_session_ciphertext`, and the
+  redacted account label for that XCPro account, marks `userAccess=NONE`, and
+  records `puretrack_provider_not_connected`. Later status is explicit
+  reconnect/not-connected, and later traffic requests stop before any provider
+  call until the user reconnects PureTrack.
+- If the provider Traffic API returns 403, the server records
+  `userAccess=FREE` with `puretrack_provider_access_denied`. This preserves the
+  PureTrack Pro versus XCPro PRO distinction and stops later traffic calls
+  before the provider until provider state is repaired by a later connect/status
+  update.
+- Apart from the provider rejection/access state above, the route does not
+  mutate PureTrack connect/disconnect state, outbound Insert queue state,
+  LiveFollow state, map state, traffic state, or profile state.
 
 Success response: `200 PureTrackTrafficResponse`.
 
@@ -817,9 +834,12 @@ Required error codes:
   upstream provider rejected the whole Insert batch as non-retryable.
 - `puretrack_provider_not_connected`: authenticated XCPro account has no
   connected PureTrack provider session for inbound traffic, or the stored
-  provider token was locally cleared or marked reconnect-required.
+  provider token was locally cleared or marked reconnect-required after a
+  provider Traffic API 401.
 - `puretrack_provider_access_denied`: connected provider state is not
-  `PREMIUM`, so PureTrack Pro provider access is missing for inbound traffic.
+  `PREMIUM`, or the provider Traffic API returned 403, so PureTrack Pro provider
+  access is missing for inbound traffic. This is distinct from XCPro
+  `feature_access_denied`.
 - `puretrack_provider_session_unavailable`: provider state exists but the
   server lacks usable recoverable provider Bearer/session material for Traffic
   API authentication, for example because encrypted material is missing or
@@ -967,9 +987,22 @@ Recommended server phases:
     passed with `30 passed, 9 deselected`; `git diff --check -- app/main.py app/tests/test_puretrack_backend_proxy.py docs/PURETRACK/PURETRACK_BACKEND_PROXY_CONTRACT.md`
     passed; the P1A negative search for old expiry writes/assertions and raw
     secret logging returned no hits.
-12. Planned/current P1B: mark stored provider tokens reconnect-needed or
-    unusable when PureTrack rejects them during Traffic API use, then expose a
-    redacted status that Android can map to user action.
+12. Complete/current P1B on 2026-06-22: provider Traffic API 401 now clears
+    stored provider token material and marks the XCPro account not-connected /
+    reconnect-required; provider Traffic API 403 records PureTrack provider
+    access denied without changing XCPro entitlement state. Later traffic calls
+    stop before retrying known rejected provider state. Local verification:
+    `.venv\Scripts\python.exe -m pytest app\tests\test_puretrack_backend_proxy.py -k "puretrack and (traffic or provider or status or disconnect)"`
+    passed with `33 passed, 8 deselected`; `git diff --check -- app/main.py app/tests/test_puretrack_backend_proxy.py docs/PURETRACK/PURETRACK_BACKEND_PROXY_CONTRACT.md`
+    passed; the P1B negative search for raw provider secret/password/token
+    logging and raw traffic leakage returned only the expected
+    `HttpPureTrackTrafficClient.fetch` server-to-provider
+    `Authorization: Bearer {provider_session_secret}` construction, which is
+    the intended server-only upstream header and not a log, response, fixture,
+    Android exposure, or raw provider payload.
+13. Planned/current P1C: confirm disconnect policy remains local
+    XCPro_Server token/status clear only unless an explicit future decision
+    approves upstream provider logout.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the
