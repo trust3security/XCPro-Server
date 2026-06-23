@@ -110,6 +110,12 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.original_puretrack_provider_client = main_module.PURETRACK_PROVIDER_CLIENT
         self.original_puretrack_insert_client = main_module.PURETRACK_INSERT_CLIENT
         self.original_puretrack_traffic_client = main_module.PURETRACK_TRAFFIC_CLIENT
+        self.original_puretrack_traffic_evidence_enabled = (
+            main_module.PURETRACK_TRAFFIC_EVIDENCE_ENABLED
+        )
+        self.original_puretrack_traffic_evidence_sink = (
+            main_module.PURETRACK_TRAFFIC_EVIDENCE_SINK
+        )
 
         self.clock = MutableClock(datetime(2026, 6, 18, 8, 0, 0))
         self.primary_bearer = "puretrack-xcpro-bearer-1"
@@ -140,6 +146,11 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         main_module.PURETRACK_INSERT_CLIENT = self.insert_client
         self.traffic_client = FakePureTrackTrafficClient()
         main_module.PURETRACK_TRAFFIC_CLIENT = self.traffic_client
+        self.traffic_evidence_events = []
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_ENABLED = False
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_SINK = (
+            self.traffic_evidence_events.append
+        )
         main_module._puretrack_traffic_cache.clear()
         main_module._puretrack_traffic_rate_limits.clear()
         self.client = TestClient(main_module.app)
@@ -154,6 +165,12 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         main_module.PURETRACK_PROVIDER_CLIENT = self.original_puretrack_provider_client
         main_module.PURETRACK_INSERT_CLIENT = self.original_puretrack_insert_client
         main_module.PURETRACK_TRAFFIC_CLIENT = self.original_puretrack_traffic_client
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_ENABLED = (
+            self.original_puretrack_traffic_evidence_enabled
+        )
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_SINK = (
+            self.original_puretrack_traffic_evidence_sink
+        )
         main_module._puretrack_traffic_cache.clear()
         main_module._puretrack_traffic_rate_limits.clear()
         main_module.Base.metadata.drop_all(bind=self.engine)
@@ -233,6 +250,13 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertEqual(b"provider-session-secret", configured.provider_session_encryption_secret)
         self.assertEqual("https://puretrack.test", configured.api_base_url)
         self.assertEqual(3.5, configured.timeout_seconds)
+        self.assertIs(False, main_module.load_puretrack_traffic_evidence_enabled({}))
+        self.assertIs(
+            True,
+            main_module.load_puretrack_traffic_evidence_enabled({
+                "XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED": "true",
+            }),
+        )
 
     def test_status_requires_valid_xcpro_bearer_and_package(self):
         missing_auth = self.client.get(
@@ -1282,6 +1306,115 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertEqual(body["freshUntilMs"], cached_body["freshUntilMs"])
         self.assertEqual(1, len(self.traffic_client.calls))
 
+    def test_traffic_cadence_evidence_is_disabled_by_default(self):
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.upsert_provider_session(
+            token=None,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+        )
+
+        response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([], self.traffic_evidence_events)
+
+    def test_traffic_cadence_evidence_emits_sanitized_success_and_cache_events(self):
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_ENABLED = True
+        self.upsert_entitlement_snapshot(tier="PRO")
+        self.upsert_provider_session(
+            token=None,
+            user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+        )
+        user_id = self.user_id_for_token()
+
+        first_response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(),
+        )
+        second_response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(200, first_response.status_code)
+        self.assertEqual(200, second_response.status_code)
+        self.assertEqual(2, len(self.traffic_evidence_events))
+        first_event, second_event = self.traffic_evidence_events
+        self.assertEqual(main_module.PURETRACK_TRAFFIC_EVIDENCE_EVENT_NAME, first_event["event"])
+        self.assertEqual("/api/v1/puretrack/traffic", first_event["route"])
+        self.assertEqual("POST", first_event["method"])
+        self.assertEqual(200, first_event["statusCode"])
+        self.assertEqual(first_response.json()["result"], first_event["outcome"])
+        self.assertEqual(main_module.PURETRACK_TRAFFIC_CACHE_MISS, first_event["cacheStatus"])
+        self.assertEqual(main_module.XCPRO_RELEASE_PACKAGE_NAME, first_event["packageName"])
+        self.assertEqual(
+            main_module.puretrack_traffic_cadence_user_hash(user_id),
+            first_event["userHash"],
+        )
+        self.assertIn("serverReceivedAtMs", first_event)
+        self.assertIn("serverCompletedAtMs", first_event)
+        self.assertEqual(main_module.PURETRACK_TRAFFIC_CACHE_HIT, second_event["cacheStatus"])
+        self.assertEqual(1, len(self.traffic_client.calls))
+
+        serialized = json.dumps(self.traffic_evidence_events, sort_keys=True)
+        for forbidden in (
+            "server-side-app-key",
+            "session-None",
+            self.primary_bearer,
+            "pilot@example.com",
+            user_id,
+            "map-refresh-20260619-0001",
+            "-37.49503",
+            "176.54678",
+            "ZK-MZE",
+            "ANZ118M",
+            "KY-ZK-MZE",
+            "providerSessionSecret",
+            "https://puretrack.example",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_traffic_cadence_evidence_emits_sanitized_error_without_provider_call(self):
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_ENABLED = True
+        self.upsert_entitlement_snapshot(tier="PRO")
+
+        response = self.client.post(
+            "/api/v1/puretrack/traffic",
+            json=self.traffic_payload(),
+            headers=self.headers(),
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual(
+            main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED,
+            response.json()["code"],
+        )
+        self.assertEqual([], self.traffic_client.calls)
+        self.assertEqual(1, len(self.traffic_evidence_events))
+        event = self.traffic_evidence_events[0]
+        self.assertEqual(409, event["statusCode"])
+        self.assertEqual(main_module.ErrorCode.PURETRACK_PROVIDER_NOT_CONNECTED, event["outcome"])
+        self.assertNotIn("cacheStatus", event)
+        self.assertEqual(main_module.XCPRO_RELEASE_PACKAGE_NAME, event["packageName"])
+
+        serialized = json.dumps(event, sort_keys=True)
+        for forbidden in (
+            "server-side-app-key",
+            self.primary_bearer,
+            "pilot@example.com",
+            "map-refresh-20260619-0001",
+            "-37.49503",
+            "176.54678",
+            "providerSessionSecret",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
     def test_traffic_route_denies_missing_preconditions_before_provider_call(self):
         original_config = main_module.PURETRACK_RUNTIME_CONFIG
         cases = [
@@ -1600,6 +1733,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                 self.assertEqual(expected_code, result.error_code)
 
     def test_traffic_route_rate_limits_with_retry_after(self):
+        main_module.PURETRACK_TRAFFIC_EVIDENCE_ENABLED = True
         self.upsert_entitlement_snapshot(tier="PRO")
         self.upsert_provider_session(
             token=None,
@@ -1626,6 +1760,26 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             limited_response.json()["code"],
         )
         self.assertEqual("5", limited_response.headers.get("Retry-After"))
+        self.assertEqual(
+            main_module.PURETRACK_TRAFFIC_RATE_LIMIT_BURST + 1,
+            len(self.traffic_evidence_events),
+        )
+        limited_event = self.traffic_evidence_events[-1]
+        self.assertEqual(429, limited_event["statusCode"])
+        self.assertEqual(main_module.ErrorCode.PURETRACK_RATE_LIMITED, limited_event["outcome"])
+        self.assertEqual(5000, limited_event["retryAfterMs"])
+
+        serialized = json.dumps(limited_event, sort_keys=True)
+        for forbidden in (
+            "server-side-app-key",
+            self.primary_bearer,
+            "pilot@example.com",
+            "map-refresh-20260619-0001",
+            "-37.49503",
+            "176.54678",
+            "providerSessionSecret",
+        ):
+            self.assertNotIn(forbidden, serialized)
 
     def headers(
         self,

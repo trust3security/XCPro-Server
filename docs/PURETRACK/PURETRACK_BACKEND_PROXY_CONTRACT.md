@@ -757,6 +757,30 @@ Privacy and redaction:
 - Parser, mapper, error, audit, support, and test-fixture code must prove that
   excluded fields cannot reach Android-visible responses or logs.
 
+Sanitized route-cadence evidence:
+
+- `XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED` is an optional, disabled-by-default
+  operational evidence flag for short PureTrack inbound overlay cadence windows.
+- When enabled, `POST /api/v1/puretrack/traffic` may emit a sanitized
+  `puretrack_traffic_cadence` event.
+- Allowed event fields are limited to:
+  - event marker;
+  - route path `/api/v1/puretrack/traffic`;
+  - method `POST`;
+  - server received/completed epoch milliseconds;
+  - HTTP status code and outcome/error code;
+  - cache status, if available;
+  - retry-after milliseconds, if available;
+  - redacted stable XCPro user hash;
+  - validated package name.
+- The event must never include Android bearer tokens, app keys, Insert keys,
+  provider session material, passwords, request bodies, response bodies, bbox
+  coordinates, provider URLs, raw compact rows, target labels, registrations,
+  callsigns, model names, raw target ids, `tracker_uid` values, exact private
+  locations, account emails, or provider account data.
+- The evidence flag must not change route semantics, cache behavior, rate-limit
+  behavior, provider requests, response DTOs, or Android-visible state.
+
 Cache, freshness, and rate limits:
 
 - Initial server cache is optional and may be in-memory only. If implemented,
@@ -1009,6 +1033,16 @@ Recommended server phases:
     passed with `4 passed, 37 deselected`; `git diff --check -- app/main.py app/tests/test_puretrack_backend_proxy.py docs/PURETRACK/PURETRACK_BACKEND_PROXY_CONTRACT.md`
     passed; the targeted disconnect-policy search for logout/raw leakage hit
     only policy/documentation mentions and no code/test upstream logout call.
+14. Complete/current P5A-R1 on 2026-06-23: added disabled-by-default sanitized
+    `puretrack_traffic_cadence` evidence for the traffic route, projected
+    `XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED` through local compose config,
+    and documented the short live evidence window. Local verification:
+    `.venv\Scripts\python.exe -m pytest app\tests\test_puretrack_backend_proxy.py -k "puretrack and (traffic or evidence or redaction)"`
+    passed with `23 passed, 21 deselected`; `git diff --check -- .env.example DEPLOY.md app/main.py app/tests/test_puretrack_backend_proxy.py docker-compose.yml docs/PURETRACK/PURETRACK_BACKEND_PROXY_CONTRACT.md`
+    passed; the required evidence/redaction search returned expected config,
+    policy, fixture, existing route/parser, and forbidden-field assertion hits
+    only, with no emitted evidence containing credentials, bbox values, raw
+    compact rows, provider URLs, target identity, or request/response payloads.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the

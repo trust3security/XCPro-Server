@@ -11,6 +11,7 @@ from urllib.parse import quote
 import uuid
 import os
 import json
+import logging
 import random
 import string
 import secrets
@@ -61,6 +62,7 @@ except ImportError:
     PYDANTIC_V2 = False
 
 app = FastAPI()
+logger = logging.getLogger("xcpro.puretrack.traffic")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/xcpro")
 STALE_AFTER_SECONDS = 120
@@ -149,6 +151,8 @@ PURETRACK_TRAFFIC_RESULT_PARTIAL = "PARTIAL"
 PURETRACK_TRAFFIC_CACHE_MISS = "MISS"
 PURETRACK_TRAFFIC_CACHE_HIT = "HIT"
 PURETRACK_TRAFFIC_CACHE_BYPASS = "BYPASS"
+PURETRACK_TRAFFIC_ROUTE_PATH = "/api/v1/puretrack/traffic"
+PURETRACK_TRAFFIC_EVIDENCE_EVENT_NAME = "puretrack_traffic_cadence"
 PURETRACK_TRAFFIC_DEFAULT_CATEGORY = "air"
 PURETRACK_TRAFFIC_DEFAULT_MAX_AGE_SECONDS = 300
 PURETRACK_TRAFFIC_MIN_MAX_AGE_SECONDS = 30
@@ -1047,6 +1051,17 @@ def load_puretrack_runtime_config(
     )
 
 
+def load_puretrack_traffic_evidence_enabled(
+    env: Optional[dict[str, str]] = None
+) -> bool:
+    resolved_env = os.environ if env is None else env
+    return parse_boolean_env(
+        "XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED",
+        resolved_env.get("XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED"),
+        default=False,
+    )
+
+
 def collect_private_follow_runtime_safety_errors(
     config: PrivateFollowRuntimeConfig
 ) -> list[str]:
@@ -1159,6 +1174,7 @@ PRIVATE_FOLLOW_BEARER_TTL_SECONDS = PRIVATE_FOLLOW_RUNTIME_CONFIG.private_follow
 GOOGLE_PLAY_RUNTIME_CONFIG = load_google_play_runtime_config()
 FCM_RUNTIME_CONFIG = load_fcm_runtime_config()
 PURETRACK_RUNTIME_CONFIG = load_puretrack_runtime_config()
+PURETRACK_TRAFFIC_EVIDENCE_ENABLED = load_puretrack_traffic_evidence_enabled()
 GOOGLE_PLAY_RTDN_INGEST_TOKEN = GOOGLE_PLAY_RUNTIME_CONFIG.rtdn_test_ingest_token
 GOOGLE_PLAY_RTDN_ALLOW_TEST_HEADER_AUTH = (
     GOOGLE_PLAY_RUNTIME_CONFIG.allow_test_rtdn_header_auth
@@ -4557,6 +4573,71 @@ def puretrack_audit_id() -> str:
 def puretrack_traffic_audit_id() -> str:
     suffix = "".join(secrets.choice(string.ascii_lowercase) for _ in range(12))
     return f"pt_traffic_{suffix}"
+
+
+def puretrack_traffic_cadence_user_hash(user_id: str) -> str:
+    return hash_token(user_id)[:16]
+
+
+def puretrack_traffic_retry_after_header_ms(
+    headers: Optional[Mapping[str, str]],
+) -> Optional[int]:
+    if headers is None:
+        return None
+    raw_value = headers.get("Retry-After")
+    if raw_value is None:
+        return None
+    try:
+        seconds = float(str(raw_value).strip())
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return int(math.ceil(seconds * 1000.0))
+
+
+def build_puretrack_traffic_cadence_evidence_event(
+    *,
+    started_at_ms: int,
+    completed_at_ms: int,
+    current_user: CurrentUserRecord,
+    package_name: str,
+    status_code: int,
+    outcome: str,
+    cache_status: Optional[str] = None,
+    retry_after_ms: Optional[int] = None,
+) -> dict[str, Any]:
+    event = {
+        "event": PURETRACK_TRAFFIC_EVIDENCE_EVENT_NAME,
+        "route": PURETRACK_TRAFFIC_ROUTE_PATH,
+        "method": "POST",
+        "serverReceivedAtMs": started_at_ms,
+        "serverCompletedAtMs": completed_at_ms,
+        "statusCode": status_code,
+        "outcome": outcome,
+        "cacheStatus": cache_status,
+        "retryAfterMs": retry_after_ms,
+        "userHash": puretrack_traffic_cadence_user_hash(current_user.user.id),
+        "packageName": package_name,
+    }
+    return {key: value for key, value in event.items() if value is not None}
+
+
+def log_puretrack_traffic_evidence_event(event: dict[str, Any]) -> None:
+    logger.info(
+        "%s %s",
+        PURETRACK_TRAFFIC_EVIDENCE_EVENT_NAME,
+        json.dumps(event, sort_keys=True, separators=(",", ":")),
+    )
+
+
+PURETRACK_TRAFFIC_EVIDENCE_SINK = log_puretrack_traffic_evidence_event
+
+
+def emit_puretrack_traffic_cadence_evidence(event: dict[str, Any]) -> None:
+    if not PURETRACK_TRAFFIC_EVIDENCE_ENABLED:
+        return
+    PURETRACK_TRAFFIC_EVIDENCE_SINK(event)
 
 
 def redact_puretrack_account_label(email: str) -> str:
@@ -10092,16 +10173,57 @@ def get_puretrack_traffic(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     package_name: Optional[str] = Header(default=None, alias="X-XCPro-Package-Name")
 ):
+    started_at_ms = to_epoch_ms(utcnow())
     db = SessionLocal()
     try:
         current_user = ensure_current_user_record(db, authorization)
         validated_package_name = validate_entitlement_package_name(package_name)
-        return fetch_puretrack_traffic(
-            db,
-            current_user,
-            validated_package_name,
-            request,
+        try:
+            response = fetch_puretrack_traffic(
+                db,
+                current_user,
+                validated_package_name,
+                request,
+            )
+        except ApiHTTPException as exc:
+            emit_puretrack_traffic_cadence_evidence(
+                build_puretrack_traffic_cadence_evidence_event(
+                    started_at_ms=started_at_ms,
+                    completed_at_ms=to_epoch_ms(utcnow()),
+                    current_user=current_user,
+                    package_name=validated_package_name,
+                    status_code=exc.status_code,
+                    outcome=exc.code,
+                    retry_after_ms=puretrack_traffic_retry_after_header_ms(exc.headers),
+                )
+            )
+            raise
+        except Exception:
+            emit_puretrack_traffic_cadence_evidence(
+                build_puretrack_traffic_cadence_evidence_event(
+                    started_at_ms=started_at_ms,
+                    completed_at_ms=to_epoch_ms(utcnow()),
+                    current_user=current_user,
+                    package_name=validated_package_name,
+                    status_code=500,
+                    outcome="unexpected_error",
+                )
+            )
+            raise
+
+        emit_puretrack_traffic_cadence_evidence(
+            build_puretrack_traffic_cadence_evidence_event(
+                started_at_ms=started_at_ms,
+                completed_at_ms=to_epoch_ms(utcnow()),
+                current_user=current_user,
+                package_name=validated_package_name,
+                status_code=200,
+                outcome=response.result,
+                cache_status=response.cacheStatus,
+                retry_after_ms=response.retryAfterMs,
+            )
         )
+        return response
     finally:
         db.close()
 

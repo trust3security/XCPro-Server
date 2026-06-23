@@ -82,6 +82,7 @@ XCPRO_PURETRACK_INSERT_KEY=your-puretrack-insert-key-if-publishing
 XCPRO_PURETRACK_PROVIDER_SESSION_ENCRYPTION_SECRET=generated-secret
 XCPRO_PURETRACK_API_BASE_URL=https://puretrack.io
 XCPRO_PURETRACK_TIMEOUT_SECONDS=10
+XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED=false
 ```
 
 Do not commit the real production values.
@@ -493,11 +494,37 @@ Expected:
   timeout report `SET` before live PureTrack login/connect validation
 - PureTrack Insert key reports `SET` before outbound Insert publishing
   validation
+- PureTrack traffic cadence evidence remains `false` except during an explicit,
+  short, sanitized PureTrack evidence window
 - notification timer status and journal output remain aggregate-only
 
 Do not run `deliver_notifications.py --confirm-send` as a generic deploy smoke
 check. Use it only when intentionally delivering queued notification outbox
 events.
+
+### PureTrack traffic cadence evidence window
+
+`XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED` is disabled by default. Enable it
+only for a short, explicit PureTrack inbound-overlay evidence window, then
+disable it again after collecting route-level timing proof.
+
+Allowed evidence fields are limited to the sanitized
+`puretrack_traffic_cadence` event marker, route path, server timestamps, HTTP
+status/outcome, cache status, retry-after milliseconds, redacted user hash, and
+validated package name. Do not collect or commit raw provider rows, PureTrack
+provider URLs, app keys, bearer tokens, provider session material, passwords,
+request or response bodies, bbox coordinates, target labels, registrations,
+callsigns, models, `tracker_uid` values, or exact private locations.
+
+Safe verification flow:
+
+1. Set `XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED=true` in `/opt/xcpro/.env`.
+2. Recreate only the API container through the normal compose path.
+3. Run the phone smoke and capture only sanitized
+   `puretrack_traffic_cadence` lines.
+4. Set `XCPRO_PURETRACK_TRAFFIC_EVIDENCE_ENABLED=false` and recreate the API
+   container again.
+5. Scrub and review any evidence before copying it into repo docs.
 
 ## Recommended next improvements
 
