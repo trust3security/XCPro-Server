@@ -920,7 +920,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         for status in ("ACTIVE", "GRACE_PERIOD", "CANCELED_BUT_ACTIVE"):
             with self.subTest(status=status):
                 purchase_token = f"{status.lower()}-purchase-token"
-                expiry_time_ms = 1777777777000
+                expiry_time_ms = 1780000000000
                 self.verifier.set_result(
                     purchase_token,
                     self.verification_result(
@@ -949,6 +949,84 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
                 self.assertEqual("ANNUAL", entitlement["billingPeriod"])
                 self.assertEqual(status, entitlement["status"])
                 self.assertEqual(expiry_time_ms, entitlement["validUntilMs"])
+
+    def test_stale_paid_continuity_denies_effective_read_and_gate_without_mutation_then_restore_repairs(self):
+        purchase_token = "stale-paid-continuity-token"
+        now_ms = main_module.to_epoch_ms(self.clock.utcnow())
+        future_expiry_ms = now_ms + 86_400_000
+        stale_expiry_ms = now_ms - 1
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", expiry_time_ms=future_expiry_ms),
+        )
+        active = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, active.status_code)
+        self.assertEqual("ACTIVE", active.json()["entitlement"]["status"])
+
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            snapshot.expiry_time_ms = stale_expiry_ms
+            snapshot.valid_until_ms = stale_expiry_ms
+            db.commit()
+        finally:
+            db.close()
+
+        readback = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, readback.status_code)
+        entitlement = readback.json()["entitlement"]
+        self.assertEqual("PRO", entitlement["tier"])
+        self.assertEqual("MONTHLY", entitlement["billingPeriod"])
+        self.assertEqual("EXPIRED", entitlement["status"])
+        self.assertEqual("GOOGLE_PLAY", entitlement["source"])
+        self.assertEqual("VERIFIED", entitlement["verificationState"])
+        self.assertEqual("xcpro_pro", entitlement["productId"])
+        self.assertEqual("monthly", entitlement["basePlanId"])
+        self.assertEqual(stale_expiry_ms, entitlement["expiryTimeMs"])
+        self.assertIsNone(entitlement["validUntilMs"])
+
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            self.assertFalse(
+                main_module.account_has_verified_xcpro_pro_entitlement(
+                    db,
+                    snapshot.user_id,
+                )
+            )
+            self.assertEqual("ACTIVE", snapshot.status)
+            self.assertEqual(stale_expiry_ms, snapshot.valid_until_ms)
+            self.assertEqual(stale_expiry_ms, snapshot.expiry_time_ms)
+        finally:
+            db.close()
+
+        repaired_expiry_ms = now_ms + 172_800_000
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", expiry_time_ms=repaired_expiry_ms),
+        )
+        repaired = self.client.post(
+            "/api/v1/subscriptions/googleplay/restore",
+            json=self.restore_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+
+        self.assertEqual(200, repaired.status_code)
+        self.assertEqual("ACCEPTED_VERIFIED", repaired.json()["result"])
+        repaired_entitlement = repaired.json()["entitlement"]
+        self.assertEqual("ACTIVE", repaired_entitlement["status"])
+        self.assertEqual(repaired_expiry_ms, repaired_entitlement["validUntilMs"])
+        snapshot = self.single_row(main_module.AccountEntitlementSnapshot)
+        self.assertEqual("ACTIVE", snapshot.status)
+        self.assertEqual(repaired_expiry_ms, snapshot.valid_until_ms)
 
     def test_revoked_and_expired_remove_paid_access(self):
         for status in ("EXPIRED", "REVOKED"):
@@ -2209,7 +2287,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         package_name: str = main_module.XCPRO_RELEASE_PACKAGE_NAME,
         product_id: str = "xcpro_pro",
         base_plan_id: str = "monthly",
-        expiry_time_ms: int | None = 1777777777000,
+        expiry_time_ms: int | None = 1780000000000,
         auto_renewing: bool | None = True,
         acknowledgement_required: bool = False,
         linked_purchase_token: str | None = None,

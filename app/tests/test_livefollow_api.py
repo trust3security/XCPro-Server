@@ -874,6 +874,46 @@ class LiveFollowApiTest(unittest.TestCase):
                 )
                 self.assert_response_has_no_purchase_token(response.json())
 
+    def test_get_me_relationship_limits_use_free_caps_when_paid_valid_until_is_stale(self):
+        now_ms = main_module.to_epoch_ms(self.clock.utcnow())
+        cases = [
+            ("stale", now_ms, 1),
+            ("future", now_ms + 86_400_000, 100),
+        ]
+        for name, valid_until_ms, expected_cap in cases:
+            with self.subTest(name=name):
+                token = self.add_static_bearer_token(
+                    f"paid-valid-window-{name}",
+                    f"paid-valid-window-{name}",
+                    f"Paid Valid Window {name}"
+                )
+                self.upsert_entitlement_snapshot(
+                    token=token,
+                    tier="PRO",
+                    billing_period="MONTHLY",
+                    status="ACTIVE",
+                    verification_state="VERIFIED",
+                    product_id="xcpro_pro",
+                    base_plan_id="monthly",
+                    expiry_time_ms=valid_until_ms,
+                    valid_until_ms=valid_until_ms,
+                )
+
+                response = self.client.get(
+                    "/api/v2/me",
+                    headers=self.bearer_headers(token)
+                )
+
+                self.assertEqual(200, response.status_code)
+                self.assertEqual(
+                    {
+                        "following_count": 0,
+                        "max_following": expected_cap,
+                        "status": "under_limit",
+                    },
+                    response.json()["relationship_limits"]
+                )
+
     def test_get_me_relationship_limits_report_at_and_over_limit_for_existing_edges(self):
         self.complete_profile(
             token=self.primary_bearer_token,
@@ -1063,7 +1103,7 @@ class LiveFollowApiTest(unittest.TestCase):
         user_id = self.user_id_for_token()
         now = self.clock.utcnow()
         now_ms = main_module.to_epoch_ms(now)
-        valid_until_ms = now_ms + main_module.PURETRACK_PROVIDER_STATUS_CACHE_MS
+        valid_until_ms = now_ms + 86_400_000
         provider_secret = "puretrack-provider-session"
         db = self.session_local()
         try:
@@ -1103,7 +1143,7 @@ class LiveFollowApiTest(unittest.TestCase):
                 "insertApiConfigured": True,
                 "userAccess": "PRO",
                 "verifiedAtMs": now_ms,
-                "validUntilMs": valid_until_ms,
+                "validUntilMs": None,
                 "errorCode": None,
             },
             puretrack
@@ -1261,6 +1301,53 @@ class LiveFollowApiTest(unittest.TestCase):
                     main_module.PAID_CONTINUITY_HARD_REFRESH_AFTER_MS,
                     entitlement["hardRefreshAfterMs"]
                 )
+
+    def test_subscription_entitlement_read_projects_stale_paid_continuity_as_expired_without_mutating_context(self):
+        now_ms = main_module.to_epoch_ms(self.clock.utcnow())
+        stale_expiry_ms = now_ms - 1
+        self.upsert_entitlement_snapshot(
+            tier="SOARING",
+            billing_period="MONTHLY",
+            status="ACTIVE",
+            verification_state="VERIFIED",
+            product_id="xcpro_soaring",
+            base_plan_id="monthly",
+            valid_until_ms=stale_expiry_ms,
+            expiry_time_ms=stale_expiry_ms,
+            auto_renewing=True,
+        )
+
+        response = self.client.get(
+            "/api/v1/subscriptions/entitlements",
+            headers=self.entitlement_headers()
+        )
+
+        self.assertEqual(200, response.status_code)
+        entitlement = response.json()["entitlement"]
+        self.assertEqual("SOARING", entitlement["tier"])
+        self.assertEqual("MONTHLY", entitlement["billingPeriod"])
+        self.assertEqual("EXPIRED", entitlement["status"])
+        self.assertEqual("GOOGLE_PLAY", entitlement["source"])
+        self.assertEqual("VERIFIED", entitlement["verificationState"])
+        self.assertEqual("xcpro_soaring", entitlement["productId"])
+        self.assertEqual("monthly", entitlement["basePlanId"])
+        self.assertEqual(stale_expiry_ms, entitlement["expiryTimeMs"])
+        self.assertIsNone(entitlement["validUntilMs"])
+        self.assertEqual(
+            main_module.DENIED_ENTITLEMENT_STALE_AFTER_MS,
+            entitlement["staleAfterMs"]
+        )
+        self.assertEqual(
+            main_module.DENIED_ENTITLEMENT_HARD_REFRESH_AFTER_MS,
+            entitlement["hardRefreshAfterMs"]
+        )
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            self.assertEqual("ACTIVE", snapshot.status)
+            self.assertEqual(stale_expiry_ms, snapshot.valid_until_ms)
+        finally:
+            db.close()
 
     def test_subscription_entitlement_read_denied_lifecycle_states_do_not_return_valid_until(self):
         for status in ("PENDING", "ON_HOLD", "PAUSED", "SUSPENDED", "EXPIRED", "REVOKED"):

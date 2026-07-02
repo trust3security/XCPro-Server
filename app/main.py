@@ -4478,12 +4478,43 @@ def require_stored_entitlement_contract(snapshot: AccountEntitlementSnapshot) ->
     }
 
 
+def stored_paid_continuity_is_current(
+    snapshot: AccountEntitlementSnapshot,
+    values: dict[str, str],
+    now_ms: int,
+) -> bool:
+    if values["status"] not in PAID_CONTINUITY_STATUSES:
+        return False
+    if snapshot.valid_until_ms is None or snapshot.valid_until_ms <= now_ms:
+        return False
+    if snapshot.expiry_time_ms is not None and snapshot.expiry_time_ms <= now_ms:
+        return False
+    return True
+
+
+def effective_stored_entitlement_values(
+    snapshot: AccountEntitlementSnapshot,
+    now_ms: int,
+) -> dict[str, str]:
+    values = require_stored_entitlement_contract(snapshot)
+    if (
+        values["status"] in PAID_CONTINUITY_STATUSES
+        and not stored_paid_continuity_is_current(snapshot, values, now_ms)
+    ):
+        return {
+            **values,
+            "status": "EXPIRED",
+        }
+    return values
+
+
 def build_stored_entitlement_response(
     db,
     current_user: CurrentUserRecord,
-    snapshot: AccountEntitlementSnapshot
+    snapshot: AccountEntitlementSnapshot,
+    now_ms: int,
 ) -> dict[str, Any]:
-    values = require_stored_entitlement_contract(snapshot)
+    values = effective_stored_entitlement_values(snapshot, now_ms)
     is_paid_continuity = values["status"] in PAID_CONTINUITY_STATUSES
     return {
         "entitlement": {
@@ -4538,7 +4569,8 @@ def build_entitlement_response(db, current_user: CurrentUserRecord) -> dict[str,
     )
     if snapshot is None:
         return build_canonical_free_entitlement_response(db, current_user)
-    return build_stored_entitlement_response(db, current_user, snapshot)
+    now_ms = to_epoch_ms(utcnow())
+    return build_stored_entitlement_response(db, current_user, snapshot, now_ms)
 
 
 def validate_puretrack_connect_request(request: PureTrackConnectRequest) -> tuple[str, str]:
@@ -4690,6 +4722,7 @@ def puretrack_provider_session_material_available(
 
 
 def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
+    now_ms = to_epoch_ms(utcnow())
     snapshot = (
         db.query(AccountEntitlementSnapshot)
         .filter(AccountEntitlementSnapshot.user_id == user_id)
@@ -4705,8 +4738,8 @@ def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
         raise
     return (
         values["tier"] == "PRO"
-        and values["status"] in PAID_CONTINUITY_STATUSES
         and values["verificationState"] == "VERIFIED"
+        and stored_paid_continuity_is_current(snapshot, values, now_ms)
     )
 
 
@@ -5968,6 +6001,7 @@ def resolve_effective_livefollow_following_limit(
     db,
     user_id: str
 ) -> LiveFollowFollowingLimit:
+    now_ms = to_epoch_ms(utcnow())
     snapshot = (
         db.query(AccountEntitlementSnapshot)
         .filter(AccountEntitlementSnapshot.user_id == user_id)
@@ -5986,8 +6020,8 @@ def resolve_effective_livefollow_following_limit(
     tier = values["tier"]
     if (
         tier != "FREE"
-        and values["status"] in PAID_CONTINUITY_STATUSES
         and values["verificationState"] == "VERIFIED"
+        and stored_paid_continuity_is_current(snapshot, values, now_ms)
     ):
         return LiveFollowFollowingLimit(
             effective_tier=tier,

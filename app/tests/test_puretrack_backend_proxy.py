@@ -462,6 +462,46 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                 self.assertEqual(200, response.status_code)
                 self.assertIs(expected_allowed, response.json()["trafficApiAllowed"])
 
+    def test_trafficApiAllowed_and_traffic_feature_access_denied_use_stale_xcpro_valid_until_guard(self):
+        now_ms = self.now_ms()
+        cases = (
+            ("stale", now_ms - 1, False, 403),
+            ("future", now_ms + 86_400_000, True, 200),
+        )
+        for name, valid_until_ms, expected_allowed, expected_traffic_status in cases:
+            with self.subTest(name=name):
+                token = f"puretrack-stale-valid-until-{name}"
+                self.add_static_bearer(token, token)
+                self.upsert_entitlement_snapshot(
+                    token=token,
+                    tier="PRO",
+                    expiry_time_ms=valid_until_ms,
+                    valid_until_ms=valid_until_ms,
+                )
+                self.upsert_provider_session(
+                    token=token,
+                    user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+                )
+
+                status = self.client.get(
+                    "/api/v1/puretrack/status",
+                    headers=self.headers(token=token),
+                )
+                traffic = self.client.post(
+                    "/api/v1/puretrack/traffic",
+                    json=self.traffic_payload(),
+                    headers=self.headers(token=token),
+                )
+
+                self.assertEqual(200, status.status_code)
+                self.assertIs(expected_allowed, status.json()["trafficApiAllowed"])
+                self.assertEqual(expected_traffic_status, traffic.status_code)
+                if expected_traffic_status == 403:
+                    self.assertEqual(
+                        main_module.ErrorCode.FEATURE_ACCESS_DENIED,
+                        traffic.json()["code"],
+                    )
+
     def test_hash_only_provider_session_fails_closed_for_traffic_allowance(self):
         self.upsert_entitlement_snapshot(tier="PRO")
         self.upsert_provider_session(
@@ -1815,10 +1855,22 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self,
         token: str | None = None,
         tier: str = "PRO",
+        expiry_time_ms: int | None = None,
+        valid_until_ms: int | None = None,
     ):
         user_id = self.user_id_for_token(token)
         now = self.clock.utcnow()
         now_ms = self.now_ms()
+        resolved_expiry_time_ms = (
+            expiry_time_ms
+            if expiry_time_ms is not None
+            else now_ms + 86_400_000
+        )
+        resolved_valid_until_ms = (
+            valid_until_ms
+            if valid_until_ms is not None
+            else resolved_expiry_time_ms
+        )
         db = self.session_local()
         try:
             db.merge(
@@ -1831,12 +1883,12 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                     verification_state="VERIFIED",
                     product_id=main_module.PRODUCT_ID_BY_TIER[tier],
                     base_plan_id=main_module.BASE_PLAN_BY_PERIOD["MONTHLY"],
-                    expiry_time_ms=now_ms + 86_400_000,
+                    expiry_time_ms=resolved_expiry_time_ms,
                     auto_renewing=True,
                     will_lose_access_at_ms=None,
                     verified_at_ms=now_ms,
                     fetched_at_ms=now_ms,
-                    valid_until_ms=now_ms + 86_400_000,
+                    valid_until_ms=resolved_valid_until_ms,
                     stale_after_ms=None,
                     hard_refresh_after_ms=None,
                     recovery_action="NONE",
