@@ -1948,6 +1948,13 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual(before_counts, self.billing_row_counts())
         self.assertEqual("BASIC", snapshot["entitlement"]["tier"])
         self.assertEqual("MONTHLY", snapshot["entitlement"]["billingPeriod"])
+        self.assertEqual("ACTIVE", snapshot["entitlement"]["effectiveStatus"])
+        self.assertFalse(snapshot["entitlement"]["stalePaidContinuity"])
+        self.assertFalse(snapshot["entitlement"]["effectiveTrafficAllowed"])
+        self.assertEqual(
+            1780000000000,
+            snapshot["entitlement"]["effectiveValidUntilMs"],
+        )
         self.assertEqual("xcpro_basic", snapshot["currentPurchase"]["productId"])
         self.assertEqual("monthly", snapshot["currentPurchase"]["basePlanId"])
         self.assertEqual(
@@ -1959,6 +1966,102 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertIsNone(snapshot["latestGoogleEvent"])
         self.assertIsNone(snapshot["unavailableMetadata"]["latestOrderId"])
         self.assert_plaintext_absent(snapshot, purchase_token)
+
+    def test_billing_support_snapshot_reports_stale_effective_context_without_mutation_or_raw_token(self):
+        purchase_token = "support-stale-effective-context-token"
+        purchase_token_hash = main_module.hash_purchase_token(purchase_token)
+        now_ms = main_module.to_epoch_ms(self.clock.utcnow())
+        future_expiry_ms = now_ms + 86_400_000
+        stale_expiry_ms = now_ms - 1
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", expiry_time_ms=future_expiry_ms),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        self.clock.advance(minutes=1)
+
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            snapshot.expiry_time_ms = stale_expiry_ms
+            snapshot.valid_until_ms = stale_expiry_ms
+            main_module.create_billing_audit_record(
+                db=db,
+                user_id=snapshot.user_id,
+                event_type="SUPPORT_STALE_EVIDENCE_FIXTURE",
+                purchase_token_hash=purchase_token_hash,
+                result="STALE_EFFECTIVE_CONTEXT",
+                detail={
+                    "packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+                    "productId": "xcpro_pro",
+                    "basePlanId": "monthly",
+                    "subscriptionStatus": "ACTIVE",
+                    "purchaseToken": purchase_token,
+                },
+            )
+            db.commit()
+        finally:
+            db.close()
+        before_counts = self.support_snapshot_row_counts()
+        verifier_calls_before = list(self.verifier.calls)
+
+        db = self.session_local()
+        try:
+            support_snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.support_snapshot_row_counts())
+        self.assertEqual(verifier_calls_before, self.verifier.calls)
+        entitlement = support_snapshot["entitlement"]
+        self.assertEqual("PRO", entitlement["tier"])
+        self.assertEqual("MONTHLY", entitlement["billingPeriod"])
+        self.assertEqual("ACTIVE", entitlement["status"])
+        self.assertEqual("EXPIRED", entitlement["effectiveStatus"])
+        self.assertTrue(entitlement["stalePaidContinuity"])
+        self.assertFalse(entitlement["effectiveTrafficAllowed"])
+        self.assertEqual(stale_expiry_ms, entitlement["validUntilMs"])
+        self.assertIsNone(entitlement["effectiveValidUntilMs"])
+        self.assertEqual("xcpro_pro", entitlement["productId"])
+        self.assertEqual("monthly", entitlement["basePlanId"])
+        self.assertEqual(
+            purchase_token_hash,
+            support_snapshot["currentPurchase"]["purchaseTokenHash"],
+        )
+        self.assertEqual(
+            "STALE_EFFECTIVE_CONTEXT",
+            support_snapshot["latestAudit"]["result"],
+        )
+        self.assertEqual(
+            "xcpro_pro",
+            support_snapshot["latestAudit"]["safeDetail"]["productId"],
+        )
+        self.assertNotIn("purchaseToken", support_snapshot["latestAudit"]["safeDetail"])
+
+        db = self.session_local()
+        try:
+            stored_snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            self.assertEqual("ACTIVE", stored_snapshot.status)
+            self.assertEqual(stale_expiry_ms, stored_snapshot.valid_until_ms)
+            audit = (
+                db.query(main_module.BillingAuditRecord)
+                .filter(main_module.BillingAuditRecord.result == "STALE_EFFECTIVE_CONTEXT")
+                .one()
+            )
+            self.assertNotIn(purchase_token, audit.detail_json)
+            self.assertIn("<redacted>", audit.detail_json)
+        finally:
+            db.close()
+        self.assert_plaintext_absent(support_snapshot, purchase_token)
+        self.assert_plaintext_absent(support_snapshot, self.primary_bearer_token)
 
     def test_billing_support_snapshot_reports_superseded_linked_token_hash_only(self):
         old_token = "support-superseded-old-token"
@@ -2221,7 +2324,9 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual(200, sync.status_code)
         before_counts = self.support_snapshot_row_counts()
 
-        with self.assertRaises(support_billing_snapshot_script.SupportBillingSnapshotScriptError):
+        with self.assertRaises(
+            support_billing_snapshot_script.SupportBillingSnapshotScriptError
+        ) as raised:
             support_billing_snapshot_script.run(
                 support_billing_snapshot_script.parse_args(
                     ["--purchase-token", purchase_token]
@@ -2230,6 +2335,8 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
             )
 
         self.assertEqual(before_counts, self.support_snapshot_row_counts())
+        self.assertIn("--purchase-token is not supported", str(raised.exception))
+        self.assertNotIn(purchase_token, str(raised.exception))
 
     def package_headers(
         self,

@@ -6702,14 +6702,39 @@ def safe_billing_audit_detail(detail_json: Optional[str]) -> dict[str, Any]:
 
 
 def build_support_entitlement_snapshot(
-    snapshot: Optional[AccountEntitlementSnapshot]
+    snapshot: Optional[AccountEntitlementSnapshot],
+    now_ms: int,
 ) -> Optional[dict[str, Any]]:
     if snapshot is None:
         return None
+    try:
+        effective_values = effective_stored_entitlement_values(snapshot, now_ms)
+    except ApiHTTPException as exc:
+        if exc.code != ErrorCode.ENTITLEMENT_STATE_INVALID:
+            raise
+        effective_values = None
+    effective_status = (
+        effective_values["status"]
+        if effective_values is not None
+        else None
+    )
+    effective_paid_continuity = effective_status in PAID_CONTINUITY_STATUSES
+    stale_paid_continuity = (
+        snapshot.status in PAID_CONTINUITY_STATUSES
+        and effective_status == "EXPIRED"
+    )
     return {
         "tier": snapshot.tier,
         "billingPeriod": snapshot.billing_period,
         "status": snapshot.status,
+        "effectiveStatus": effective_status,
+        "stalePaidContinuity": stale_paid_continuity,
+        "effectiveTrafficAllowed": (
+            effective_values is not None
+            and effective_values["tier"] == "PRO"
+            and effective_values["verificationState"] == "VERIFIED"
+            and effective_paid_continuity
+        ),
         "source": snapshot.source,
         "verificationState": snapshot.verification_state,
         "productId": snapshot.product_id,
@@ -6720,6 +6745,11 @@ def build_support_entitlement_snapshot(
         "verifiedAtMs": snapshot.verified_at_ms,
         "fetchedAtMs": snapshot.fetched_at_ms,
         "validUntilMs": snapshot.valid_until_ms,
+        "effectiveValidUntilMs": (
+            snapshot.valid_until_ms
+            if effective_paid_continuity
+            else None
+        ),
         "staleAfterMs": snapshot.stale_after_ms,
         "hardRefreshAfterMs": snapshot.hard_refresh_after_ms,
         "recoveryAction": snapshot.recovery_action,
@@ -6815,6 +6845,7 @@ def select_support_current_purchase(
 
 
 def build_billing_support_snapshot(db, user_id: str) -> dict[str, Any]:
+    now_ms = to_epoch_ms(utcnow())
     user = db.query(User).filter(User.id == user_id).first()
     auth_identity = (
         db.query(AuthIdentity)
@@ -6875,7 +6906,7 @@ def build_billing_support_snapshot(db, user_id: str) -> dict[str, Any]:
                 auth_identity.provider_email_verified if auth_identity is not None else None
             ),
         },
-        "entitlement": build_support_entitlement_snapshot(entitlement),
+        "entitlement": build_support_entitlement_snapshot(entitlement, now_ms),
         "currentPurchase": build_support_purchase_snapshot(current_purchase),
         "linkedPreviousPurchase": build_support_purchase_snapshot(linked_previous_purchase),
         "latestGoogleEvent": build_support_event_snapshot(latest_event),

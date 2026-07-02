@@ -1196,7 +1196,12 @@ class FirebaseAuthExchangeEndpointTest(unittest.TestCase):
         )
         self.assertEqual(conflict_email, email_owner["authProviderEmail"])
         self.assertIs(True, email_owner["authProviderEmailVerified"])
-        self.assertEqual("SOARING", email_result["snapshot"]["entitlement"]["tier"])
+        support_entitlement = email_result["snapshot"]["entitlement"]
+        self.assertEqual("SOARING", support_entitlement["tier"])
+        self.assertEqual("ACTIVE", support_entitlement["effectiveStatus"])
+        self.assertFalse(support_entitlement["stalePaidContinuity"])
+        self.assertFalse(support_entitlement["effectiveTrafficAllowed"])
+        self.assertEqual(1777777777000, support_entitlement["effectiveValidUntilMs"])
         self.assertEqual(
             purchase_token_hash,
             email_result["snapshot"]["currentPurchase"]["purchaseTokenHash"],
