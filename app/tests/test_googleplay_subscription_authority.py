@@ -1503,6 +1503,158 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertEqual("annual", purchase.base_plan_id)
         self.assertEqual("EXPIRED", self.single_row(main_module.AccountEntitlementSnapshot).status)
 
+    def test_rtdn_verified_expired_repairs_stale_active_snapshot_with_audit_evidence(self):
+        purchase_token = "rtdn-stale-active-to-expired-token"
+        purchase_token_hash = main_module.hash_purchase_token(purchase_token)
+        now_ms = main_module.to_epoch_ms(self.clock.utcnow())
+        future_expiry_ms = now_ms + 86_400_000
+        stale_expiry_ms = now_ms - 1
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", expiry_time_ms=future_expiry_ms),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        self.assertEqual("ACTIVE", sync.json()["entitlement"]["status"])
+
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            snapshot.expiry_time_ms = stale_expiry_ms
+            snapshot.valid_until_ms = stale_expiry_ms
+            db.commit()
+        finally:
+            db.close()
+
+        self.clock.advance(minutes=1)
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="EXPIRED", expiry_time_ms=stale_expiry_ms),
+        )
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_envelope(
+                message_id="rtdn-stale-active-expired",
+                purchase_token=purchase_token,
+            ),
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("REVOKED_OR_EXPIRED", response.json()["result"])
+        self.assertFalse(response.json()["deduped"])
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            purchase = db.query(main_module.BillingGooglePurchase).one()
+            event = db.query(main_module.BillingGoogleEvent).one()
+            audit = (
+                db.query(main_module.BillingAuditRecord)
+                .filter(main_module.BillingAuditRecord.result == "REVOKED_OR_EXPIRED")
+                .one()
+            )
+
+            self.assertEqual("EXPIRED", snapshot.status)
+            self.assertIsNone(snapshot.valid_until_ms)
+            self.assertEqual(stale_expiry_ms, snapshot.expiry_time_ms)
+            self.assertEqual("EXPIRED", purchase.google_subscription_state)
+            self.assertEqual("EXPIRED", purchase.xcpro_subscription_status)
+            self.assertEqual(purchase_token_hash, purchase.purchase_token_hash)
+            self.assertEqual("REVOKED_OR_EXPIRED", event.processing_result)
+            self.assertEqual(audit.audit_id, event.audit_id)
+            self.assertEqual(purchase_token_hash, audit.purchase_token_hash)
+            audit_detail = json.loads(audit.detail_json)
+            self.assertEqual("EXPIRED", audit_detail["subscriptionStatus"])
+            self.assertEqual("xcpro_pro", audit_detail["productId"])
+            self.assertNotIn(purchase_token, audit.detail_json)
+        finally:
+            db.close()
+
+        before_counts = self.billing_row_counts()
+        db = self.session_local()
+        try:
+            support_snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual("EXPIRED", support_snapshot["entitlement"]["status"])
+        self.assertEqual("EXPIRED", support_snapshot["entitlement"]["effectiveStatus"])
+        self.assertFalse(support_snapshot["entitlement"]["stalePaidContinuity"])
+        self.assertEqual("REVOKED_OR_EXPIRED", support_snapshot["latestAudit"]["result"])
+        self.assertEqual(
+            purchase_token_hash,
+            support_snapshot["latestAudit"]["purchaseTokenHash"],
+        )
+        self.assertEqual(
+            "REVOKED_OR_EXPIRED",
+            support_snapshot["latestGoogleEvent"]["processingResult"],
+        )
+        self.assert_plaintext_absent(support_snapshot, purchase_token)
+
+    def test_rtdn_verified_active_repairs_stale_denied_snapshot_for_same_owned_token(self):
+        purchase_token = "rtdn-stale-denied-to-active-token"
+        now_ms = main_module.to_epoch_ms(self.clock.utcnow())
+        stale_expiry_ms = now_ms - 1
+        repaired_expiry_ms = now_ms + 172_800_000
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", expiry_time_ms=now_ms + 86_400_000),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(purchase_token=purchase_token),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        self.assertEqual("ACTIVE", sync.json()["entitlement"]["status"])
+
+        db = self.session_local()
+        try:
+            snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
+            purchase = db.query(main_module.BillingGooglePurchase).one()
+            snapshot.status = "EXPIRED"
+            snapshot.expiry_time_ms = stale_expiry_ms
+            snapshot.valid_until_ms = None
+            purchase.google_subscription_state = "EXPIRED"
+            purchase.xcpro_subscription_status = "EXPIRED"
+            purchase.expiry_time_ms = stale_expiry_ms
+            purchase.auto_renewing = False
+            db.commit()
+        finally:
+            db.close()
+
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(status="ACTIVE", expiry_time_ms=repaired_expiry_ms),
+        )
+        response = self.client.post(
+            "/api/v1/subscriptions/googleplay/rtdn",
+            json=self.rtdn_envelope(
+                message_id="rtdn-stale-denied-active",
+                purchase_token=purchase_token,
+            ),
+            headers=self.rtdn_headers(),
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("ACCEPTED_VERIFIED", response.json()["result"])
+        snapshot = self.single_row(main_module.AccountEntitlementSnapshot)
+        self.assertEqual("ACTIVE", snapshot.status)
+        self.assertEqual(repaired_expiry_ms, snapshot.valid_until_ms)
+        self.assertEqual(repaired_expiry_ms, snapshot.expiry_time_ms)
+        purchase = self.single_row(main_module.BillingGooglePurchase)
+        self.assertEqual("ACTIVE", purchase.google_subscription_state)
+        self.assertEqual("ACTIVE", purchase.xcpro_subscription_status)
+        self.assertEqual(repaired_expiry_ms, purchase.expiry_time_ms)
+
     def test_unknown_rtdn_without_subscription_id_records_token_not_owned(self):
         purchase_token = "rtdn-unknown-no-subscription-id-token"
 
