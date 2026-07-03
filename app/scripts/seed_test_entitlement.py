@@ -142,7 +142,8 @@ def clear_snapshot(db, user_id: str, args: argparse.Namespace) -> dict[str, Any]
     existed = snapshot is not None
     dry_run = args.dry_run
     audit_id = None
-    production_repair = is_production_runtime() and not dry_run
+    production_output = is_production_runtime()
+    production_repair = production_output and not dry_run
     if snapshot is not None and not dry_run:
         db.delete(snapshot)
         audit_id = write_production_repair_audit(
@@ -160,7 +161,7 @@ def clear_snapshot(db, user_id: str, args: argparse.Namespace) -> dict[str, Any]
         "dryRun": dry_run,
         "snapshotExisted": existed,
     }
-    result.update(public_user_summary(user_id, production_repair))
+    result.update(public_user_summary(user_id, production_output))
     if audit_id is not None:
         result["auditId"] = audit_id
     return result

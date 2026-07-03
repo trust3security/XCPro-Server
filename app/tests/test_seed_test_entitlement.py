@@ -159,6 +159,43 @@ class SeedTestEntitlementScriptTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_production_clear_dry_run_redacts_user_and_does_not_audit(self):
+        user_id = self.create_user(email="pilot@example.com")
+        seed_test_entitlement.run(
+            seed_test_entitlement.parse_args(
+                [
+                    "--email",
+                    "pilot@example.com",
+                    "--confirm-manual-test",
+                ]
+            )
+        )
+        self.set_runtime_env(main_module.RUNTIME_ENV_PROD)
+
+        result = seed_test_entitlement.run(
+            seed_test_entitlement.parse_args(
+                [
+                    "--email",
+                    "pilot@example.com",
+                    "--clear",
+                    "--dry-run",
+                    "--confirm-manual-test",
+                ]
+            )
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["dryRun"])
+        self.assertTrue(result["snapshotExisted"])
+        self.assertNotIn("userId", result)
+        self.assertEqual(f"user:{user_id[:8]}", result["userRef"])
+        db = self.session_local()
+        try:
+            self.assertEqual(1, db.query(main_module.AccountEntitlementSnapshot).count())
+            self.assertEqual(0, db.query(main_module.BillingAuditRecord).count())
+        finally:
+            db.close()
+
     def test_production_seed_writes_redacted_operator_audit(self):
         user_id = self.create_user(email="pilot@example.com")
         self.set_runtime_env(main_module.RUNTIME_ENV_PROD)
