@@ -1043,6 +1043,31 @@ Recommended server phases:
     policy, fixture, existing route/parser, and forbidden-field assertion hits
     only, with no emitted evidence containing credentials, bbox values, raw
     compact rows, provider URLs, target identity, or request/response payloads.
+15. Complete/current P5B on 2026-07-02: added stale paid-continuity entitlement
+    guards and support diagnostics so stored `PRO` / paid-continuity /
+    `VERIFIED` rows with expired validity resolve as effective expired for
+    entitlement and PureTrack traffic decisions without calling Google Play or
+    mutating support snapshots. Local test coverage covers stale active denial,
+    support snapshot effective fields, redaction, and verified lifecycle repair
+    paths.
+16. Complete/current P5C on 2026-07-03: repeated production affected-account
+    validation using read-only support/status/log checks only. One stale stored
+    `PRO` / `ACTIVE` / `VERIFIED` account still reported
+    `effectiveStatus=EXPIRED`, `stalePaidContinuity=true`,
+    `effectiveTrafficAllowed=false`, and `trafficApiAllowed=false`, while the
+    PureTrack provider state remained `PREMIUM` and connected/material-ready.
+    The committed evidence records only sanitized audit IDs and omits raw
+    account identifiers, token hashes, bearer tokens, provider credentials,
+    provider session material, and production exports.
+17. Complete/current P5D on 2026-07-03: hardened the existing
+    `seed_test_entitlement.py` manual entitlement mutation path for production
+    operator use. Non-dry-run production seed/clear mutations now require an
+    explicit production-repair confirmation, operator id, and support ticket,
+    and they write a `BillingAuditRecord` with
+    `event_type=OPERATOR_ENTITLEMENT_REPAIR`. Production script output reports
+    only a short `userRef` plus `auditId`; no API route, entitlement readback,
+    Google Play reconciliation, PureTrack provider state, Android behavior, or
+    P5B stale paid-continuity guard changed.
 
 Android P3A1 is complete. Android P3B1 may implement the production HTTP
 adapter against these XCPro backend status/connect/disconnect routes after the

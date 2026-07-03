@@ -123,6 +123,12 @@ XCPro production policy remains:
 | P0C | Production Secret Installation And API Recreate | complete / current |
 | P0D | Live PureTrack Login Smoke And Evidence Closeout | complete / current |
 | P0E | Contingency Sanitized Diagnostics If Smoke Still Fails | blocked / not needed |
+| P5A-R1 | Sanitized PureTrack Traffic Cadence Evidence | complete / current |
+| P5B | Stale Paid Entitlement Guard And Support Diagnostics | complete / current |
+| P5C | Post-Deploy Affected-Account Validation | complete / current |
+| P5D | Production Entitlement Repair Policy Hardening | complete / current |
+| P5E | Google Play Raw Token Evidence Reconciliation | blocked / evidence required |
+| P5F | Production Repair Execution And Read-Only Validation | deferred |
 
 ## P0A - Evidence Freeze And Config Gap Record
 
@@ -503,6 +509,168 @@ P0E must be split before implementation if diagnosis requires:
 
 - Server-side planning and evidence only.
 - No implementation until P0D evidence identifies the exact unknown.
+
+## P5C - Post-Deploy Affected-Account Validation
+
+Status: complete / current.
+
+### Objective
+
+Repeat the affected-account entitlement validation after P5B deployment using
+only read-only production support/status/log checks. Confirm the stale stored
+XCPro entitlement shape still fails closed for PureTrack traffic while the
+PureTrack provider state remains separate.
+
+### Allowed Scope
+
+- Read-only production support/status helper checks.
+- Read-only status-equivalent calculation from stored server state.
+- Read-only production logs by sanitized audit ID when retained.
+- Redacted validation notes only.
+
+### Explicit Exclusions
+
+- No database mutation.
+- No entitlement grant or revoke.
+- No Google Play reconciliation.
+- No raw token, token hash, bearer token, provider password, account
+  identifier, or production export in committed output.
+- No Android changes.
+- No PureTrack traffic/provider-data debugging.
+
+### Evidence
+
+Completed on 2026-07-03:
+
+- Read-only production validation found exactly one stored entitlement row with
+  `tier=PRO`, `status=ACTIVE`, and `verificationState=VERIFIED` that now
+  resolves to the stale paid-continuity shape.
+- The support snapshot path reported:
+  - `effectiveStatus=EXPIRED`.
+  - `stalePaidContinuity=true`.
+  - `effectiveTrafficAllowed=false`.
+  - `effectiveValidUntilMs=null`.
+- The status-equivalent PureTrack check reported:
+  - `connected=true`.
+  - `userAccess=PREMIUM`.
+  - `trafficApiAllowed=false`.
+  - `errorCode=null`.
+- Provider-state separation was confirmed from stored server state:
+  - PureTrack provider `PREMIUM` state remained present.
+  - PureTrack provider session connected/material-ready state remained present.
+  - XCPro entitlement denial remained the reason `trafficApiAllowed=false`.
+- Sanitized audit IDs captured:
+  - Billing audit: `4ea300f7-15ac-424d-acec-d48b19ebaacc`,
+    `result=REVOKED_OR_EXPIRED`, event
+    `SUBSCRIPTION_NOTIFICATION_13`, created `2026-06-02T04:35:10Z`.
+  - Matching Google event audit:
+    `4ea300f7-15ac-424d-acec-d48b19ebaacc`,
+    `processingResult=REVOKED_OR_EXPIRED`.
+  - PureTrack status audit:
+    `pt_f92da17113c3439e9f3fb1ff5e901364`.
+- Production API log lookup by the sanitized billing and PureTrack audit IDs
+  returned no retained matching log lines at validation time.
+- No raw account ID, email, bearer token, Google Play purchase token, purchase
+  token hash, PureTrack credential, provider token/session material, provider
+  payload, or production export was recorded.
+
+### P5D Readiness And Decision
+
+P5D followed the audited-operator hardening path instead of a blanket
+production block. Based on P5C evidence, the affected production account
+already failed closed for XCPro entitlement and PureTrack traffic access while
+provider Premium/connected state remained separate.
+
+## P5D - Production Entitlement Repair Policy Hardening
+
+Status: complete / current.
+
+### Objective
+
+Harden the existing manual/test entitlement repair script so committed
+production entitlement mutations require explicit operator context and write a
+billing audit record. Preserve P5B's stale paid-continuity fail-closed guard and
+avoid adding any new route, read/status, Android, Google Play reconciliation, or
+unaudited mutation path.
+
+### Allowed Scope
+
+- `app/scripts/seed_test_entitlement.py`
+- `app/tests/test_seed_test_entitlement.py`
+- Narrow operator/deployment docs and this IP evidence.
+
+### Explicit Exclusions
+
+- No Android changes.
+- No PureTrack provider traffic/provider-data debugging.
+- No normal GET/read/status/gate mutation.
+- No unaudited production mutation path.
+- No Google Play reconciliation.
+- No raw tokens, token hashes, bearer tokens, account identifiers, provider
+  credentials, or production exports in committed output.
+
+### Policy Decision
+
+- Use audited-operator hardening, not a blanket production block.
+- Non-dry-run production `seed_test_entitlement.py` seed and clear operations
+  now require:
+  - `--confirm-manual-test`
+  - `--confirm-production-repair`
+  - `--operator-id`
+  - `--support-ticket`
+- Committed production mutations reuse the existing billing audit table through
+  `create_billing_audit_record(...)` with:
+  - `event_type=OPERATOR_ENTITLEMENT_REPAIR`
+  - `result=OPERATOR_ENTITLEMENT_SEEDED` or
+    `OPERATOR_ENTITLEMENT_CLEARED`
+  - `purchase_token_hash=null`
+  - redacted/sanitized operational detail only.
+- Production script output uses a short `userRef` and `auditId` instead of a raw
+  user id. Production dry-runs remain read-only, do not audit, and also avoid
+  echoing raw user ids.
+- Local/dev manual test seeding remains available behind the existing
+  `--confirm-manual-test` flag.
+
+### Evidence
+
+Completed on 2026-07-03:
+
+- `seed_test_entitlement.py` now detects production from
+  `PRIVATE_FOLLOW_RUNTIME_CONFIG.runtime_env`.
+- Production committed seed/clear mutations fail before opening a write path
+  unless the production repair flag, operator id, and support ticket are
+  present and syntactically safe.
+- Production committed seed/clear mutations create `BillingAuditRecord` rows in
+  the same transaction as the entitlement mutation.
+- No API route, entitlement readback, PureTrack status/traffic/insert gate,
+  Google Play verifier, RTDN processing, provider session, Android code, or
+  P5B effective stale-continuity guard was changed.
+- Focused tests prove:
+  - production seed without repair context fails with no entitlement or audit
+    row;
+  - production dry-run is read-only and does not audit;
+  - production seed writes a redacted operator audit;
+  - production clear writes a redacted operator audit;
+  - existing dev/manual seed and clear behavior still works.
+
+### Verification
+
+Run from `C:\Users\Asus\AndroidStudioProjects\XCPro_Server`:
+
+```powershell
+.venv\Scripts\python.exe -m pytest app\tests\test_seed_test_entitlement.py
+git diff --check -- app/scripts/seed_test_entitlement.py app/tests/test_seed_test_entitlement.py DEPLOY.md docs/PURETRACK
+```
+
+### Next Phase Readiness
+
+P5E remains blocked on raw Google Play token evidence. Do not proceed until the
+required raw Play token evidence is supplied out of band and handled under the
+no-commit/no-log secret rules.
+
+P5F remains deferred. It must not execute a production repair until P5E is
+unblocked or an explicit operator decision authorizes repair using the hardened
+audited path and read-only post-repair validation.
 
 ## Release-Grade Gates
 

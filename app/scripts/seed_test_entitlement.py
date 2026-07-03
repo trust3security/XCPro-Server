@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -27,9 +28,16 @@ class ManualSeedError(ValueError):
     pass
 
 
+OPERATOR_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
+SUPPORT_TICKET_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{3,80}$")
+PRODUCTION_REPAIR_EVENT_TYPE = "OPERATOR_ENTITLEMENT_REPAIR"
+PRODUCTION_SEED_RESULT = "OPERATOR_ENTITLEMENT_SEEDED"
+PRODUCTION_CLEAR_RESULT = "OPERATOR_ENTITLEMENT_CLEARED"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Seed or clear a manual B0-A test entitlement snapshot."
+        description="Seed or clear a manual B0-A test/operator entitlement snapshot."
     )
     identity = parser.add_mutually_exclusive_group(required=True)
     identity.add_argument("--user-id")
@@ -47,21 +55,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--clear", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm-manual-test", action="store_true")
+    parser.add_argument("--confirm-production-repair", action="store_true")
+    parser.add_argument("--operator-id")
+    parser.add_argument("--support-ticket")
     return parser.parse_args(argv)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.confirm_manual_test:
         raise ManualSeedError("--confirm-manual-test is required.")
+    validate_production_repair_policy(args)
 
     db = main_module.SessionLocal()
     try:
         user = resolve_user(db, args)
         if args.clear:
-            return clear_snapshot(db, user.id, args.dry_run)
+            return clear_snapshot(db, user.id, args)
         return upsert_snapshot(db, user.id, args)
     finally:
         db.close()
+
+
+def is_production_runtime() -> bool:
+    return (
+        main_module.PRIVATE_FOLLOW_RUNTIME_CONFIG.runtime_env
+        == main_module.RUNTIME_ENV_PROD
+    )
+
+
+def validate_operator_field(
+    value: str | None,
+    field_name: str,
+    pattern: re.Pattern[str],
+) -> str:
+    normalized = (value or "").strip()
+    if not pattern.fullmatch(normalized):
+        raise ManualSeedError(
+            f"{field_name} is required in production and may contain only "
+            "letters, numbers, '.', '_', '-', or ':' as applicable."
+        )
+    return normalized
+
+
+def validate_production_repair_policy(args: argparse.Namespace) -> None:
+    if not is_production_runtime() or args.dry_run:
+        return
+    if not args.confirm_production_repair:
+        raise ManualSeedError("--confirm-production-repair is required in production.")
+    validate_operator_field(args.operator_id, "--operator-id", OPERATOR_ID_PATTERN)
+    validate_operator_field(args.support_ticket, "--support-ticket", SUPPORT_TICKET_PATTERN)
 
 
 def resolve_user(db, args: argparse.Namespace):
@@ -91,35 +133,50 @@ def resolve_user(db, args: argparse.Namespace):
     return user
 
 
-def clear_snapshot(db, user_id: str, dry_run: bool) -> dict[str, Any]:
+def clear_snapshot(db, user_id: str, args: argparse.Namespace) -> dict[str, Any]:
     snapshot = (
         db.query(main_module.AccountEntitlementSnapshot)
         .filter(main_module.AccountEntitlementSnapshot.user_id == user_id)
         .first()
     )
     existed = snapshot is not None
+    dry_run = args.dry_run
+    audit_id = None
+    production_repair = is_production_runtime() and not dry_run
     if snapshot is not None and not dry_run:
         db.delete(snapshot)
+        audit_id = write_production_repair_audit(
+            db=db,
+            user_id=user_id,
+            action="clear",
+            result=PRODUCTION_CLEAR_RESULT,
+            args=args,
+            values=None,
+        )
         db.commit()
-    return {
+    result = {
         "ok": True,
         "action": "clear",
         "dryRun": dry_run,
-        "userId": user_id,
         "snapshotExisted": existed,
     }
+    result.update(public_user_summary(user_id, production_repair))
+    if audit_id is not None:
+        result["auditId"] = audit_id
+    return result
 
 
 def upsert_snapshot(db, user_id: str, args: argparse.Namespace) -> dict[str, Any]:
     values = build_snapshot_values(args)
     if args.dry_run:
-        return {
+        result = {
             "ok": True,
             "action": "seed",
             "dryRun": True,
-            "userId": user_id,
             **public_summary(values),
         }
+        result.update(public_user_summary(user_id, is_production_runtime()))
+        return result
 
     snapshot = (
         db.query(main_module.AccountEntitlementSnapshot)
@@ -136,14 +193,73 @@ def upsert_snapshot(db, user_id: str, args: argparse.Namespace) -> dict[str, Any
     else:
         for key, value in values.items():
             setattr(snapshot, key, value)
+    audit_id = None
+    production_repair = is_production_runtime()
+    if production_repair:
+        audit_id = write_production_repair_audit(
+            db=db,
+            user_id=user_id,
+            action="seed",
+            result=PRODUCTION_SEED_RESULT,
+            args=args,
+            values=values,
+        )
     db.commit()
-    return {
+    result = {
         "ok": True,
         "action": "seed",
         "dryRun": False,
-        "userId": user_id,
         **public_summary(values),
     }
+    result.update(public_user_summary(user_id, production_repair))
+    if audit_id is not None:
+        result["auditId"] = audit_id
+    return result
+
+
+def write_production_repair_audit(
+    db,
+    user_id: str,
+    action: str,
+    result: str,
+    args: argparse.Namespace,
+    values: dict[str, Any] | None,
+) -> str | None:
+    if not is_production_runtime():
+        return None
+    operator_id = validate_operator_field(
+        args.operator_id,
+        "--operator-id",
+        OPERATOR_ID_PATTERN,
+    )
+    support_ticket = validate_operator_field(
+        args.support_ticket,
+        "--support-ticket",
+        SUPPORT_TICKET_PATTERN,
+    )
+    detail: dict[str, Any] = {
+        "source": "OPERATOR_ENTITLEMENT_REPAIR",
+        "action": action,
+        "operatorId": operator_id,
+        "supportTicket": support_ticket,
+        "packageName": main_module.XCPRO_RELEASE_PACKAGE_NAME,
+    }
+    if values is not None:
+        detail.update(
+            {
+                "productId": values["product_id"],
+                "basePlanId": values["base_plan_id"],
+                "subscriptionStatus": values["status"],
+            }
+        )
+    return main_module.create_billing_audit_record(
+        db=db,
+        user_id=user_id,
+        event_type=PRODUCTION_REPAIR_EVENT_TYPE,
+        purchase_token_hash=None,
+        result=result,
+        detail=detail,
+    )
 
 
 def build_snapshot_values(args: argparse.Namespace) -> dict[str, Any]:
@@ -198,6 +314,12 @@ def public_summary(values: dict[str, Any]) -> dict[str, Any]:
         "basePlanId": values["base_plan_id"],
         "validUntilMs": values["valid_until_ms"],
     }
+
+
+def public_user_summary(user_id: str, production_repair: bool) -> dict[str, Any]:
+    if production_repair:
+        return {"userRef": f"user:{user_id[:8]}"}
+    return {"userId": user_id}
 
 
 def main(argv: list[str] | None = None) -> int:

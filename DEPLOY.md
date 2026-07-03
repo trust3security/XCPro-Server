@@ -352,6 +352,35 @@ cp -a /opt/xcpro "$BACKUP_DIR/opt_xcpro"
 docker exec xcpro-db pg_dumpall -U postgres > "$BACKUP_DIR/pg_dumpall.sql"
 ```
 
+## Production entitlement repair scripts
+
+`app/scripts/seed_test_entitlement.py` is the only current manual
+test/operator entitlement repair writer. In production, any committed seed or
+clear operation must be an explicit audited support action:
+
+```bash
+docker compose exec -T api python /app/scripts/seed_test_entitlement.py \
+  <one lookup argument> \
+  --confirm-manual-test \
+  --confirm-production-repair \
+  --operator-id <operator-tag> \
+  --support-ticket <ticket-id>
+```
+
+For clears, add `--clear`. For read-only rehearsal, add `--dry-run`; dry-runs
+do not write entitlement rows or billing audit rows.
+
+Rules:
+
+- Do not paste raw account identifiers, emails, bearer tokens, purchase tokens,
+  token hashes, provider credentials, or production exports into committed
+  notes, logs, docs, screenshots, or support artifacts.
+- Production committed mutations must emit a billing `auditId`; retain that
+  sanitized id for support correlation.
+- This script is not Google Play reconciliation. Do not use it to bypass raw
+  Play-token evidence requirements or to weaken stale paid-continuity
+  fail-closed behavior.
+
 ## Current manual deploy pattern
 
 ### If only docker-compose.yml or `.env` changed
