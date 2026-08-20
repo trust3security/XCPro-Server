@@ -434,11 +434,13 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertEqual(main_module.PURETRACK_PROVIDER_ACCESS_FREE, status["userAccess"])
         self.assertIs(False, status["trafficApiAllowed"])
 
-    def test_traffic_api_allowed_requires_app_key_xcpro_pro_and_premium_provider(self):
+    def test_traffic_api_allowed_requires_app_key_xcpro_xc_or_higher_and_premium_provider(self):
         cases = (
             ("all_gates", "server-side-app-key", "PRO", main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM, True),
             ("missing_app_key", None, "PRO", main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM, False),
-            ("xcpro_xc", "server-side-app-key", "XC", main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM, False),
+            ("xcpro_xc", "server-side-app-key", "XC", main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM, True),
+            ("xcpro_basic", "server-side-app-key", "BASIC", main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM, False),
+            ("xcpro_soaring", "server-side-app-key", "SOARING", main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM, False),
             ("provider_free", "server-side-app-key", "PRO", main_module.PURETRACK_PROVIDER_ACCESS_FREE, False),
         )
         for name, app_key, tier, user_access, expected_allowed in cases:
@@ -826,7 +828,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         )
         self.assertEqual([], self.insert_client.calls)
 
-    def test_insert_requires_verified_xcpro_pro_entitlement(self):
+    def test_insert_allows_verified_xcpro_xc_entitlement(self):
         self.enable_insert_key()
         self.upsert_entitlement_snapshot(tier="XC")
 
@@ -836,9 +838,26 @@ class PureTrackBackendProxyTest(unittest.TestCase):
             headers=self.headers(),
         )
 
-        self.assertEqual(403, response.status_code)
-        self.assertEqual(main_module.ErrorCode.FEATURE_ACCESS_DENIED, response.json()["code"])
-        self.assertEqual([], self.insert_client.calls)
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(main_module.PURETRACK_INSERT_RESULT_ACCEPTED, response.json()["result"])
+        self.assertEqual(1, len(self.insert_client.calls))
+
+    def test_insert_rejects_lower_xcpro_tiers_before_provider_call(self):
+        self.enable_insert_key()
+
+        for tier in (None, "BASIC", "SOARING"):
+            with self.subTest(tier=tier):
+                if tier is not None:
+                    self.upsert_entitlement_snapshot(tier=tier)
+                response = self.client.post(
+                    "/api/v1/puretrack/insert",
+                    json=self.insert_payload(),
+                    headers=self.headers(),
+                )
+
+                self.assertEqual(403, response.status_code)
+                self.assertEqual(main_module.ErrorCode.FEATURE_ACCESS_DENIED, response.json()["code"])
+                self.assertEqual([], self.insert_client.calls)
 
     def test_insert_rejects_invalid_request_shapes_before_provider_call(self):
         self.enable_insert_key()
@@ -1271,7 +1290,7 @@ class PureTrackBackendProxyTest(unittest.TestCase):
         self.assertEqual([], self.traffic_client.calls)
 
     def test_traffic_route_fetches_normalizes_caches_and_redacts(self):
-        self.upsert_entitlement_snapshot(tier="PRO")
+        self.upsert_entitlement_snapshot(tier="XC")
         self.upsert_provider_session(
             token=None,
             user_access=main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
@@ -1499,12 +1518,32 @@ class PureTrackBackendProxyTest(unittest.TestCase):
                 503,
             ),
             (
-                "missing-xcpro-pro",
-                "traffic-missing-xcpro-pro",
+                "missing-xcpro-entitlement",
+                "traffic-missing-xcpro-entitlement",
                 "server-side-app-key",
                 main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
                 True,
                 None,
+                main_module.ErrorCode.FEATURE_ACCESS_DENIED,
+                403,
+            ),
+            (
+                "basic-xcpro-entitlement",
+                "traffic-basic-xcpro-entitlement",
+                "server-side-app-key",
+                main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+                True,
+                "BASIC",
+                main_module.ErrorCode.FEATURE_ACCESS_DENIED,
+                403,
+            ),
+            (
+                "soaring-xcpro-entitlement",
+                "traffic-soaring-xcpro-entitlement",
+                "server-side-app-key",
+                main_module.PURETRACK_PROVIDER_ACCESS_PREMIUM,
+                True,
+                "SOARING",
                 main_module.ErrorCode.FEATURE_ACCESS_DENIED,
                 403,
             ),
