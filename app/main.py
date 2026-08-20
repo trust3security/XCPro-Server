@@ -125,6 +125,7 @@ DENIED_ENTITLEMENT_HARD_REFRESH_AFTER_MS = 3_600_000
 PAID_CONTINUITY_STALE_AFTER_MS = 21_600_000
 PAID_CONTINUITY_HARD_REFRESH_AFTER_MS = 259_200_000
 PLAN_TIER_VALUES = frozenset({"FREE", "BASIC", "SOARING", "XC", "PRO"})
+PURETRACK_XCPRO_ALLOWED_TIERS = frozenset({"XC", "PRO"})
 PURETRACK_USER_ACCESS_VALUES = frozenset({"UNKNOWN", "NONE", "FREE", "PREMIUM", "ERROR"})
 PURETRACK_PROVIDER_ACCESS_UNKNOWN = "UNKNOWN"
 PURETRACK_PROVIDER_ACCESS_NONE = "NONE"
@@ -4721,7 +4722,7 @@ def puretrack_provider_session_material_available(
         return False
 
 
-def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
+def account_has_verified_xcpro_puretrack_entitlement(db, user_id: str) -> bool:
     now_ms = to_epoch_ms(utcnow())
     snapshot = (
         db.query(AccountEntitlementSnapshot)
@@ -4737,7 +4738,7 @@ def account_has_verified_xcpro_pro_entitlement(db, user_id: str) -> bool:
             return False
         raise
     return (
-        values["tier"] == "PRO"
+        values["tier"] in PURETRACK_XCPRO_ALLOWED_TIERS
         and values["verificationState"] == "VERIFIED"
         and stored_paid_continuity_is_current(snapshot, values, now_ms)
     )
@@ -5493,11 +5494,11 @@ def require_puretrack_traffic_provider_session_secret(
             code=ErrorCode.PURETRACK_APP_KEY_UNCONFIGURED,
             detail="PureTrack Traffic API is not configured"
         )
-    if not account_has_verified_xcpro_pro_entitlement(db, current_user.user.id):
+    if not account_has_verified_xcpro_puretrack_entitlement(db, current_user.user.id):
         raise ApiHTTPException(
             status_code=403,
             code=ErrorCode.FEATURE_ACCESS_DENIED,
-            detail="PureTrack traffic requires XCPro PRO access"
+            detail="PureTrack traffic requires XC-or-higher XCPro access"
         )
 
     session = load_puretrack_provider_session(db, current_user.user.id)
@@ -5772,7 +5773,7 @@ def build_puretrack_status_payload(
         and resolved_connected
         and resolved_user_access == PURETRACK_PROVIDER_ACCESS_PREMIUM
         and provider_session_material_ready
-        and account_has_verified_xcpro_pro_entitlement(db, current_user.user.id)
+        and account_has_verified_xcpro_puretrack_entitlement(db, current_user.user.id)
     )
     return {
         "connected": resolved_connected,
@@ -5801,11 +5802,11 @@ def publish_puretrack_insert_batch(
             code=ErrorCode.PURETRACK_INSERT_KEY_UNCONFIGURED,
             detail="PureTrack Insert publishing is not configured"
         )
-    if not account_has_verified_xcpro_pro_entitlement(db, current_user.user.id):
+    if not account_has_verified_xcpro_puretrack_entitlement(db, current_user.user.id):
         raise ApiHTTPException(
             status_code=403,
             code=ErrorCode.FEATURE_ACCESS_DENIED,
-            detail="PureTrack Insert publishing requires XCPro PRO access"
+            detail="PureTrack Insert publishing requires XC-or-higher XCPro access"
         )
 
     trackers, client_point_ids, point_count = validate_puretrack_insert_request(request)
@@ -6731,7 +6732,7 @@ def build_support_entitlement_snapshot(
         "stalePaidContinuity": stale_paid_continuity,
         "effectiveTrafficAllowed": (
             effective_values is not None
-            and effective_values["tier"] == "PRO"
+            and effective_values["tier"] in PURETRACK_XCPRO_ALLOWED_TIERS
             and effective_values["verificationState"] == "VERIFIED"
             and effective_paid_continuity
         ),

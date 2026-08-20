@@ -997,7 +997,7 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         try:
             snapshot = db.query(main_module.AccountEntitlementSnapshot).one()
             self.assertFalse(
-                main_module.account_has_verified_xcpro_pro_entitlement(
+                main_module.account_has_verified_xcpro_puretrack_entitlement(
                     db,
                     snapshot.user_id,
                 )
@@ -2117,6 +2117,43 @@ class GooglePlaySubscriptionAuthorityTest(unittest.TestCase):
         self.assertFalse(snapshot["currentPurchase"]["acknowledgementPending"])
         self.assertIsNone(snapshot["latestGoogleEvent"])
         self.assertIsNone(snapshot["unavailableMetadata"]["latestOrderId"])
+        self.assert_plaintext_absent(snapshot, purchase_token)
+
+    def test_billing_support_snapshot_reports_active_xc_traffic_access_without_mutation(self):
+        purchase_token = "support-active-xc-token"
+        self.verifier.set_result(
+            purchase_token,
+            self.verification_result(
+                status="ACTIVE",
+                product_id="xcpro_xc",
+                base_plan_id="monthly",
+            ),
+        )
+        sync = self.client.post(
+            "/api/v1/subscriptions/googleplay/sync",
+            json=self.sync_payload(
+                product_id="xcpro_xc",
+                base_plan_id="monthly",
+                purchase_token=purchase_token,
+            ),
+            headers=self.package_headers(),
+        )
+        self.assertEqual(200, sync.status_code)
+        before_counts = self.billing_row_counts()
+
+        db = self.session_local()
+        try:
+            snapshot = main_module.build_billing_support_snapshot(
+                db,
+                self.primary_user_id(db),
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(before_counts, self.billing_row_counts())
+        self.assertEqual("XC", snapshot["entitlement"]["tier"])
+        self.assertEqual("ACTIVE", snapshot["entitlement"]["effectiveStatus"])
+        self.assertTrue(snapshot["entitlement"]["effectiveTrafficAllowed"])
         self.assert_plaintext_absent(snapshot, purchase_token)
 
     def test_billing_support_snapshot_reports_stale_effective_context_without_mutation_or_raw_token(self):
