@@ -671,7 +671,7 @@ class LiveFollowApiTest(unittest.TestCase):
         self.assertNotIn(idle_session["session_id"], session_ids)
         self.assertNotIn(ended_session["session_id"], session_ids)
 
-    def test_active_pilots_list_preserves_stale_status(self):
+    def test_active_pilots_list_includes_threshold_and_excludes_stale_sessions(self):
         session = self.start_session()
 
         position_response = self.client.post(
@@ -681,12 +681,22 @@ class LiveFollowApiTest(unittest.TestCase):
         )
         self.assertEqual(200, position_response.status_code)
 
-        self.clock.advance(seconds=main_module.STALE_AFTER_SECONDS + 1)
+        self.clock.advance(seconds=main_module.STALE_AFTER_SECONDS)
 
-        response = self.client.get("/api/v1/live/active")
-        self.assertEqual(200, response.status_code)
-        self.assertEqual(1, len(response.json()))
-        self.assertEqual("stale", response.json()[0]["status"])
+        threshold_response = self.client.get("/api/v1/live/active")
+        self.assertEqual(200, threshold_response.status_code)
+        self.assertEqual(1, len(threshold_response.json()))
+        self.assertEqual("active", threshold_response.json()[0]["status"])
+
+        self.clock.advance(seconds=1)
+
+        stale_list_response = self.client.get("/api/v1/live/active")
+        self.assertEqual(200, stale_list_response.status_code)
+        self.assertEqual([], stale_list_response.json())
+
+        stale_direct_response = self.client.get(f"/api/v1/live/{session['session_id']}")
+        self.assertEqual(200, stale_direct_response.status_code)
+        self.assertEqual("stale", stale_direct_response.json()["status"])
 
     def test_active_pilots_list_keeps_session_when_latest_cache_is_missing(self):
         session = self.start_session()
