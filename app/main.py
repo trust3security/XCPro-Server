@@ -11605,12 +11605,14 @@ def get_active_live_sessions():
     db = SessionLocal()
     try:
         # Conservative inclusion: only sessions with at least one accepted position are listed.
+        active_cutoff = utcnow() - timedelta(seconds=STALE_AFTER_SECONDS)
         sessions = (
             db.query(LiveSession)
             .filter(
                 LiveSession.status != "ended",
                 LiveSession.visibility == LIVE_VISIBILITY_PUBLIC,
-                LiveSession.last_position_at.isnot(None)
+                LiveSession.last_position_at.isnot(None),
+                LiveSession.last_position_at >= active_cutoff
             )
             .order_by(
                 LiveSession.last_position_at.desc(),
